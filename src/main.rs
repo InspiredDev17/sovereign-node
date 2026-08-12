@@ -1,0 +1,497 @@
+#![forbid(unsafe_code)]
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Args, Parser, Subcommand};
+use ed25519_dalek::VerifyingKey;
+use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use sovereign_node::authz::{AuthorizationEngine, Clock, SystemClock};
+use sovereign_node::capabilities::CapabilityExecutor;
+use sovereign_node::config::{HealthConfig, NodeConfig, PolicyConfig};
+use sovereign_node::identity::NodeIdentity;
+use sovereign_node::pairing::{PairingKeyMaterialV1, PairingManager, PairingProof, PairingRequest};
+use sovereign_node::protocol::{
+    Capability, CapabilityManifestV1, PairingId, PublicKeyBytes, Sha256Digest, SignatureBytes,
+    SignedNodeRegistrationV1, TrustStatus, UnixMillis,
+};
+use sovereign_node::resources::ResourceReporter;
+use sovereign_node::runtime::NodeRuntime;
+use sovereign_node::store::{RevocationOutcome, StateStore};
+use uuid::Uuid;
+
+const STATE_DATABASE: &str = "state.sqlite3";
+
+#[derive(Debug, Parser)]
+#[command(name = "sovereign-node", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Create a stable local node identity and empty fail-closed state database.
+    Init(InitArgs),
+    /// Print an example conservative configuration without writing it.
+    ConfigExample {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Print a node-signed public registration (never private key material).
+    Identity { config: PathBuf },
+    /// Inspect local trust/audit state without starting a listener.
+    Status { config: PathBuf },
+    /// Owner-local pairing and revocation ceremony.
+    #[command(subcommand)]
+    Pair(PairCommand),
+    /// Rotate the node device identity key after explicit local confirmation.
+    RotateIdentity {
+        config: PathBuf,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Run the unprivileged daemon. No listener is opened unless configured.
+    Serve { config: PathBuf },
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    label: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum PairCommand {
+    /// Create and display a short-lived transcript requiring proof of both keys.
+    Request(PairRequestArgs),
+    /// Verify both transcript signatures and commit trust after local confirmation.
+    Approve(PairApproveArgs),
+    /// Durably revoke a peer after local confirmation.
+    Revoke(PairRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+struct PairRequestArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    peer_id: String,
+    #[arg(long)]
+    label: String,
+    #[arg(long)]
+    owner_id: String,
+    #[arg(long)]
+    owner_public_key_hex: String,
+    #[arg(long)]
+    broker_public_key_hex: String,
+    #[arg(long)]
+    client_ca_pem: PathBuf,
+    #[arg(long)]
+    client_certificate_pem: PathBuf,
+    #[arg(long = "capability", required = true)]
+    capabilities: Vec<String>,
+    #[arg(long, default_value_t = 300)]
+    ttl_seconds: u64,
+    /// Optional signed duration for cached offline trust.
+    #[arg(long)]
+    trust_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct PairApproveArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    pairing_id: Uuid,
+    #[arg(long)]
+    challenge_hex: String,
+    #[arg(long)]
+    owner_signature_hex: String,
+    #[arg(long)]
+    broker_signature_hex: String,
+    #[arg(long)]
+    confirm: bool,
+}
+
+#[derive(Debug, Args)]
+struct PairRevokeArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    peer_id: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long)]
+    confirm: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct InitOutput {
+    created: bool,
+    node_id: String,
+    display_name: String,
+    identity_fingerprint_sha256: String,
+    data_dir: String,
+    listener_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusOutput {
+    node_id: String,
+    identity_fingerprint_sha256: String,
+    trusted_peer_count: usize,
+    audit_event_count: u64,
+    audit_tail_sha256: String,
+    listener: Option<String>,
+    default_remote_execution: &'static str,
+    agent_green_health: &'static str,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if !sovereign_node::security_platform_supported()
+        && !matches!(&cli.command, Command::ConfigExample { .. })
+    {
+        bail!("stateful v0.1 commands require Unix owner and mode security primitives");
+    }
+    match cli.command {
+        Command::Init(args) => init(args),
+        Command::ConfigExample { data_dir } => config_example(&data_dir),
+        Command::Identity { config } => identity(&config),
+        Command::Status { config } => status(&config),
+        Command::Pair(command) => pair(command),
+        Command::RotateIdentity { config, confirm } => rotate_identity(&config, confirm),
+        Command::Serve { config } => serve(&config).await,
+    }
+}
+
+fn init(args: InitArgs) -> Result<()> {
+    require_absolute(&args.data_dir, "data directory")?;
+    let now = now()?;
+    let (identity, created) = NodeIdentity::load_or_initialize(&args.data_dir, &args.label, now)?;
+    let store = StateStore::open(args.data_dir.join(STATE_DATABASE))?;
+    store.verify_audit_chain()?;
+    print_json(&InitOutput {
+        created,
+        node_id: identity.node_id().to_string(),
+        display_name: identity.device().display_name.clone(),
+        identity_fingerprint_sha256: identity.fingerprint(),
+        data_dir: args.data_dir.display().to_string(),
+        listener_enabled: false,
+    })
+}
+
+fn config_example(data_dir: &Path) -> Result<()> {
+    require_absolute(data_dir, "data directory")?;
+    let config = NodeConfig {
+        data_dir: data_dir.to_path_buf(),
+        policy_version: 1,
+        listen: None,
+        tls: None,
+        policy: PolicyConfig::default(),
+        file_roots: Default::default(),
+        approved_actions: Default::default(),
+        health: HealthConfig::default(),
+    };
+    config.validate()?;
+    println!("{}", toml::to_string_pretty(&config)?);
+    Ok(())
+}
+
+fn identity(config_path: &Path) -> Result<()> {
+    let config = NodeConfig::load(config_path)?;
+    let identity = NodeIdentity::load(&config.data_dir)?;
+    let store = open_store(&config)?;
+    let now = now()?;
+    let peers = store.currently_trusted_peers(to_i64(now)?)?;
+    let trust = if peers.is_empty() {
+        TrustStatus::Unpaired
+    } else {
+        TrustStatus::Trusted
+    };
+    let registration = identity.registration(
+        CapabilityManifestV1 {
+            manifest_version: config.policy_version,
+            capabilities: config.policy.enabled_capabilities,
+            generated_at: now,
+        },
+        trust,
+        now,
+    );
+    registration.validate()?;
+    let node_signature = identity.sign(&registration.signing_bytes()?)?;
+    print_json(&SignedNodeRegistrationV1 {
+        registration,
+        node_signature,
+    })
+}
+
+fn status(config_path: &Path) -> Result<()> {
+    let config = NodeConfig::load(config_path)?;
+    let identity = NodeIdentity::load(&config.data_dir)?;
+    let store = open_store(&config)?;
+    let audit = store.verify_audit_chain()?;
+    let peers = store.currently_trusted_peers(to_i64(now()?)?)?;
+    print_json(&StatusOutput {
+        node_id: identity.node_id().to_string(),
+        identity_fingerprint_sha256: identity.fingerprint(),
+        trusted_peer_count: peers.len(),
+        audit_event_count: audit.event_count,
+        audit_tail_sha256: hex::encode(audit.tail_hash),
+        listener: config.listen.map(|address| address.to_string()),
+        default_remote_execution: "deny unless exact owner+broker authorization verifies",
+        agent_green_health: "unknown until an explicit authenticated read-only adapter is configured",
+    })
+}
+
+fn pair(command: PairCommand) -> Result<()> {
+    match command {
+        PairCommand::Request(args) => pair_request(args),
+        PairCommand::Approve(args) => pair_approve(args),
+        PairCommand::Revoke(args) => pair_revoke(args),
+    }
+}
+
+fn pair_request(args: PairRequestArgs) -> Result<()> {
+    let (config, identity, store) = pairing_context(&args.config)?;
+    let owner_public_key = public_key(&args.owner_public_key_hex)?;
+    let broker_public_key = public_key(&args.broker_public_key_hex)?;
+    let client_ca_der = first_pem_certificate(&args.client_ca_pem)?;
+    let client_leaf_der = first_pem_certificate(&args.client_certificate_pem)?;
+    let certificate_digest = Sha256Digest(Sha256::digest(client_leaf_der).into());
+    let capabilities = args
+        .capabilities
+        .iter()
+        .map(|value| parse_capability(value))
+        .collect::<Result<Vec<_>>>()?;
+    let manager = PairingManager::new(
+        identity,
+        store,
+        config.policy.enabled_capabilities.iter().copied(),
+    );
+    let now = now()?;
+    let trust_expires_at = args
+        .trust_ttl_seconds
+        .map(|seconds| {
+            seconds
+                .checked_mul(1_000)
+                .and_then(|millis| now.0.checked_add(millis))
+                .map(UnixMillis)
+                .ok_or_else(|| anyhow!("trust TTL is too large"))
+        })
+        .transpose()?;
+    let display = manager.begin(
+        PairingRequest {
+            peer_id: args.peer_id,
+            device_label: args.label,
+            key_material: PairingKeyMaterialV1 {
+                schema_version: 1,
+                owner_id: args.owner_id,
+                owner_public_key,
+                broker_public_key,
+                client_ca_der,
+                client_certificate_sha256: certificate_digest,
+                allowed_capabilities: capabilities,
+                trust_expires_at,
+            },
+            ttl_millis: args
+                .ttl_seconds
+                .checked_mul(1_000)
+                .ok_or_else(|| anyhow!("pairing TTL is too large"))?,
+        },
+        now,
+    )?;
+    print_json(&display)
+}
+
+fn pair_approve(args: PairApproveArgs) -> Result<()> {
+    let (config, identity, store) = pairing_context(&args.config)?;
+    let manager = PairingManager::new(
+        identity,
+        store,
+        config.policy.enabled_capabilities.iter().copied(),
+    );
+    let now = now()?;
+    let trusted = manager.approve_local(
+        &PairingProof {
+            pairing_id: PairingId(args.pairing_id),
+            challenge_secret: fixed_bytes::<32>(&args.challenge_hex, "challenge")?,
+            owner_signature: signature(&args.owner_signature_hex)?,
+            broker_signature: signature(&args.broker_signature_hex)?,
+            approved_at: now,
+        },
+        args.confirm,
+    )?;
+    print_json(&trusted)
+}
+
+fn pair_revoke(args: PairRevokeArgs) -> Result<()> {
+    let (config, identity, store) = pairing_context(&args.config)?;
+    let manager = PairingManager::new(
+        identity,
+        store,
+        config.policy.enabled_capabilities.iter().copied(),
+    );
+    let outcome = manager.revoke_local(&args.peer_id, &args.reason, now()?, args.confirm)?;
+    let label = match outcome {
+        RevocationOutcome::Revoked(_) => "revoked",
+        RevocationOutcome::AlreadyRevoked(_) => "already-revoked",
+        RevocationOutcome::NotFound => "not-found",
+    };
+    print_json(&serde_json::json!({ "peer_id": args.peer_id, "outcome": label }))
+}
+
+fn rotate_identity(config_path: &Path, confirm: bool) -> Result<()> {
+    let config = NodeConfig::load(config_path)?;
+    let identity = NodeIdentity::load(&config.data_dir)?;
+    let store = open_store(&config)?;
+    if !store.currently_trusted_peers(to_i64(now()?)?)?.is_empty() {
+        bail!(
+            "device identity rotation is refused while trusted peers exist; revoke them and restart before rotating"
+        );
+    }
+    let (rotated, binding) = identity.rotate_locally(&config.data_dir, now()?, confirm)?;
+    print_json(&serde_json::json!({
+        "node_id": rotated.node_id().to_string(),
+        "identity_fingerprint_sha256": rotated.fingerprint(),
+        "rotation_binding": binding,
+        "daemon_restart_required": true
+    }))
+}
+
+async fn serve(config_path: &Path) -> Result<()> {
+    if !sovereign_node::security_platform_supported() {
+        bail!("the hardened v0.1 daemon currently supports Unix security primitives only");
+    }
+    if sovereign_node::security_running_as_root() {
+        bail!("the Sovereign Node daemon refuses to run as root");
+    }
+    let config = Arc::new(NodeConfig::load(config_path)?);
+    let identity = Arc::new(NodeIdentity::load(&config.data_dir)?);
+    let store = Arc::new(open_store(&config)?);
+    store.verify_audit_chain()?;
+
+    if config.listen.is_none() {
+        eprintln!(
+            "Sovereign Node is running in local-only offline mode; no network listener is open"
+        );
+        tokio::signal::ctrl_c().await?;
+        return Ok(());
+    }
+
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let policy_digest = Sha256Digest(config.policy_digest()?);
+    store.activate_policy(config.policy_version, policy_digest.0, to_i64(now()?)?)?;
+    let authorization = AuthorizationEngine::new(
+        identity.node_id(),
+        store.clone(),
+        clock.clone(),
+        &config.policy,
+        config.policy_version,
+        policy_digest,
+    );
+    let resources = ResourceReporter::new(identity.node_id(), identity.device().clone());
+    let executor = CapabilityExecutor::new(config.clone(), resources);
+    let runtime = Arc::new(NodeRuntime::new(
+        identity,
+        authorization,
+        executor,
+        store.clone(),
+        clock,
+        config.policy.max_concurrent_actions,
+        config.policy.queue_capacity,
+    ));
+    sovereign_node::transport::serve(config, store, runtime).await?;
+    Ok(())
+}
+
+fn pairing_context(config_path: &Path) -> Result<(NodeConfig, Arc<NodeIdentity>, Arc<StateStore>)> {
+    let config = NodeConfig::load(config_path)?;
+    let identity = Arc::new(NodeIdentity::load(&config.data_dir)?);
+    let store = Arc::new(open_store(&config)?);
+    store.verify_audit_chain()?;
+    Ok((config, identity, store))
+}
+
+fn open_store(config: &NodeConfig) -> Result<StateStore> {
+    StateStore::open(config.data_dir.join(STATE_DATABASE)).map_err(Into::into)
+}
+
+fn now() -> Result<UnixMillis> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    Ok(UnixMillis(u64::try_from(duration.as_millis())?))
+}
+
+fn to_i64(value: UnixMillis) -> Result<i64> {
+    i64::try_from(value.0).context("system time is outside the supported range")
+}
+
+fn public_key(value: &str) -> Result<PublicKeyBytes> {
+    let bytes = fixed_bytes::<32>(value, "Ed25519 public key")?;
+    let key = VerifyingKey::from_bytes(&bytes).context("invalid Ed25519 public key")?;
+    if key.is_weak() {
+        bail!("weak Ed25519 public keys are not accepted");
+    }
+    Ok(PublicKeyBytes(bytes))
+}
+
+fn signature(value: &str) -> Result<SignatureBytes> {
+    let bytes = hex::decode(value).context("signature is not hexadecimal")?;
+    SignatureBytes::from_slice(&bytes).map_err(Into::into)
+}
+
+fn fixed_bytes<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+    let bytes = hex::decode(value).with_context(|| format!("{label} is not hexadecimal"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("{label} must contain exactly {N} bytes"))
+}
+
+fn first_pem_certificate(path: &Path) -> Result<Vec<u8>> {
+    let certificate = CertificateDer::from_pem_file(path)
+        .with_context(|| format!("{} contains no valid certificate", path.display()))?;
+    Ok(certificate.as_ref().to_vec())
+}
+
+fn parse_capability(value: &str) -> Result<Capability> {
+    match value {
+        "SystemInfo" => Ok(Capability::SystemInfo),
+        "ResourceStatus" => Ok(Capability::ResourceStatus),
+        "FileRead" => Ok(Capability::FileRead),
+        "FileWrite" => Ok(Capability::FileWrite),
+        "ProcessStatus" => Ok(Capability::ProcessStatus),
+        "ServiceStatus" => Ok(Capability::ServiceStatus),
+        "ExecuteApprovedAction" => Ok(Capability::ExecuteApprovedAction),
+        "GPUStatus" | "GpuStatus" => Ok(Capability::GpuStatus),
+        "EngineStatus" => Ok(Capability::EngineStatus),
+        "ModelStatus" => Ok(Capability::ModelStatus),
+        "RepositoryStatus" => Ok(Capability::RepositoryStatus),
+        "AgentGreenHealth" => Ok(Capability::AgentGreenHealth),
+        "ActionBrokerHealth" => Ok(Capability::ActionBrokerHealth),
+        _ => bail!("unknown capability {value:?}"),
+    }
+}
+
+fn require_absolute(path: &Path, label: &str) -> Result<()> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        bail!("{label} must be an absolute path")
+    }
+}
+
+fn print_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}

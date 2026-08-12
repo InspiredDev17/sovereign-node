@@ -1,0 +1,44 @@
+# All paths must be absolute. Keep this file and the data directory owner-only.
+data_dir = "/var/lib/sovereign-node"
+# Increment this monotonic value for every capability, target, root, or action mapping change.
+policy_version = 1
+
+# The remote listener is intentionally absent by default. To enable it, set an exact loopback or
+# private-LAN SocketAddr and provide TLS files. Wildcard/public addresses and plaintext are rejected.
+# listen = "192.168.1.50:7443"
+#
+# [tls]
+# certificate_pem = "/etc/sovereign-node/node-cert.pem"
+# private_key_pem = "/etc/sovereign-node/node-key.pem"
+
+[policy]
+enabled_capabilities = ["SystemInfo", "ResourceStatus"]
+max_frame_bytes = 1048576
+max_concurrent_actions = 4
+queue_capacity = 32
+max_action_ttl_secs = 300
+require_owner_signature_for_all_actions = true
+max_file_read_bytes = 524288
+max_file_write_bytes = 524288
+max_action_output_bytes = 262144
+max_action_runtime_secs = 30
+
+# Reserved future policy shape. v0.1 rejects advertising FileRead/FileWrite.
+# The root must not contain or be contained by data_dir.
+# [file_roots]
+# reports = "/srv/sovereign-node/reports"
+
+# Reserved future policy shape. v0.1 rejects advertising ExecuteApprovedAction.
+# The eventual caller supplies only a catalog ID; no shell text or uploaded program is accepted.
+# [approved_actions.service_snapshot]
+# executable = "/usr/local/libexec/sovereign-service-snapshot"
+# fixed_arguments = ["--format", "json"]
+# working_directory = "/var/empty"
+# executable_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# timeout_secs = 10
+
+[health]
+# Reserved future policy shape; uncommenting either field is rejected in v0.1. Agent Green has no
+# assumed endpoint. A future adapter must be authenticated, read-only, sanitized, and non-attesting.
+# agent_green_snapshot = "/run/agentgreen/sanitized-health.json"
+# action_broker_label = "local-action-broker"

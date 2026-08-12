@@ -1,0 +1,2203 @@
+//! Durable, fail-closed state for pairing, trust, replay protection, and audit.
+//!
+//! This module deliberately stores authorization and response *digests*, never
+//! bearer credentials, raw action arguments, or response bodies.  Signature
+//! validation remains the authorization layer's responsibility.  Callers use
+//! [`StateStore::reserve_replay_after_validation`] so an invalid authorization is
+//! audited but never consumes a replay identifier.
+
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+use postcard::to_stdvec;
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use thiserror::Error;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+/// SHA-256 digests are used to bind data that must not be stored in plaintext.
+pub type Sha256Digest = [u8; 32];
+
+const SCHEMA_VERSION: i64 = 1;
+const ZERO_HASH: Sha256Digest = [0_u8; 32];
+const MAX_ID_BYTES: usize = 255;
+const MAX_LABEL_BYTES: usize = 255;
+const MAX_CAPABILITY_BYTES: usize = 128;
+// The opaque pairing material may include two public keys and a DER client CA certificate.
+const MAX_PUBLIC_KEY_BYTES: usize = 131_072;
+const MIN_PAIRING_CHALLENGE_BYTES: usize = 16;
+
+/// Capacity limits intentionally fail closed instead of allowing unbounded
+/// unauthenticated state growth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreLimits {
+    pub max_pending_pairings: u64,
+    pub max_trusted_peers: u64,
+    pub max_open_replays: u64,
+}
+
+impl Default for StoreLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_pairings: 64,
+            max_trusted_peers: 1024,
+            max_open_replays: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("state database error: {0}")]
+    Database(#[from] rusqlite::Error),
+    #[error("state serialization error: {0}")]
+    Codec(#[from] postcard::Error),
+    #[error("state filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("state database mutex was poisoned")]
+    LockPoisoned,
+    #[error("database schema {found} is newer than supported schema {supported}")]
+    UnsupportedSchema { found: i64, supported: i64 },
+    #[error("invalid state input: {0}")]
+    InvalidInput(&'static str),
+    #[error("stored state is corrupt: {0}")]
+    CorruptData(&'static str),
+    #[error("resource limit reached: {0}")]
+    ResourceLimit(&'static str),
+    #[error("pairing challenge was not found")]
+    PairingNotFound,
+    #[error("pairing challenge has expired")]
+    PairingExpired,
+    #[error("pairing challenge proof did not match")]
+    PairingChallengeMismatch,
+    #[error("peer is already trusted")]
+    PeerAlreadyTrusted,
+    #[error("peer is revoked and requires an explicit new identity or recovery flow")]
+    PeerRevoked,
+    #[error("request authorization was rejected")]
+    AuthorizationRejected,
+    #[error("request authorization has expired")]
+    AuthorizationExpired,
+    #[error("request replay reservation does not exist")]
+    ReplayNotFound,
+    #[error("request fingerprint does not match its replay reservation")]
+    ReplayFingerprintMismatch,
+    #[error("terminal response metadata conflicts with the immutable stored result")]
+    TerminalResponseConflict,
+    #[error("credential rotation does not match the currently trusted key")]
+    CredentialRotationMismatch,
+    #[error("audit chain is invalid at sequence {sequence}")]
+    AuditChainInvalid { sequence: u64 },
+    #[error("policy version rollback was rejected")]
+    PolicyRollback,
+    #[error("policy content changed without increasing its version")]
+    PolicyVersionReuse,
+}
+
+/// A pending, locally displayed pairing challenge.  Only a digest of the
+/// challenge secret is persisted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingPairingChallenge {
+    pub pairing_id: Uuid,
+    pub node_id: String,
+    pub peer_id: String,
+    pub device_label: String,
+    pub peer_public_key: Vec<u8>,
+    /// Device-key digest displayed locally and bound into the signed transcript.
+    pub node_identity_digest: Sha256Digest,
+    pub challenge_digest: Sha256Digest,
+    pub transport_binding_digest: Sha256Digest,
+    pub requested_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+}
+
+impl PendingPairingChallenge {
+    /// Construct a record while hashing the randomly generated challenge.  A
+    /// challenge must carry at least 128 bits of entropy; short display codes
+    /// should be backed by an independent high-entropy transcript secret.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pairing_id: Uuid,
+        node_id: String,
+        peer_id: String,
+        device_label: String,
+        peer_public_key: Vec<u8>,
+        challenge_secret: &[u8],
+        node_identity_digest: Sha256Digest,
+        transport_binding_digest: Sha256Digest,
+        requested_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<Self, StoreError> {
+        if challenge_secret.len() < MIN_PAIRING_CHALLENGE_BYTES {
+            return Err(StoreError::InvalidInput(
+                "pairing challenge must contain at least 128 bits",
+            ));
+        }
+        let value = Self {
+            pairing_id,
+            node_id,
+            peer_id,
+            device_label,
+            peer_public_key,
+            challenge_digest: sha256(challenge_secret),
+            node_identity_digest,
+            transport_binding_digest,
+            requested_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        validate_identifier(&self.node_id)?;
+        validate_identifier(&self.peer_id)?;
+        validate_bounded_text(&self.device_label, MAX_LABEL_BYTES, "device label")?;
+        if self.peer_public_key.is_empty() || self.peer_public_key.len() > MAX_PUBLIC_KEY_BYTES {
+            return Err(StoreError::InvalidInput("invalid peer public key length"));
+        }
+        if self.expires_at_unix_ms <= self.requested_at_unix_ms {
+            return Err(StoreError::InvalidInput(
+                "pairing expiry must follow creation time",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Explicit owner approval used to turn a pending challenge into trust.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PairingApproval {
+    pub pairing_id: Uuid,
+    pub owner_authority_digest: Sha256Digest,
+    pub capability_manifest_digest: Sha256Digest,
+    pub approved_at_unix_ms: i64,
+    pub trust_expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Pairing {
+    pub pairing_id: Uuid,
+    pub node_id: String,
+    pub peer_id: String,
+    pub device_label: String,
+    pub peer_public_key: Vec<u8>,
+    pub transport_binding_digest: Sha256Digest,
+    pub owner_authority_digest: Sha256Digest,
+    pub capability_manifest_digest: Sha256Digest,
+    pub requested_at_unix_ms: i64,
+    pub approved_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TrustStatus {
+    Active,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrustedPeer {
+    pub peer_id: String,
+    pub pairing_id: Uuid,
+    pub node_id: String,
+    pub device_label: String,
+    pub public_key: Vec<u8>,
+    pub identity_digest: Sha256Digest,
+    pub capability_manifest_digest: Sha256Digest,
+    pub status: TrustStatus,
+    /// Monotonically increases when the peer credential is rotated. Signed
+    /// authorizations bind this value as their trust epoch.
+    pub trust_epoch: u64,
+    pub paired_at_unix_ms: i64,
+    pub trust_expires_at_unix_ms: Option<i64>,
+    pub last_key_rotation_at_unix_ms: Option<i64>,
+    pub revoked_at_unix_ms: Option<i64>,
+}
+
+impl TrustedPeer {
+    #[must_use]
+    pub fn is_currently_trusted(&self, now_unix_ms: i64) -> bool {
+        self.status == TrustStatus::Active
+            && self
+                .trust_expires_at_unix_ms
+                .is_none_or(|expires_at| expires_at > now_unix_ms)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RevocationRecord {
+    pub peer_id: String,
+    pub pairing_id: Uuid,
+    pub revoked_at_unix_ms: i64,
+    pub owner_authority_digest: Sha256Digest,
+    pub reason_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RevocationOutcome {
+    Revoked(RevocationRecord),
+    AlreadyRevoked(RevocationRecord),
+    NotFound,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CredentialRotationOutcome {
+    Rotated(TrustedPeer),
+    AlreadyCurrent(TrustedPeer),
+}
+
+/// Security-relevant request fields used for durable replay binding.  Raw
+/// arguments, raw targets, and authorization tokens are intentionally absent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplayReservation {
+    pub request_id: Uuid,
+    pub task_id: Uuid,
+    pub pairing_id: Uuid,
+    pub trust_epoch: u64,
+    pub policy_version: u64,
+    pub policy_digest: Sha256Digest,
+    pub replay_sequence: u64,
+    pub replay_nonce: Sha256Digest,
+    pub agent_id: String,
+    pub node_id: String,
+    pub capability: String,
+    pub target_digest: Sha256Digest,
+    pub arguments_digest: Sha256Digest,
+    pub authorization_digest: Sha256Digest,
+    pub expires_at_unix_ms: i64,
+}
+
+impl ReplayReservation {
+    pub fn fingerprint(&self) -> Result<Sha256Digest, StoreError> {
+        self.validate()?;
+        Ok(sha256(&encode(self)?))
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        validate_identifier(&self.agent_id)?;
+        validate_identifier(&self.node_id)?;
+        validate_bounded_text(&self.capability, MAX_CAPABILITY_BYTES, "capability")?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TerminalStatus {
+    Succeeded,
+    Rejected,
+    Failed,
+    Cancelled,
+    Expired,
+    Indeterminate,
+}
+
+/// Immutable metadata for a terminal action response.  The response itself is
+/// returned to the caller by the runtime and is not retained here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalResponseMetadata {
+    pub status: TerminalStatus,
+    pub response_digest: Sha256Digest,
+    pub redacted_error_digest: Option<Sha256Digest>,
+    pub response_size_bytes: u64,
+    pub completed_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplayOutcome {
+    Reserved {
+        fingerprint: Sha256Digest,
+    },
+    DuplicateSame {
+        fingerprint: Sha256Digest,
+        terminal: Option<TerminalResponseMetadata>,
+    },
+    Collision {
+        existing_fingerprint: Sha256Digest,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalRecordOutcome {
+    Recorded,
+    AlreadyRecordedSame,
+}
+
+/// Audit entries have a closed vocabulary and digest-only context.  This keeps
+/// secrets, action arguments, raw targets, and credential material out of the
+/// audit database by construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AuditKind {
+    PairingChallengeCreated,
+    PairingApproved,
+    PairingRejected,
+    PeerRevoked,
+    CredentialRotated,
+    PolicyActivated,
+    AuthorizationRejected,
+    RequestReserved,
+    ReplayDuplicate,
+    ReplayCollision,
+    TerminalResponseRecorded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AuditOutcome {
+    Accepted,
+    Rejected,
+    Observed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuditEventDraft {
+    pub occurred_at_unix_ms: i64,
+    pub kind: AuditKind,
+    pub outcome: AuditOutcome,
+    pub request_id: Option<Uuid>,
+    pub actor_digest: Option<Sha256Digest>,
+    pub subject_digest: Option<Sha256Digest>,
+    pub context_digest: Option<Sha256Digest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub sequence: u64,
+    pub event_id: Uuid,
+    pub occurred_at_unix_ms: i64,
+    pub kind: AuditKind,
+    pub outcome: AuditOutcome,
+    pub request_id: Option<Uuid>,
+    pub actor_digest: Option<Sha256Digest>,
+    pub subject_digest: Option<Sha256Digest>,
+    pub context_digest: Option<Sha256Digest>,
+    pub previous_hash: Sha256Digest,
+    pub event_hash: Sha256Digest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuditChainState {
+    pub event_count: u64,
+    pub tail_hash: Sha256Digest,
+}
+
+#[derive(Debug)]
+pub struct StateStore {
+    connection: Mutex<Connection>,
+    path: PathBuf,
+    limits: StoreLimits,
+}
+
+impl StateStore {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_limits(path, StoreLimits::default())
+    }
+
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+    ) -> Result<Self, StoreError> {
+        if !cfg!(unix) {
+            return Err(StoreError::InvalidInput(
+                "v0.1 state storage requires Unix ownership and mode checks",
+            ));
+        }
+        validate_limits(limits)?;
+        let path = path.as_ref().to_path_buf();
+        prepare_private_database_file(&path)?;
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut connection = Connection::open_with_flags(&path, flags)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        configure_connection(&connection)?;
+        migrate(&mut connection)?;
+        tighten_private_permissions(&path)?;
+
+        Ok(Self {
+            connection: Mutex::new(connection),
+            path,
+            limits,
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Persist the canonical local policy binding and reject rollback or same-version remapping.
+    pub fn activate_policy(
+        &self,
+        version: u64,
+        digest: Sha256Digest,
+        now_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        if version == 0 {
+            return Err(StoreError::InvalidInput("policy version must be non-zero"));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let existing: Option<(Vec<u8>, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT policy_version, policy_digest FROM policy_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_version, stored_digest)) = existing {
+            let stored_version = u64::from_be_bytes(
+                stored_version
+                    .try_into()
+                    .map_err(|_| StoreError::CorruptData("policy version has invalid length"))?,
+            );
+            let stored_digest = digest_from_blob(stored_digest)?;
+            if version < stored_version {
+                return Err(StoreError::PolicyRollback);
+            }
+            if version == stored_version {
+                if !constant_time_digest_eq(&digest, &stored_digest) {
+                    return Err(StoreError::PolicyVersionReuse);
+                }
+                transaction.commit()?;
+                return Ok(());
+            }
+        }
+        transaction.execute(
+            "INSERT INTO policy_state(singleton, policy_version, policy_digest)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 policy_version = excluded.policy_version,
+                 policy_digest = excluded.policy_digest",
+            params![&u64_blob(version)[..], &digest[..]],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: now_unix_ms,
+                kind: AuditKind::PolicyActivated,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: None,
+                subject_digest: Some(sha256(&u64_blob(version))),
+                context_digest: Some(digest),
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn put_pending_pairing(
+        &self,
+        challenge: &PendingPairingChallenge,
+    ) -> Result<(), StoreError> {
+        challenge.validate()?;
+        let record = encode(challenge)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        transaction.execute(
+            "DELETE FROM pending_pairings WHERE expires_at_unix_ms <= ?1",
+            [challenge.requested_at_unix_ms],
+        )?;
+
+        let existing: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_pairings WHERE pairing_id = ?1",
+                [challenge.pairing_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let existing: PendingPairingChallenge = decode(&existing)?;
+            if existing == *challenge {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::InvalidInput(
+                "pairing identifier already binds different challenge data",
+            ));
+        }
+
+        enforce_count_limit(
+            &transaction,
+            "SELECT COUNT(*) FROM pending_pairings",
+            self.limits.max_pending_pairings,
+            "pending pairing capacity",
+        )?;
+
+        transaction.execute(
+            "INSERT INTO pending_pairings
+                (pairing_id, peer_id, node_id, expires_at_unix_ms, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                challenge.pairing_id.to_string(),
+                challenge.peer_id,
+                challenge.node_id,
+                challenge.expires_at_unix_ms,
+                record
+            ],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: challenge.requested_at_unix_ms,
+                kind: AuditKind::PairingChallengeCreated,
+                outcome: AuditOutcome::Observed,
+                request_id: None,
+                actor_digest: None,
+                subject_digest: Some(sha256(challenge.peer_id.as_bytes())),
+                context_digest: Some(sha256(challenge.node_id.as_bytes())),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()
+    }
+
+    pub fn pending_pairing(
+        &self,
+        pairing_id: Uuid,
+    ) -> Result<Option<PendingPairingChallenge>, StoreError> {
+        let connection = self.lock()?;
+        let record: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT record FROM pending_pairings WHERE pairing_id = ?1",
+                [pairing_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        record.map(|bytes| decode(&bytes)).transpose()
+    }
+
+    pub fn audit_pairing_rejection(
+        &self,
+        pairing_id: Uuid,
+        occurred_at_unix_ms: i64,
+        reason: &[u8],
+    ) -> Result<(), StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_pairings WHERE pairing_id = ?1",
+                [pairing_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(record) = record else {
+            return Err(StoreError::PairingNotFound);
+        };
+        let pending: PendingPairingChallenge = decode(&record)?;
+        append_pairing_rejection_audit(&transaction, &pending, occurred_at_unix_ms, reason)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Establish trust only after the owner approval and pairing proof have
+    /// both been supplied.  Approval, trust insertion, challenge consumption,
+    /// and audit append commit atomically.
+    pub fn approve_pairing(
+        &self,
+        approval: &PairingApproval,
+        presented_challenge: &[u8],
+    ) -> Result<(Pairing, TrustedPeer), StoreError> {
+        if presented_challenge.len() < MIN_PAIRING_CHALLENGE_BYTES {
+            return Err(StoreError::PairingChallengeMismatch);
+        }
+        if approval
+            .trust_expires_at_unix_ms
+            .is_some_and(|expires_at| expires_at <= approval.approved_at_unix_ms)
+        {
+            return Err(StoreError::InvalidInput(
+                "trust expiry must follow approval time",
+            ));
+        }
+
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending_record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_pairings WHERE pairing_id = ?1",
+                [approval.pairing_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(pending_record) = pending_record else {
+            return Err(StoreError::PairingNotFound);
+        };
+        let pending: PendingPairingChallenge = decode(&pending_record)?;
+
+        if pending.expires_at_unix_ms <= approval.approved_at_unix_ms {
+            transaction.execute(
+                "DELETE FROM pending_pairings WHERE pairing_id = ?1",
+                [approval.pairing_id.to_string()],
+            )?;
+            append_pairing_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"expired",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::PairingExpired);
+        }
+
+        let presented_digest = sha256(presented_challenge);
+        if !constant_time_digest_eq(&pending.challenge_digest, &presented_digest) {
+            append_pairing_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"challenge-mismatch",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::PairingChallengeMismatch);
+        }
+
+        if transaction
+            .query_row(
+                "SELECT 1 FROM revocations WHERE peer_id = ?1",
+                [&pending.peer_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            append_pairing_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"peer-revoked",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::PeerRevoked);
+        }
+
+        if transaction
+            .query_row(
+                "SELECT 1 FROM trusted_peers WHERE peer_id = ?1",
+                [&pending.peer_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::PeerAlreadyTrusted);
+        }
+        enforce_count_limit(
+            &transaction,
+            "SELECT COUNT(*) FROM trusted_peers",
+            self.limits.max_trusted_peers,
+            "trusted peer capacity",
+        )?;
+
+        let pairing = Pairing {
+            pairing_id: pending.pairing_id,
+            node_id: pending.node_id.clone(),
+            peer_id: pending.peer_id.clone(),
+            device_label: pending.device_label.clone(),
+            peer_public_key: pending.peer_public_key.clone(),
+            transport_binding_digest: pending.transport_binding_digest,
+            owner_authority_digest: approval.owner_authority_digest,
+            capability_manifest_digest: approval.capability_manifest_digest,
+            requested_at_unix_ms: pending.requested_at_unix_ms,
+            approved_at_unix_ms: approval.approved_at_unix_ms,
+        };
+        let trusted_peer = TrustedPeer {
+            peer_id: pending.peer_id.clone(),
+            pairing_id: pending.pairing_id,
+            node_id: pending.node_id.clone(),
+            device_label: pending.device_label.clone(),
+            public_key: pending.peer_public_key.clone(),
+            identity_digest: peer_identity_digest(&pending.peer_id, &pending.peer_public_key),
+            capability_manifest_digest: approval.capability_manifest_digest,
+            status: TrustStatus::Active,
+            trust_epoch: 1,
+            paired_at_unix_ms: approval.approved_at_unix_ms,
+            trust_expires_at_unix_ms: approval.trust_expires_at_unix_ms,
+            last_key_rotation_at_unix_ms: None,
+            revoked_at_unix_ms: None,
+        };
+
+        transaction.execute(
+            "INSERT INTO pairings (pairing_id, peer_id, node_id, record)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                pairing.pairing_id.to_string(),
+                pairing.peer_id,
+                pairing.node_id,
+                encode(&pairing)?
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO trusted_peers
+                (peer_id, pairing_id, trust_status, trust_expires_at_unix_ms, record)
+             VALUES (?1, ?2, 1, ?3, ?4)",
+            params![
+                trusted_peer.peer_id,
+                trusted_peer.pairing_id.to_string(),
+                trusted_peer.trust_expires_at_unix_ms,
+                encode(&trusted_peer)?
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM pending_pairings WHERE pairing_id = ?1",
+            [pending.pairing_id.to_string()],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: approval.approved_at_unix_ms,
+                kind: AuditKind::PairingApproved,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: Some(approval.owner_authority_digest),
+                subject_digest: Some(trusted_peer.identity_digest),
+                context_digest: Some(approval.capability_manifest_digest),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok((pairing, trusted_peer))
+    }
+
+    pub fn pairing(&self, pairing_id: Uuid) -> Result<Option<Pairing>, StoreError> {
+        let connection = self.lock()?;
+        let record: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT record FROM pairings WHERE pairing_id = ?1",
+                [pairing_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        record.map(|bytes| decode(&bytes)).transpose()
+    }
+
+    /// Returns only active, non-expired trust.  Revoked and expired peers are
+    /// indistinguishable from untrusted peers at this authorization boundary.
+    pub fn currently_trusted_peer(
+        &self,
+        peer_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<Option<TrustedPeer>, StoreError> {
+        validate_identifier(peer_id)?;
+        let connection = self.lock()?;
+        let record: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT record FROM trusted_peers
+                 WHERE peer_id = ?1
+                   AND trust_status = 1
+                   AND (trust_expires_at_unix_ms IS NULL OR trust_expires_at_unix_ms > ?2)",
+                params![peer_id, now_unix_ms],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let peer = record
+            .map(|bytes| decode::<TrustedPeer>(&bytes))
+            .transpose()?;
+        if peer
+            .as_ref()
+            .is_some_and(|value| !value.is_currently_trusted(now_unix_ms))
+        {
+            return Err(StoreError::CorruptData("trust index disagrees with record"));
+        }
+        Ok(peer)
+    }
+
+    pub fn peer_record(&self, peer_id: &str) -> Result<Option<TrustedPeer>, StoreError> {
+        validate_identifier(peer_id)?;
+        let connection = self.lock()?;
+        let record: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT record FROM trusted_peers WHERE peer_id = ?1",
+                [peer_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        record.map(|bytes| decode(&bytes)).transpose()
+    }
+
+    pub fn currently_trusted_peers(
+        &self,
+        now_unix_ms: i64,
+    ) -> Result<Vec<TrustedPeer>, StoreError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT record FROM trusted_peers
+             WHERE trust_status = 1
+               AND (trust_expires_at_unix_ms IS NULL OR trust_expires_at_unix_ms > ?1)
+             ORDER BY peer_id ASC",
+        )?;
+        let rows = statement.query_map([now_unix_ms], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut peers = Vec::new();
+        for row in rows {
+            let peer: TrustedPeer = decode(&row?)?;
+            if !peer.is_currently_trusted(now_unix_ms) {
+                return Err(StoreError::CorruptData("trust index disagrees with record"));
+            }
+            peers.push(peer);
+        }
+        Ok(peers)
+    }
+
+    pub fn revoke_peer(
+        &self,
+        peer_id: &str,
+        revoked_at_unix_ms: i64,
+        owner_authority_digest: Sha256Digest,
+        reason_digest: Sha256Digest,
+    ) -> Result<RevocationOutcome, StoreError> {
+        validate_identifier(peer_id)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(record) = revocation_in_transaction(&transaction, peer_id)? {
+            transaction.commit()?;
+            return Ok(RevocationOutcome::AlreadyRevoked(record));
+        }
+        let trusted_record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM trusted_peers WHERE peer_id = ?1",
+                [peer_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(trusted_record) = trusted_record else {
+            transaction.commit()?;
+            return Ok(RevocationOutcome::NotFound);
+        };
+        let mut peer: TrustedPeer = decode(&trusted_record)?;
+        peer.status = TrustStatus::Revoked;
+        peer.revoked_at_unix_ms = Some(revoked_at_unix_ms);
+        let revocation = RevocationRecord {
+            peer_id: peer.peer_id.clone(),
+            pairing_id: peer.pairing_id,
+            revoked_at_unix_ms,
+            owner_authority_digest,
+            reason_digest,
+        };
+
+        transaction.execute(
+            "UPDATE trusted_peers
+             SET trust_status = 2, record = ?2
+             WHERE peer_id = ?1 AND trust_status = 1",
+            params![peer_id, encode(&peer)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO revocations
+                (peer_id, pairing_id, revoked_at_unix_ms, record)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                peer_id,
+                peer.pairing_id.to_string(),
+                revoked_at_unix_ms,
+                encode(&revocation)?
+            ],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: revoked_at_unix_ms,
+                kind: AuditKind::PeerRevoked,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: Some(owner_authority_digest),
+                subject_digest: Some(peer.identity_digest),
+                context_digest: Some(reason_digest),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(RevocationOutcome::Revoked(revocation))
+    }
+
+    pub fn revocation_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<RevocationRecord>, StoreError> {
+        validate_identifier(peer_id)?;
+        let connection = self.lock()?;
+        revocation_in_connection(&connection, peer_id)
+    }
+
+    pub fn is_peer_revoked(&self, peer_id: &str) -> Result<bool, StoreError> {
+        Ok(self.revocation_for_peer(peer_id)?.is_some())
+    }
+
+    /// Rotate a paired credential without silently creating a new trust
+    /// relationship.  The expected old key digest prevents lost-update races.
+    pub fn rotate_peer_credential(
+        &self,
+        peer_id: &str,
+        expected_public_key_digest: Sha256Digest,
+        new_public_key: Vec<u8>,
+        owner_authority_digest: Sha256Digest,
+        rotated_at_unix_ms: i64,
+    ) -> Result<CredentialRotationOutcome, StoreError> {
+        validate_identifier(peer_id)?;
+        if new_public_key.is_empty() || new_public_key.len() > MAX_PUBLIC_KEY_BYTES {
+            return Err(StoreError::InvalidInput("invalid peer public key length"));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM trusted_peers WHERE peer_id = ?1 AND trust_status = 1",
+                [peer_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(record) = record else {
+            return if revocation_in_transaction(&transaction, peer_id)?.is_some() {
+                Err(StoreError::PeerRevoked)
+            } else {
+                Err(StoreError::PairingNotFound)
+            };
+        };
+        let mut peer: TrustedPeer = decode(&record)?;
+        let current_digest = sha256(&peer.public_key);
+        if !constant_time_digest_eq(&current_digest, &expected_public_key_digest) {
+            return Err(StoreError::CredentialRotationMismatch);
+        }
+        if peer.public_key == new_public_key {
+            transaction.commit()?;
+            return Ok(CredentialRotationOutcome::AlreadyCurrent(peer));
+        }
+        peer.public_key = new_public_key;
+        peer.identity_digest = peer_identity_digest(&peer.peer_id, &peer.public_key);
+        peer.trust_epoch = peer
+            .trust_epoch
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData("credential epoch overflow"))?;
+        peer.last_key_rotation_at_unix_ms = Some(rotated_at_unix_ms);
+        transaction.execute(
+            "UPDATE trusted_peers SET record = ?2 WHERE peer_id = ?1 AND trust_status = 1",
+            params![peer_id, encode(&peer)?],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: rotated_at_unix_ms,
+                kind: AuditKind::CredentialRotated,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: Some(owner_authority_digest),
+                subject_digest: Some(peer.identity_digest),
+                context_digest: Some(current_digest),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(CredentialRotationOutcome::Rotated(peer))
+    }
+
+    /// Validate the authorization first, then atomically reserve the request
+    /// identifier.  If validation fails, the denial is audit-chained and no
+    /// replay row is inserted.
+    pub fn reserve_replay_after_validation<F, E>(
+        &self,
+        reservation: &ReplayReservation,
+        validate_authorization: F,
+    ) -> Result<ReplayOutcome, StoreError>
+    where
+        F: FnOnce() -> Result<(), E>,
+        E: fmt::Display,
+    {
+        reservation.validate()?;
+        let now_unix_ms = unix_time_ms()?;
+        if let Err(error) = validate_authorization() {
+            self.append_audit(AuditEventDraft {
+                occurred_at_unix_ms: now_unix_ms,
+                kind: AuditKind::AuthorizationRejected,
+                outcome: AuditOutcome::Rejected,
+                request_id: Some(reservation.request_id),
+                actor_digest: Some(sha256(reservation.agent_id.as_bytes())),
+                subject_digest: Some(sha256(reservation.node_id.as_bytes())),
+                context_digest: Some(sha256(error.to_string().as_bytes())),
+            })?;
+            return Err(StoreError::AuthorizationRejected);
+        }
+        self.reserve_validated_replay_at(reservation, now_unix_ms)
+    }
+
+    pub fn reserve_validated_replay_at(
+        &self,
+        reservation: &ReplayReservation,
+        now_unix_ms: i64,
+    ) -> Result<ReplayOutcome, StoreError> {
+        if reservation.expires_at_unix_ms <= now_unix_ms {
+            return Err(StoreError::AuthorizationExpired);
+        }
+        let fingerprint = reservation.fingerprint()?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Defense in depth: even a caller that accidentally treats a stale
+        // authorization as valid cannot reserve work for a revoked pairing.
+        if transaction
+            .query_row(
+                "SELECT 1 FROM revocations WHERE pairing_id = ?1",
+                [reservation.pairing_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            append_audit_in_transaction(
+                &transaction,
+                AuditEventDraft {
+                    occurred_at_unix_ms: now_unix_ms,
+                    kind: AuditKind::AuthorizationRejected,
+                    outcome: AuditOutcome::Rejected,
+                    request_id: Some(reservation.request_id),
+                    actor_digest: Some(sha256(reservation.agent_id.as_bytes())),
+                    subject_digest: Some(sha256(reservation.pairing_id.as_bytes())),
+                    context_digest: Some(sha256(b"revoked-pairing")),
+                },
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::PeerRevoked);
+        }
+
+        // Serialize replay reservation with revocation and credential rotation. Re-check the
+        // durable peer record inside this IMMEDIATE transaction so an old epoch cannot slip
+        // through after a key rotation between signature verification and reservation.
+        let peer_record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM trusted_peers
+                 WHERE pairing_id = ?1 AND trust_status = 1
+                   AND (trust_expires_at_unix_ms IS NULL OR trust_expires_at_unix_ms > ?2)",
+                params![reservation.pairing_id.to_string(), now_unix_ms],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(peer_record) = peer_record else {
+            append_audit_in_transaction(
+                &transaction,
+                AuditEventDraft {
+                    occurred_at_unix_ms: now_unix_ms,
+                    kind: AuditKind::AuthorizationRejected,
+                    outcome: AuditOutcome::Rejected,
+                    request_id: Some(reservation.request_id),
+                    actor_digest: Some(sha256(reservation.agent_id.as_bytes())),
+                    subject_digest: Some(sha256(reservation.pairing_id.as_bytes())),
+                    context_digest: Some(sha256(b"inactive-or-expired-pairing")),
+                },
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::PeerRevoked);
+        };
+        let current_peer: TrustedPeer = decode(&peer_record)?;
+        if current_peer.trust_epoch != reservation.trust_epoch {
+            append_audit_in_transaction(
+                &transaction,
+                AuditEventDraft {
+                    occurred_at_unix_ms: now_unix_ms,
+                    kind: AuditKind::AuthorizationRejected,
+                    outcome: AuditOutcome::Rejected,
+                    request_id: Some(reservation.request_id),
+                    actor_digest: Some(sha256(reservation.agent_id.as_bytes())),
+                    subject_digest: Some(sha256(reservation.pairing_id.as_bytes())),
+                    context_digest: Some(sha256(b"stale-trust-epoch")),
+                },
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::PeerRevoked);
+        }
+
+        let active_policy: Option<(Vec<u8>, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT policy_version, policy_digest FROM policy_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((policy_version, policy_digest)) = active_policy else {
+            return Err(StoreError::PolicyRollback);
+        };
+        let policy_version = u64::from_be_bytes(
+            policy_version
+                .try_into()
+                .map_err(|_| StoreError::CorruptData("policy version has invalid length"))?,
+        );
+        let policy_digest = digest_from_blob(policy_digest)?;
+        if policy_version != reservation.policy_version
+            || !constant_time_digest_eq(&policy_digest, &reservation.policy_digest)
+        {
+            return Err(StoreError::PolicyVersionReuse);
+        }
+
+        let existing: Option<(Vec<u8>, Option<Vec<u8>>)> = transaction
+            .query_row(
+                "SELECT request_fingerprint, terminal_record
+                 FROM request_replays
+                 WHERE request_id = ?1
+                    OR (pairing_id = ?2 AND trust_epoch = ?3
+                        AND (replay_sequence = ?4 OR replay_nonce = ?5))
+                 ORDER BY CASE WHEN request_id = ?1 THEN 0 ELSE 1 END
+                 LIMIT 1",
+                params![
+                    reservation.request_id.to_string(),
+                    reservation.pairing_id.to_string(),
+                    &u64_blob(reservation.trust_epoch)[..],
+                    &u64_blob(reservation.replay_sequence)[..],
+                    &reservation.replay_nonce[..]
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let (outcome, audit_kind, audit_outcome) = if let Some((existing, terminal)) = existing {
+            let existing_fingerprint = digest_from_blob(existing)?;
+            if constant_time_digest_eq(&existing_fingerprint, &fingerprint) {
+                let terminal = terminal
+                    .map(|bytes| decode::<TerminalResponseMetadata>(&bytes))
+                    .transpose()?;
+                (
+                    ReplayOutcome::DuplicateSame {
+                        fingerprint,
+                        terminal,
+                    },
+                    AuditKind::ReplayDuplicate,
+                    AuditOutcome::Observed,
+                )
+            } else {
+                (
+                    ReplayOutcome::Collision {
+                        existing_fingerprint,
+                    },
+                    AuditKind::ReplayCollision,
+                    AuditOutcome::Rejected,
+                )
+            }
+        } else {
+            enforce_count_limit(
+                &transaction,
+                "SELECT COUNT(*) FROM request_replays WHERE terminal_record IS NULL",
+                self.limits.max_open_replays,
+                "open replay reservation capacity",
+            )?;
+            transaction.execute(
+                "INSERT INTO request_replays
+                    (request_id, pairing_id, trust_epoch, replay_sequence,
+                     replay_nonce, request_fingerprint, reserved_at_unix_ms,
+                     expires_at_unix_ms, terminal_record)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![
+                    reservation.request_id.to_string(),
+                    reservation.pairing_id.to_string(),
+                    &u64_blob(reservation.trust_epoch)[..],
+                    &u64_blob(reservation.replay_sequence)[..],
+                    &reservation.replay_nonce[..],
+                    &fingerprint[..],
+                    now_unix_ms,
+                    reservation.expires_at_unix_ms
+                ],
+            )?;
+            (
+                ReplayOutcome::Reserved { fingerprint },
+                AuditKind::RequestReserved,
+                AuditOutcome::Accepted,
+            )
+        };
+
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: now_unix_ms,
+                kind: audit_kind,
+                outcome: audit_outcome,
+                request_id: Some(reservation.request_id),
+                actor_digest: Some(sha256(reservation.agent_id.as_bytes())),
+                subject_digest: Some(sha256(reservation.node_id.as_bytes())),
+                context_digest: Some(fingerprint),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(outcome)
+    }
+
+    pub fn replay_outcome(
+        &self,
+        reservation: &ReplayReservation,
+    ) -> Result<Option<ReplayOutcome>, StoreError> {
+        let fingerprint = reservation.fingerprint()?;
+        let connection = self.lock()?;
+        let existing: Option<(Vec<u8>, Option<Vec<u8>>)> = connection
+            .query_row(
+                "SELECT request_fingerprint, terminal_record
+                 FROM request_replays WHERE request_id = ?1",
+                [reservation.request_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((existing, terminal)) = existing else {
+            return Ok(None);
+        };
+        let existing_fingerprint = digest_from_blob(existing)?;
+        if constant_time_digest_eq(&existing_fingerprint, &fingerprint) {
+            Ok(Some(ReplayOutcome::DuplicateSame {
+                fingerprint,
+                terminal: terminal
+                    .map(|bytes| decode::<TerminalResponseMetadata>(&bytes))
+                    .transpose()?,
+            }))
+        } else {
+            Ok(Some(ReplayOutcome::Collision {
+                existing_fingerprint,
+            }))
+        }
+    }
+
+    /// Record terminal metadata exactly once.  A retry with identical metadata
+    /// is idempotent; any different terminal result fails closed.
+    pub fn record_terminal_response(
+        &self,
+        request_id: Uuid,
+        expected_fingerprint: Sha256Digest,
+        terminal: &TerminalResponseMetadata,
+    ) -> Result<TerminalRecordOutcome, StoreError> {
+        let terminal_record = encode(terminal)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(Vec<u8>, Option<Vec<u8>>)> = transaction
+            .query_row(
+                "SELECT request_fingerprint, terminal_record
+                 FROM request_replays WHERE request_id = ?1",
+                [request_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored_fingerprint, stored_terminal)) = existing else {
+            return Err(StoreError::ReplayNotFound);
+        };
+        let stored_fingerprint = digest_from_blob(stored_fingerprint)?;
+        if !constant_time_digest_eq(&stored_fingerprint, &expected_fingerprint) {
+            return Err(StoreError::ReplayFingerprintMismatch);
+        }
+
+        let outcome = if let Some(stored_terminal) = stored_terminal {
+            let stored_terminal: TerminalResponseMetadata = decode(&stored_terminal)?;
+            if stored_terminal != *terminal {
+                return Err(StoreError::TerminalResponseConflict);
+            }
+            TerminalRecordOutcome::AlreadyRecordedSame
+        } else {
+            transaction.execute(
+                "UPDATE request_replays SET terminal_record = ?2
+                 WHERE request_id = ?1 AND terminal_record IS NULL",
+                params![request_id.to_string(), terminal_record],
+            )?;
+            append_audit_in_transaction(
+                &transaction,
+                AuditEventDraft {
+                    occurred_at_unix_ms: terminal.completed_at_unix_ms,
+                    kind: AuditKind::TerminalResponseRecorded,
+                    outcome: AuditOutcome::Observed,
+                    request_id: Some(request_id),
+                    actor_digest: None,
+                    subject_digest: Some(expected_fingerprint),
+                    context_digest: Some(terminal.response_digest),
+                },
+            )?;
+            TerminalRecordOutcome::Recorded
+        };
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(outcome)
+    }
+
+    pub fn terminal_response(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Option<TerminalResponseMetadata>, StoreError> {
+        let connection = self.lock()?;
+        let record: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT terminal_record FROM request_replays
+                 WHERE request_id = ?1 AND terminal_record IS NOT NULL",
+                [request_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        record.map(|bytes| decode(&bytes)).transpose()
+    }
+
+    pub fn append_audit(&self, draft: AuditEventDraft) -> Result<AuditEvent, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let event = append_audit_in_transaction(&transaction, draft)?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(event)
+    }
+
+    pub fn audit_events_after(
+        &self,
+        sequence: u64,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>, StoreError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(StoreError::InvalidInput(
+                "audit query limit is out of range",
+            ));
+        }
+        let sequence = i64::try_from(sequence)
+            .map_err(|_| StoreError::InvalidInput("audit sequence is too large"))?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT record FROM audit_events
+             WHERE sequence > ?1 ORDER BY sequence ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![sequence, limit], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(decode(&row?)?);
+        }
+        Ok(events)
+    }
+
+    /// Verify every link and the durable tail marker.  This is suitable for
+    /// startup checks and Agent Green monitoring.
+    pub fn verify_audit_chain(&self) -> Result<AuditChainState, StoreError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT sequence, previous_hash, event_hash, record
+             FROM audit_events ORDER BY sequence ASC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut expected_sequence = 1_u64;
+        let mut previous_hash = ZERO_HASH;
+        while let Some(row) = rows.next()? {
+            let stored_sequence: i64 = row.get(0)?;
+            let stored_previous = digest_from_blob(row.get(1)?)?;
+            let stored_hash = digest_from_blob(row.get(2)?)?;
+            let record: Vec<u8> = row.get(3)?;
+            let event: AuditEvent = decode(&record)?;
+            let sequence = u64::try_from(stored_sequence)
+                .map_err(|_| StoreError::CorruptData("negative audit sequence"))?;
+            if sequence != expected_sequence
+                || event.sequence != sequence
+                || event.previous_hash != stored_previous
+                || event.event_hash != stored_hash
+                || !constant_time_digest_eq(&stored_previous, &previous_hash)
+                || !constant_time_digest_eq(&audit_event_hash(&event)?, &stored_hash)
+            {
+                return Err(StoreError::AuditChainInvalid { sequence });
+            }
+            previous_hash = stored_hash;
+            expected_sequence = expected_sequence
+                .checked_add(1)
+                .ok_or(StoreError::CorruptData("audit sequence overflow"))?;
+        }
+        drop(rows);
+        drop(statement);
+
+        let (tail_sequence, tail_hash): (i64, Vec<u8>) = connection.query_row(
+            "SELECT tail_sequence, tail_hash FROM audit_chain_tail WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let tail_sequence = u64::try_from(tail_sequence)
+            .map_err(|_| StoreError::CorruptData("negative audit tail sequence"))?;
+        let tail_hash = digest_from_blob(tail_hash)?;
+        let event_count = expected_sequence - 1;
+        if tail_sequence != event_count || !constant_time_digest_eq(&tail_hash, &previous_hash) {
+            return Err(StoreError::AuditChainInvalid {
+                sequence: event_count.saturating_add(1),
+            });
+        }
+        Ok(AuditChainState {
+            event_count,
+            tail_hash,
+        })
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        self.connection.lock().map_err(|_| StoreError::LockPoisoned)
+    }
+
+    fn tighten_permissions(&self) -> Result<(), StoreError> {
+        tighten_private_permissions(&self.path)
+    }
+}
+
+fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = FULL;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA secure_delete = ON;
+         PRAGMA trusted_schema = OFF;
+         PRAGMA wal_autocheckpoint = 1000;",
+    )?;
+    Ok(())
+}
+
+fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_pairings (
+             pairing_id TEXT PRIMARY KEY NOT NULL,
+             peer_id TEXT NOT NULL,
+             node_id TEXT NOT NULL,
+             expires_at_unix_ms INTEGER NOT NULL,
+             record BLOB NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS pending_pairings_expiry_idx
+             ON pending_pairings(expires_at_unix_ms);
+         CREATE INDEX IF NOT EXISTS pending_pairings_peer_idx
+             ON pending_pairings(peer_id);
+
+         CREATE TABLE IF NOT EXISTS pairings (
+             pairing_id TEXT PRIMARY KEY NOT NULL,
+             peer_id TEXT NOT NULL UNIQUE,
+             node_id TEXT NOT NULL,
+             record BLOB NOT NULL
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS trusted_peers (
+             peer_id TEXT PRIMARY KEY NOT NULL,
+             pairing_id TEXT NOT NULL UNIQUE REFERENCES pairings(pairing_id),
+             trust_status INTEGER NOT NULL CHECK (trust_status IN (1, 2)),
+             trust_expires_at_unix_ms INTEGER,
+             record BLOB NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS trusted_peers_current_idx
+             ON trusted_peers(trust_status, trust_expires_at_unix_ms);
+
+         CREATE TABLE IF NOT EXISTS revocations (
+             peer_id TEXT PRIMARY KEY NOT NULL REFERENCES trusted_peers(peer_id),
+             pairing_id TEXT NOT NULL REFERENCES pairings(pairing_id),
+             revoked_at_unix_ms INTEGER NOT NULL,
+             record BLOB NOT NULL
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS request_replays (
+             request_id TEXT PRIMARY KEY NOT NULL,
+             pairing_id TEXT NOT NULL,
+             trust_epoch BLOB NOT NULL CHECK (length(trust_epoch) = 8),
+             replay_sequence BLOB NOT NULL CHECK (length(replay_sequence) = 8),
+             replay_nonce BLOB NOT NULL CHECK (length(replay_nonce) = 32),
+             request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
+             reserved_at_unix_ms INTEGER NOT NULL,
+             expires_at_unix_ms INTEGER NOT NULL,
+             terminal_record BLOB
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS request_replays_open_idx
+             ON request_replays(reserved_at_unix_ms) WHERE terminal_record IS NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS request_replays_sequence_idx
+             ON request_replays(pairing_id, trust_epoch, replay_sequence);
+         CREATE UNIQUE INDEX IF NOT EXISTS request_replays_nonce_idx
+             ON request_replays(pairing_id, trust_epoch, replay_nonce);
+
+         CREATE TABLE IF NOT EXISTS policy_state (
+             singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+             policy_version BLOB NOT NULL CHECK (length(policy_version) = 8),
+             policy_digest BLOB NOT NULL CHECK (length(policy_digest) = 32)
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS audit_events (
+             sequence INTEGER PRIMARY KEY NOT NULL,
+             event_id TEXT NOT NULL UNIQUE,
+             previous_hash BLOB NOT NULL CHECK (length(previous_hash) = 32),
+             event_hash BLOB NOT NULL UNIQUE CHECK (length(event_hash) = 32),
+             record BLOB NOT NULL
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS audit_chain_tail (
+             singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+             tail_sequence INTEGER NOT NULL CHECK (tail_sequence >= 0),
+             tail_hash BLOB NOT NULL CHECK (length(tail_hash) = 32)
+         ) STRICT;
+         INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
+             VALUES (1, 0, zeroblob(32))
+             ON CONFLICT(singleton) DO NOTHING;
+         PRAGMA user_version = 1;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn append_pairing_rejection_audit(
+    transaction: &Transaction<'_>,
+    pending: &PendingPairingChallenge,
+    occurred_at_unix_ms: i64,
+    reason: &[u8],
+) -> Result<(), StoreError> {
+    append_audit_in_transaction(
+        transaction,
+        AuditEventDraft {
+            occurred_at_unix_ms,
+            kind: AuditKind::PairingRejected,
+            outcome: AuditOutcome::Rejected,
+            request_id: None,
+            actor_digest: None,
+            subject_digest: Some(sha256(pending.peer_id.as_bytes())),
+            context_digest: Some(sha256(reason)),
+        },
+    )?;
+    Ok(())
+}
+
+fn append_audit_in_transaction(
+    transaction: &Transaction<'_>,
+    draft: AuditEventDraft,
+) -> Result<AuditEvent, StoreError> {
+    let (tail_sequence, tail_hash): (i64, Vec<u8>) = transaction.query_row(
+        "SELECT tail_sequence, tail_hash FROM audit_chain_tail WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let tail_sequence = u64::try_from(tail_sequence)
+        .map_err(|_| StoreError::CorruptData("negative audit tail sequence"))?;
+    let previous_hash = digest_from_blob(tail_hash)?;
+    let sequence = tail_sequence
+        .checked_add(1)
+        .ok_or(StoreError::CorruptData("audit sequence overflow"))?;
+    let mut event = AuditEvent {
+        sequence,
+        event_id: Uuid::new_v4(),
+        occurred_at_unix_ms: draft.occurred_at_unix_ms,
+        kind: draft.kind,
+        outcome: draft.outcome,
+        request_id: draft.request_id,
+        actor_digest: draft.actor_digest,
+        subject_digest: draft.subject_digest,
+        context_digest: draft.context_digest,
+        previous_hash,
+        event_hash: ZERO_HASH,
+    };
+    event.event_hash = audit_event_hash(&event)?;
+    let sequence_i64 = i64::try_from(sequence)
+        .map_err(|_| StoreError::CorruptData("audit sequence exceeds SQLite integer"))?;
+    transaction.execute(
+        "INSERT INTO audit_events
+            (sequence, event_id, previous_hash, event_hash, record)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            sequence_i64,
+            event.event_id.to_string(),
+            &event.previous_hash[..],
+            &event.event_hash[..],
+            encode(&event)?
+        ],
+    )?;
+    let updated = transaction.execute(
+        "UPDATE audit_chain_tail SET tail_sequence = ?1, tail_hash = ?2
+         WHERE singleton = 1 AND tail_sequence = ?3 AND tail_hash = ?4",
+        params![
+            sequence_i64,
+            &event.event_hash[..],
+            i64::try_from(tail_sequence)
+                .map_err(|_| StoreError::CorruptData("audit sequence overflow"))?,
+            &event.previous_hash[..]
+        ],
+    )?;
+    if updated != 1 {
+        return Err(StoreError::CorruptData("audit tail changed unexpectedly"));
+    }
+    Ok(event)
+}
+
+fn audit_event_hash(event: &AuditEvent) -> Result<Sha256Digest, StoreError> {
+    #[derive(Serialize)]
+    struct AuditHashMaterial<'a> {
+        format_version: u8,
+        sequence: u64,
+        event_id: Uuid,
+        occurred_at_unix_ms: i64,
+        kind: AuditKind,
+        outcome: AuditOutcome,
+        request_id: Option<Uuid>,
+        actor_digest: &'a Option<Sha256Digest>,
+        subject_digest: &'a Option<Sha256Digest>,
+        context_digest: &'a Option<Sha256Digest>,
+        previous_hash: Sha256Digest,
+    }
+
+    let material = AuditHashMaterial {
+        format_version: 1,
+        sequence: event.sequence,
+        event_id: event.event_id,
+        occurred_at_unix_ms: event.occurred_at_unix_ms,
+        kind: event.kind,
+        outcome: event.outcome,
+        request_id: event.request_id,
+        actor_digest: &event.actor_digest,
+        subject_digest: &event.subject_digest,
+        context_digest: &event.context_digest,
+        previous_hash: event.previous_hash,
+    };
+    Ok(sha256(&encode(&material)?))
+}
+
+fn revocation_in_connection(
+    connection: &Connection,
+    peer_id: &str,
+) -> Result<Option<RevocationRecord>, StoreError> {
+    let record: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT record FROM revocations WHERE peer_id = ?1",
+            [peer_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    record.map(|bytes| decode(&bytes)).transpose()
+}
+
+fn revocation_in_transaction(
+    transaction: &Transaction<'_>,
+    peer_id: &str,
+) -> Result<Option<RevocationRecord>, StoreError> {
+    let record: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT record FROM revocations WHERE peer_id = ?1",
+            [peer_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    record.map(|bytes| decode(&bytes)).transpose()
+}
+
+fn enforce_count_limit(
+    transaction: &Transaction<'_>,
+    query: &str,
+    maximum: u64,
+    label: &'static str,
+) -> Result<(), StoreError> {
+    let count: i64 = transaction.query_row(query, [], |row| row.get(0))?;
+    let count = u64::try_from(count).map_err(|_| StoreError::CorruptData("negative row count"))?;
+    if count >= maximum {
+        return Err(StoreError::ResourceLimit(label));
+    }
+    Ok(())
+}
+
+fn validate_limits(limits: StoreLimits) -> Result<(), StoreError> {
+    if limits.max_pending_pairings == 0
+        || limits.max_trusted_peers == 0
+        || limits.max_open_replays == 0
+    {
+        return Err(StoreError::InvalidInput("store limits must be non-zero"));
+    }
+    Ok(())
+}
+
+fn validate_identifier(value: &str) -> Result<(), StoreError> {
+    validate_bounded_text(value, MAX_ID_BYTES, "identifier")?;
+    if value.chars().any(char::is_control) {
+        return Err(StoreError::InvalidInput(
+            "identifier contains control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    value: &str,
+    maximum: usize,
+    _label: &'static str,
+) -> Result<(), StoreError> {
+    if value.is_empty() || value.len() > maximum {
+        return Err(StoreError::InvalidInput(
+            "text field length is out of range",
+        ));
+    }
+    Ok(())
+}
+
+fn peer_identity_digest(peer_id: &str, public_key: &[u8]) -> Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sovereign-node-peer-identity-v1\0");
+    hasher.update((peer_id.len() as u64).to_be_bytes());
+    hasher.update(peer_id.as_bytes());
+    hasher.update((public_key.len() as u64).to_be_bytes());
+    hasher.update(public_key);
+    hasher.finalize().into()
+}
+
+#[must_use]
+pub fn sha256(value: &[u8]) -> Sha256Digest {
+    Sha256::digest(value).into()
+}
+
+fn constant_time_digest_eq(left: &Sha256Digest, right: &Sha256Digest) -> bool {
+    let mut difference = 0_u8;
+    for (left_byte, right_byte) in left.iter().zip(right.iter()) {
+        difference |= left_byte ^ right_byte;
+    }
+    difference == 0
+}
+
+fn digest_from_blob(value: Vec<u8>) -> Result<Sha256Digest, StoreError> {
+    value
+        .try_into()
+        .map_err(|_| StoreError::CorruptData("digest has invalid length"))
+}
+
+fn u64_blob(value: u64) -> [u8; 8] {
+    value.to_be_bytes()
+}
+
+fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, StoreError> {
+    Ok(to_stdvec(value)?)
+}
+
+fn decode<T: DeserializeOwned>(value: &[u8]) -> Result<T, StoreError> {
+    let (decoded, remainder) = postcard::take_from_bytes(value)?;
+    if !remainder.is_empty() {
+        return Err(StoreError::CorruptData("stored record has trailing bytes"));
+    }
+    Ok(decoded)
+}
+
+fn unix_time_ms() -> Result<i64, StoreError> {
+    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    i64::try_from(nanos / 1_000_000)
+        .map_err(|_| StoreError::CorruptData("system time is out of range"))
+}
+
+fn prepare_private_database_file(path: &Path) -> Result<(), StoreError> {
+    let parent = path
+        .parent()
+        .ok_or(StoreError::InvalidInput("database path has no parent"))?;
+    if !parent.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(parent)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir_all(parent)?;
+    }
+
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(StoreError::InvalidInput(
+            "database parent must be a real directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if parent_metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(StoreError::InvalidInput(
+                "database parent must be owned by the daemon account",
+            ));
+        }
+    }
+
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StoreError::InvalidInput(
+                "database path must be a real regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != rustix::process::geteuid().as_raw() {
+                return Err(StoreError::InvalidInput(
+                    "database file must be owned by the daemon account",
+                ));
+            }
+        }
+    } else {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    tighten_private_permissions(path)
+}
+
+fn tighten_private_permissions(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        for candidate in sqlite_files(path) {
+            if candidate.exists() {
+                fs::set_permissions(candidate, fs::Permissions::from_mode(0o600))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sqlite_files(path: &Path) -> [PathBuf; 3] {
+    let path_text = path.as_os_str().to_string_lossy();
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{path_text}-wal")),
+        PathBuf::from(format!("{path_text}-shm")),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const NOW: i64 = 2_000_000_000_000;
+
+    fn test_store() -> Result<(TempDir, PathBuf, StateStore), StoreError> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("state.sqlite3");
+        let store = StateStore::open(&path)?;
+        Ok((directory, path, store))
+    }
+
+    fn pending(challenge_secret: &[u8]) -> Result<PendingPairingChallenge, StoreError> {
+        PendingPairingChallenge::new(
+            Uuid::new_v4(),
+            "node-01".to_owned(),
+            "broker-01".to_owned(),
+            "Owner Action Broker".to_owned(),
+            vec![7_u8; 32],
+            challenge_secret,
+            sha256(b"node-identity"),
+            sha256(b"channel-binding"),
+            NOW,
+            NOW + 60_000,
+        )
+    }
+
+    fn replay(store: &StateStore, request_id: Uuid) -> Result<ReplayReservation, StoreError> {
+        let (_, peer) = pair_peer(store, b"0123456789abcdef0123456789abcdef")?;
+        let policy_digest = sha256(b"test-policy");
+        store.activate_policy(1, policy_digest, NOW - 1)?;
+        Ok(ReplayReservation {
+            request_id,
+            task_id: Uuid::new_v4(),
+            pairing_id: peer.pairing_id,
+            trust_epoch: peer.trust_epoch,
+            policy_version: 1,
+            policy_digest,
+            replay_sequence: 1,
+            replay_nonce: sha256(request_id.as_bytes()),
+            agent_id: "agent-green".to_owned(),
+            node_id: "node-01".to_owned(),
+            capability: "SystemInfo".to_owned(),
+            target_digest: sha256(b"local"),
+            arguments_digest: sha256(b"empty-map"),
+            authorization_digest: sha256(b"signed-envelope"),
+            expires_at_unix_ms: i64::MAX,
+        })
+    }
+
+    fn pair_peer(
+        store: &StateStore,
+        challenge_secret: &[u8],
+    ) -> Result<(Pairing, TrustedPeer), StoreError> {
+        let challenge = pending(challenge_secret)?;
+        store.put_pending_pairing(&challenge)?;
+        store.approve_pairing(
+            &PairingApproval {
+                pairing_id: challenge.pairing_id,
+                owner_authority_digest: sha256(b"owner"),
+                capability_manifest_digest: sha256(b"manifest"),
+                approved_at_unix_ms: NOW + 1,
+                trust_expires_at_unix_ms: None,
+            },
+            challenge_secret,
+        )
+    }
+
+    #[test]
+    fn pairing_requires_correct_proof_and_survives_restart() -> Result<(), StoreError> {
+        let (directory, path, store) = test_store()?;
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let challenge = pending(secret)?;
+        let pairing_id = challenge.pairing_id;
+        store.put_pending_pairing(&challenge)?;
+        let wrong = store.approve_pairing(
+            &PairingApproval {
+                pairing_id,
+                owner_authority_digest: sha256(b"owner"),
+                capability_manifest_digest: sha256(b"manifest"),
+                approved_at_unix_ms: NOW + 1,
+                trust_expires_at_unix_ms: None,
+            },
+            b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        );
+        assert!(matches!(wrong, Err(StoreError::PairingChallengeMismatch)));
+        assert!(
+            store
+                .currently_trusted_peer("broker-01", NOW + 2)?
+                .is_none()
+        );
+
+        let (_, peer) = store.approve_pairing(
+            &PairingApproval {
+                pairing_id,
+                owner_authority_digest: sha256(b"owner"),
+                capability_manifest_digest: sha256(b"manifest"),
+                approved_at_unix_ms: NOW + 2,
+                trust_expires_at_unix_ms: None,
+            },
+            secret,
+        )?;
+        assert_eq!(peer.status, TrustStatus::Active);
+        drop(store);
+
+        let reopened = StateStore::open(&path)?;
+        assert_eq!(
+            reopened
+                .currently_trusted_peer("broker-01", NOW + 3)?
+                .map(|value| value.pairing_id),
+            Some(pairing_id)
+        );
+        drop(reopened);
+        drop(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn revocation_is_current_idempotent_and_durable() -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let (_, peer) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let first = store.revoke_peer(
+            &peer.peer_id,
+            NOW + 10,
+            sha256(b"owner"),
+            sha256(b"lost-device"),
+        )?;
+        assert!(matches!(first, RevocationOutcome::Revoked(_)));
+        assert!(
+            store
+                .currently_trusted_peer(&peer.peer_id, NOW + 11)?
+                .is_none()
+        );
+        let second = store.revoke_peer(
+            &peer.peer_id,
+            NOW + 12,
+            sha256(b"owner"),
+            sha256(b"different-reason"),
+        )?;
+        assert!(matches!(second, RevocationOutcome::AlreadyRevoked(_)));
+        drop(store);
+
+        let reopened = StateStore::open(path)?;
+        assert!(reopened.is_peer_revoked(&peer.peer_id)?);
+        assert!(
+            reopened
+                .currently_trusted_peer(&peer.peer_id, NOW + 20)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_reservation_distinguishes_duplicate_and_collision_across_restart()
+    -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let request_id = Uuid::new_v4();
+        let request = replay(&store, request_id)?;
+        store.activate_policy(request.policy_version, request.policy_digest, NOW - 1)?;
+        let fingerprint = request.fingerprint()?;
+        assert!(matches!(
+            store.reserve_validated_replay_at(&request, NOW)?,
+            ReplayOutcome::Reserved { .. }
+        ));
+        drop(store);
+
+        let reopened = StateStore::open(path)?;
+        assert!(matches!(
+            reopened.reserve_validated_replay_at(&request, NOW + 1)?,
+            ReplayOutcome::DuplicateSame { terminal: None, .. }
+        ));
+        let mut collision = request;
+        collision.arguments_digest = sha256(b"different arguments");
+        assert!(matches!(
+            reopened.reserve_validated_replay_at(&collision, NOW + 2)?,
+            ReplayOutcome::Collision { existing_fingerprint } if existing_fingerprint == fingerprint
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_authorization_never_reserves_request_id() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        let rejected =
+            store.reserve_replay_after_validation(&request, || Err::<(), _>("forged signature"));
+        assert!(matches!(rejected, Err(StoreError::AuthorizationRejected)));
+        assert!(store.replay_outcome(&request)?.is_none());
+        assert!(matches!(
+            store.reserve_validated_replay_at(&request, NOW)?,
+            ReplayOutcome::Reserved { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_response_is_immutable_and_returned_to_duplicate() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        let fingerprint = request.fingerprint()?;
+        store.reserve_validated_replay_at(&request, NOW)?;
+        let terminal = TerminalResponseMetadata {
+            status: TerminalStatus::Succeeded,
+            response_digest: sha256(b"redacted response"),
+            redacted_error_digest: None,
+            response_size_bytes: 17,
+            completed_at_unix_ms: NOW + 1,
+        };
+        assert_eq!(
+            store.record_terminal_response(request.request_id, fingerprint, &terminal)?,
+            TerminalRecordOutcome::Recorded
+        );
+        assert_eq!(
+            store.record_terminal_response(request.request_id, fingerprint, &terminal)?,
+            TerminalRecordOutcome::AlreadyRecordedSame
+        );
+        let mut conflicting = terminal.clone();
+        conflicting.status = TerminalStatus::Failed;
+        assert!(matches!(
+            store.record_terminal_response(request.request_id, fingerprint, &conflicting),
+            Err(StoreError::TerminalResponseConflict)
+        ));
+        assert!(matches!(
+            store.reserve_validated_replay_at(&request, NOW + 2)?,
+            ReplayOutcome::DuplicateSame { terminal: Some(value), .. } if value == terminal
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn credential_rotation_uses_expected_key_and_increments_epoch() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let (_, peer) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        assert!(matches!(
+            store.rotate_peer_credential(
+                &peer.peer_id,
+                sha256(b"wrong key"),
+                vec![8_u8; 32],
+                sha256(b"owner"),
+                NOW + 5,
+            ),
+            Err(StoreError::CredentialRotationMismatch)
+        ));
+        let rotated = store.rotate_peer_credential(
+            &peer.peer_id,
+            sha256(&peer.public_key),
+            vec![8_u8; 32],
+            sha256(b"owner"),
+            NOW + 6,
+        )?;
+        let CredentialRotationOutcome::Rotated(rotated) = rotated else {
+            return Err(StoreError::CorruptData("rotation did not update the key"));
+        };
+        assert_eq!(rotated.trust_epoch, 2);
+        assert_eq!(rotated.public_key, vec![8_u8; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn policy_binding_is_monotonic_and_rejects_same_version_remapping() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let first = sha256(b"policy-one");
+        store.activate_policy(1, first, NOW)?;
+        store.activate_policy(1, first, NOW + 1)?;
+        assert!(matches!(
+            store.activate_policy(1, sha256(b"changed"), NOW + 2),
+            Err(StoreError::PolicyVersionReuse)
+        ));
+        store.activate_policy(2, sha256(b"policy-two"), NOW + 3)?;
+        assert!(matches!(
+            store.activate_policy(1, first, NOW + 4),
+            Err(StoreError::PolicyRollback)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn audit_chain_detects_record_tampering() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        store.reserve_validated_replay_at(&request, NOW)?;
+        let state = store.verify_audit_chain()?;
+        assert_eq!(state.event_count, 4);
+        {
+            let connection = store.lock()?;
+            connection.execute(
+                "UPDATE audit_events SET record = X'00' WHERE sequence = 1",
+                [],
+            )?;
+        }
+        assert!(store.verify_audit_chain().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_pairing_limit_fails_closed() -> Result<(), StoreError> {
+        let directory = TempDir::new()?;
+        let store = StateStore::open_with_limits(
+            directory.path().join("state.sqlite3"),
+            StoreLimits {
+                max_pending_pairings: 1,
+                max_trusted_peers: 1,
+                max_open_replays: 1,
+            },
+        )?;
+        store.put_pending_pairing(&pending(b"0123456789abcdef0123456789abcdef")?)?;
+        let second = store.put_pending_pairing(&pending(b"fedcba9876543210fedcba9876543210")?);
+        assert!(matches!(
+            second,
+            Err(StoreError::ResourceLimit("pending pairing capacity"))
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_files_are_owner_only() -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        store.reserve_validated_replay_at(&request, NOW)?;
+        for candidate in sqlite_files(&path) {
+            if candidate.exists() {
+                let mode = fs::metadata(candidate)?.permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+        }
+        Ok(())
+    }
+}
