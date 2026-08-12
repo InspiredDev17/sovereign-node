@@ -12,8 +12,9 @@ use sovereign_node::authz::{
 use sovereign_node::config::PolicyConfig;
 use sovereign_node::identity::{NodeIdentity, key_id};
 use sovereign_node::pairing::{
-    PairingDisplay, PairingError, PairingKeyMaterialV1, PairingManager, PairingProof,
-    PairingRequest,
+    CredentialRotationDisplay, CredentialRotationProof, CredentialRotationRequest, PairingDisplay,
+    PairingError, PairingKeyMaterialV1, PairingManager, PairingProof, PairingRequest,
+    TrustReceiptKind,
 };
 use sovereign_node::protocol::{
     ActionArguments, ActionErrorCode, ActionRequestV1, ActionTarget, AgentId, AuthorityKind,
@@ -21,9 +22,7 @@ use sovereign_node::protocol::{
     ReplayProtectionV1, RequestId, Sha256Digest, SignatureBytes, SignedActionV1, TaskId,
     UnixMillis, UserAuthorityV1, ValidationError,
 };
-use sovereign_node::store::{
-    CredentialRotationOutcome, RevocationOutcome, StateStore, StoreError, StoreLimits, sha256,
-};
+use sovereign_node::store::{RevocationOutcome, StateStore, StoreError, StoreLimits, sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -103,8 +102,8 @@ impl Harness {
         );
         let display = manager.begin(pairing_request(material.clone()), UnixMillis(NOW))?;
         let proof = proof_for(&display, &owner_key, &broker_key, UnixMillis(NOW + 1))?;
-        let trusted = manager.approve_local(&proof, true)?;
-        assert_eq!(trusted.trust_epoch, 1);
+        let approved = manager.approve_local(&proof, true)?;
+        assert_eq!(approved.trusted_peer.trust_epoch, 1);
 
         Ok(Self {
             _directory: directory,
@@ -115,7 +114,7 @@ impl Harness {
             owner_key,
             broker_key,
             material,
-            pairing_id: PairingId(trusted.pairing_id),
+            pairing_id: PairingId(approved.trusted_peer.pairing_id),
             clock: Arc::new(ManualClock::new(NOW + 10)),
         })
     }
@@ -227,6 +226,27 @@ fn proof_for(
         challenge_secret,
         owner_signature: signature_bytes(&owner_key.sign(&proof_payload))?,
         broker_signature: signature_bytes(&broker_key.sign(&proof_payload))?,
+        approved_at,
+    })
+}
+
+fn rotation_proof_for(
+    display: &CredentialRotationDisplay,
+    current_owner: &SigningKey,
+    current_broker: &SigningKey,
+    next_owner: &SigningKey,
+    next_broker: &SigningKey,
+    approved_at: UnixMillis,
+) -> TestResult<CredentialRotationProof> {
+    let challenge_secret = decode_fixed::<32>(&display.challenge_hex)?;
+    let payload = hex::decode(&display.proof_payload_hex)?;
+    Ok(CredentialRotationProof {
+        rotation_id: display.rotation_id,
+        challenge_secret,
+        current_owner_signature: signature_bytes(&current_owner.sign(&payload))?,
+        current_broker_signature: signature_bytes(&current_broker.sign(&payload))?,
+        next_owner_signature: signature_bytes(&next_owner.sign(&payload))?,
+        next_broker_signature: signature_bytes(&next_broker.sign(&payload))?,
         approved_at,
     })
 }
@@ -357,10 +377,24 @@ fn pairing_requires_local_approval_and_both_key_proofs() -> TestResult {
             .is_none()
     );
 
-    let trusted = manager.approve_local(&proof, true)?;
+    let approved = manager.approve_local(&proof, true)?;
+    let trusted = &approved.trusted_peer;
     assert_eq!(trusted.peer_id, PEER_ID);
     assert_eq!(trusted.node_id, identity.node_id().to_string());
     assert_eq!(trusted.trust_epoch, 1);
+    assert_eq!(
+        approved.receipt.receipt.kind,
+        TrustReceiptKind::InitialPairing
+    );
+    assert_eq!(approved.receipt.receipt.trust_epoch, 1);
+    approved.receipt.verify()?;
+    let node_key = PublicKeyBytes(decode_fixed::<32>(&display.node_public_key_hex)?);
+    let node_signature = SignatureBytes::from_slice(&hex::decode(&display.node_signature_hex)?)?;
+    sovereign_node::pairing::verify_node_proof(
+        node_key,
+        &hex::decode(&display.proof_payload_hex)?,
+        &node_signature,
+    )?;
     assert!(
         store
             .currently_trusted_peer(PEER_ID, NOW as i64 + 2)?
@@ -719,25 +753,63 @@ fn replay_capacity_exhaustion_fails_closed_with_resource_error() -> TestResult {
 #[test]
 fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> TestResult {
     let harness = Harness::new()?;
-    let trusted = harness
-        .store
-        .peer_record(PEER_ID)?
-        .ok_or_else(|| test_error("paired peer record was missing"))?;
+    let manager = PairingManager::new(
+        Arc::clone(&harness.identity),
+        Arc::clone(&harness.store),
+        [
+            Capability::SystemInfo,
+            Capability::ResourceStatus,
+            Capability::FileRead,
+        ],
+    );
+    let new_owner_key = SigningKey::from_bytes(&[0x55; 32]);
     let new_broker_key = SigningKey::from_bytes(&[0x66; 32]);
     let mut next_material = harness.material.clone();
+    next_material.owner_public_key = PublicKeyBytes(new_owner_key.verifying_key().to_bytes());
     next_material.broker_public_key = PublicKeyBytes(new_broker_key.verifying_key().to_bytes());
-    let next_encoded = postcard::to_allocvec(&next_material)?;
+    let display = manager.begin_credential_rotation(
+        CredentialRotationRequest {
+            peer_id: PEER_ID.to_owned(),
+            key_material: next_material,
+            ttl_millis: 60_000,
+        },
+        UnixMillis(NOW + 20),
+    )?;
+    let proof = rotation_proof_for(
+        &display,
+        &harness.owner_key,
+        &harness.broker_key,
+        &new_owner_key,
+        &new_broker_key,
+        UnixMillis(NOW + 21),
+    )?;
 
     assert!(matches!(
-        harness.store.rotate_peer_credential(
-            PEER_ID,
-            sha256(b"incorrect current credential"),
-            next_encoded.clone(),
-            key_id(&harness.owner_key.verifying_key()).0,
-            NOW as i64 + 20,
-        ),
-        Err(StoreError::CredentialRotationMismatch)
+        manager.approve_credential_rotation_local(&proof, false),
+        Err(PairingError::OwnerConfirmationRequired)
     ));
+    let attacker = SigningKey::from_bytes(&[0x77; 32]);
+    let payload = hex::decode(&display.proof_payload_hex)?;
+    let attacker_signature = signature_bytes(&attacker.sign(&payload))?;
+    let mut forged_current_owner = proof.clone();
+    forged_current_owner.current_owner_signature = attacker_signature.clone();
+    let mut forged_current_broker = proof.clone();
+    forged_current_broker.current_broker_signature = attacker_signature.clone();
+    let mut forged_next_owner = proof.clone();
+    forged_next_owner.next_owner_signature = attacker_signature.clone();
+    let mut forged_next_broker = proof.clone();
+    forged_next_broker.next_broker_signature = attacker_signature;
+    for forged in [
+        forged_current_owner,
+        forged_current_broker,
+        forged_next_owner,
+        forged_next_broker,
+    ] {
+        assert!(matches!(
+            manager.approve_credential_rotation_local(&forged, true),
+            Err(PairingError::InvalidProof)
+        ));
+    }
     assert_eq!(
         harness
             .store
@@ -747,19 +819,32 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
         1
     );
 
-    let rotated = harness.store.rotate_peer_credential(
-        PEER_ID,
-        sha256(&trusted.public_key),
-        next_encoded,
-        key_id(&harness.owner_key.verifying_key()).0,
-        NOW as i64 + 21,
-    )?;
-    assert!(matches!(rotated, CredentialRotationOutcome::Rotated(_)));
-    let rotated_peer = harness
-        .store
-        .peer_record(PEER_ID)?
-        .ok_or_else(|| test_error("rotated peer record was missing"))?;
+    let approved = manager.approve_credential_rotation_local(&proof, true)?;
+    let rotated_peer = approved.trusted_peer;
     assert_eq!(rotated_peer.trust_epoch, 2);
+    assert_eq!(
+        approved.receipt.receipt.kind,
+        TrustReceiptKind::CredentialRotation
+    );
+    assert_eq!(approved.receipt.receipt.trust_epoch, 2);
+    assert!(
+        approved
+            .receipt
+            .receipt
+            .previous_peer_identity_digest
+            .is_some()
+    );
+    approved.receipt.verify()?;
+    let mut tampered_receipt = approved.receipt.clone();
+    tampered_receipt.receipt.trust_epoch = 3;
+    assert!(matches!(
+        tampered_receipt.verify(),
+        Err(PairingError::InvalidProof)
+    ));
+    assert!(matches!(
+        manager.approve_credential_rotation_local(&proof, true),
+        Err(PairingError::Store(StoreError::CredentialRotationNotFound))
+    ));
 
     let engine = harness.engine();
     let old_transport = harness.transport_peer();
@@ -783,7 +868,7 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
         issued_at: NOW,
         not_before: NOW,
         expires_at: NOW + 60_000,
-        owner_key: &harness.owner_key,
+        owner_key: &new_owner_key,
         broker_key: &harness.broker_key,
     })?;
     assert!(matches!(
@@ -803,7 +888,7 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
         issued_at: NOW,
         not_before: NOW,
         expires_at: NOW + 60_000,
-        owner_key: &harness.owner_key,
+        owner_key: &new_owner_key,
         broker_key: &new_broker_key,
     })?;
     assert!(matches!(
@@ -818,6 +903,58 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
             .ok_or_else(|| test_error("reopened rotated peer record was missing"))?
             .trust_epoch,
         2
+    );
+    Ok(())
+}
+
+#[test]
+fn credential_rotation_expiry_is_consumed_without_changing_trust() -> TestResult {
+    let harness = Harness::new()?;
+    let manager = PairingManager::new(
+        Arc::clone(&harness.identity),
+        Arc::clone(&harness.store),
+        [
+            Capability::SystemInfo,
+            Capability::ResourceStatus,
+            Capability::FileRead,
+        ],
+    );
+    let next_owner = SigningKey::from_bytes(&[0x35; 32]);
+    let next_broker = SigningKey::from_bytes(&[0x36; 32]);
+    let mut next_material = harness.material.clone();
+    next_material.owner_public_key = PublicKeyBytes(next_owner.verifying_key().to_bytes());
+    next_material.broker_public_key = PublicKeyBytes(next_broker.verifying_key().to_bytes());
+    let display = manager.begin_credential_rotation(
+        CredentialRotationRequest {
+            peer_id: PEER_ID.to_owned(),
+            key_material: next_material,
+            ttl_millis: 60_000,
+        },
+        UnixMillis(NOW + 20),
+    )?;
+    let proof = rotation_proof_for(
+        &display,
+        &harness.owner_key,
+        &harness.broker_key,
+        &next_owner,
+        &next_broker,
+        display.expires_at,
+    )?;
+    assert!(matches!(
+        manager.approve_credential_rotation_local(&proof, true),
+        Err(PairingError::Store(StoreError::CredentialRotationExpired))
+    ));
+    assert!(matches!(
+        manager.approve_credential_rotation_local(&proof, true),
+        Err(PairingError::Store(StoreError::CredentialRotationNotFound))
+    ));
+    assert_eq!(
+        harness
+            .store
+            .peer_record(PEER_ID)?
+            .ok_or_else(|| test_error("paired peer record was missing"))?
+            .trust_epoch,
+        1
     );
     Ok(())
 }

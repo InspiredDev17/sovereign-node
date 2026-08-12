@@ -31,7 +31,7 @@ use crate::lifecycle::{LeaseKind, LifecycleLease};
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const PEER_RATE_WINDOW_MS: i64 = 60_000;
 const ZERO_HASH: Sha256Digest = [0_u8; 32];
 const MAX_ID_BYTES: usize = 255;
@@ -100,6 +100,12 @@ pub enum StoreError {
     TerminalResponseConflict,
     #[error("credential rotation does not match the currently trusted key")]
     CredentialRotationMismatch,
+    #[error("credential rotation challenge was not found")]
+    CredentialRotationNotFound,
+    #[error("credential rotation challenge has expired")]
+    CredentialRotationExpired,
+    #[error("credential rotation challenge proof did not match")]
+    CredentialRotationChallengeMismatch,
     #[error("audit chain is invalid at sequence {sequence}")]
     AuditChainInvalid { sequence: u64 },
     #[error("policy version rollback was rejected")]
@@ -198,6 +204,11 @@ impl PendingPairingChallenge {
     fn validate(&self) -> Result<(), StoreError> {
         validate_identifier(&self.node_id)?;
         validate_identifier(&self.peer_id)?;
+        if self.pairing_id.is_nil() {
+            return Err(StoreError::InvalidInput(
+                "pairing identifier must be non-nil",
+            ));
+        }
         validate_bounded_text(&self.device_label, MAX_LABEL_BYTES, "device label")?;
         if self.peer_public_key.is_empty() || self.peer_public_key.len() > MAX_PUBLIC_KEY_BYTES {
             return Err(StoreError::InvalidInput("invalid peer public key length"));
@@ -233,6 +244,104 @@ pub struct Pairing {
     pub capability_manifest_digest: Sha256Digest,
     pub requested_at_unix_ms: i64,
     pub approved_at_unix_ms: i64,
+}
+
+/// A short-lived, node-bound request to rotate one existing peer credential.
+/// Only the challenge digest is durable; the clear challenge is displayed once.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingCredentialRotation {
+    pub rotation_id: Uuid,
+    pub pairing_id: Uuid,
+    pub node_id: String,
+    pub peer_id: String,
+    pub current_public_key_digest: Sha256Digest,
+    pub current_trust_epoch: u64,
+    pub new_public_key: Vec<u8>,
+    pub new_identity_digest: Sha256Digest,
+    pub node_identity_digest: Sha256Digest,
+    pub challenge_digest: Sha256Digest,
+    pub requested_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+}
+
+impl PendingCredentialRotation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rotation_id: Uuid,
+        pairing_id: Uuid,
+        node_id: String,
+        peer_id: String,
+        current_public_key_digest: Sha256Digest,
+        current_trust_epoch: u64,
+        new_public_key: Vec<u8>,
+        node_identity_digest: Sha256Digest,
+        challenge_secret: &[u8],
+        requested_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<Self, StoreError> {
+        if challenge_secret.len() < MIN_PAIRING_CHALLENGE_BYTES {
+            return Err(StoreError::InvalidInput(
+                "credential rotation challenge must contain at least 128 bits",
+            ));
+        }
+        let value = Self {
+            rotation_id,
+            pairing_id,
+            node_id,
+            peer_id: peer_id.clone(),
+            current_public_key_digest,
+            current_trust_epoch,
+            new_identity_digest: peer_identity_digest(&peer_id, &new_public_key),
+            new_public_key,
+            node_identity_digest,
+            challenge_digest: sha256(challenge_secret),
+            requested_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        validate_identifier(&self.node_id)?;
+        validate_identifier(&self.peer_id)?;
+        if self.rotation_id.is_nil() || self.pairing_id.is_nil() {
+            return Err(StoreError::InvalidInput(
+                "credential rotation identifiers must be non-nil",
+            ));
+        }
+        if self.current_trust_epoch == 0 {
+            return Err(StoreError::InvalidInput(
+                "credential rotation trust epoch must be non-zero",
+            ));
+        }
+        if self.new_public_key.is_empty() || self.new_public_key.len() > MAX_PUBLIC_KEY_BYTES {
+            return Err(StoreError::InvalidInput("invalid peer public key length"));
+        }
+        if !constant_time_digest_eq(
+            &self.new_identity_digest,
+            &peer_identity_digest(&self.peer_id, &self.new_public_key),
+        ) {
+            return Err(StoreError::CorruptData(
+                "credential rotation identity digest is inconsistent",
+            ));
+        }
+        if self.expires_at_unix_ms <= self.requested_at_unix_ms {
+            return Err(StoreError::InvalidInput(
+                "credential rotation expiry must follow creation time",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CredentialRotationApproval {
+    pub rotation_id: Uuid,
+    pub owner_authority_digest: Sha256Digest,
+    pub capability_manifest_digest: Sha256Digest,
+    pub approved_at_unix_ms: i64,
+    pub trust_expires_at_unix_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -386,6 +495,10 @@ pub enum AuditKind {
     ReplayDuplicate,
     ReplayCollision,
     TerminalResponseRecorded,
+    // New variants are appended to preserve postcard discriminants in existing
+    // audit chains across schema migrations.
+    CredentialRotationChallengeCreated,
+    CredentialRotationRejected,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -735,6 +848,114 @@ impl StateStore {
             )
             .optional()?;
         record.map(|bytes| decode(&bytes)).transpose()
+    }
+
+    pub fn put_pending_credential_rotation(
+        &self,
+        challenge: &PendingCredentialRotation,
+    ) -> Result<(), StoreError> {
+        challenge.validate()?;
+        let record = encode(challenge)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM pending_credential_rotations WHERE expires_at_unix_ms <= ?1",
+            [challenge.requested_at_unix_ms],
+        )?;
+        let existing: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_credential_rotations WHERE rotation_id = ?1",
+                [challenge.rotation_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let existing: PendingCredentialRotation = decode(&existing)?;
+            if existing == *challenge {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::InvalidInput(
+                "rotation identifier already binds different challenge data",
+            ));
+        }
+        enforce_count_limit(
+            &transaction,
+            "SELECT COUNT(*) FROM pending_credential_rotations",
+            self.limits.max_pending_pairings,
+            "pending credential rotation capacity",
+        )?;
+        transaction.execute(
+            "INSERT INTO pending_credential_rotations
+                (rotation_id, peer_id, pairing_id, expires_at_unix_ms, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                challenge.rotation_id.to_string(),
+                challenge.peer_id,
+                challenge.pairing_id.to_string(),
+                challenge.expires_at_unix_ms,
+                record
+            ],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: challenge.requested_at_unix_ms,
+                kind: AuditKind::CredentialRotationChallengeCreated,
+                outcome: AuditOutcome::Observed,
+                request_id: None,
+                actor_digest: None,
+                subject_digest: Some(sha256(challenge.peer_id.as_bytes())),
+                context_digest: Some(challenge.new_identity_digest),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()
+    }
+
+    pub fn pending_credential_rotation(
+        &self,
+        rotation_id: Uuid,
+    ) -> Result<Option<PendingCredentialRotation>, StoreError> {
+        let connection = self.lock()?;
+        let record: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT record FROM pending_credential_rotations WHERE rotation_id = ?1",
+                [rotation_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        record.map(|bytes| decode(&bytes)).transpose()
+    }
+
+    pub fn audit_credential_rotation_rejection(
+        &self,
+        rotation_id: Uuid,
+        occurred_at_unix_ms: i64,
+        reason: &[u8],
+    ) -> Result<(), StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_credential_rotations WHERE rotation_id = ?1",
+                [rotation_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(record) = record else {
+            return Err(StoreError::CredentialRotationNotFound);
+        };
+        let pending: PendingCredentialRotation = decode(&record)?;
+        append_credential_rotation_rejection_audit(
+            &transaction,
+            &pending,
+            occurred_at_unix_ms,
+            reason,
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn audit_pairing_rejection(
@@ -1094,9 +1315,146 @@ impl StateStore {
         Ok(self.revocation_for_peer(peer_id)?.is_some())
     }
 
-    /// Rotate a paired credential without silently creating a new trust
-    /// relationship.  The expected old key digest prevents lost-update races.
-    pub fn rotate_peer_credential(
+    /// Commit a locally approved credential-rotation challenge. Signature and
+    /// owner-presence checks are performed by `PairingManager`; this transaction
+    /// rechecks challenge, expiry, current credential, and epoch atomically.
+    pub(crate) fn approve_credential_rotation(
+        &self,
+        approval: &CredentialRotationApproval,
+        presented_challenge: &[u8],
+    ) -> Result<CredentialRotationOutcome, StoreError> {
+        if approval
+            .trust_expires_at_unix_ms
+            .is_some_and(|expiry| expiry <= approval.approved_at_unix_ms)
+        {
+            return Err(StoreError::InvalidInput(
+                "trust expiry must follow rotation approval",
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending_record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_credential_rotations WHERE rotation_id = ?1",
+                [approval.rotation_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(pending_record) = pending_record else {
+            return Err(StoreError::CredentialRotationNotFound);
+        };
+        let pending: PendingCredentialRotation = decode(&pending_record)?;
+        if pending.expires_at_unix_ms <= approval.approved_at_unix_ms {
+            transaction.execute(
+                "DELETE FROM pending_credential_rotations WHERE rotation_id = ?1",
+                [approval.rotation_id.to_string()],
+            )?;
+            append_credential_rotation_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"expired",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::CredentialRotationExpired);
+        }
+        if !constant_time_digest_eq(&pending.challenge_digest, &sha256(presented_challenge)) {
+            append_credential_rotation_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"challenge-mismatch",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::CredentialRotationChallengeMismatch);
+        }
+        let record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM trusted_peers
+                 WHERE peer_id = ?1 AND pairing_id = ?2 AND trust_status = 1
+                   AND (trust_expires_at_unix_ms IS NULL OR trust_expires_at_unix_ms > ?3)",
+                params![
+                    pending.peer_id,
+                    pending.pairing_id.to_string(),
+                    approval.approved_at_unix_ms
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(record) = record else {
+            append_credential_rotation_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"peer-inactive",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::PeerRevoked);
+        };
+        let mut peer: TrustedPeer = decode(&record)?;
+        let current_digest = sha256(&peer.public_key);
+        if peer.node_id != pending.node_id
+            || peer.trust_epoch != pending.current_trust_epoch
+            || !constant_time_digest_eq(&current_digest, &pending.current_public_key_digest)
+        {
+            append_credential_rotation_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"current-credential-changed",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::CredentialRotationMismatch);
+        }
+        if peer.public_key == pending.new_public_key {
+            transaction.execute(
+                "DELETE FROM pending_credential_rotations WHERE rotation_id = ?1",
+                [approval.rotation_id.to_string()],
+            )?;
+            transaction.commit()?;
+            return Ok(CredentialRotationOutcome::AlreadyCurrent(peer));
+        }
+        peer.public_key = pending.new_public_key;
+        peer.identity_digest = pending.new_identity_digest;
+        peer.capability_manifest_digest = approval.capability_manifest_digest;
+        peer.trust_epoch = peer
+            .trust_epoch
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData("credential epoch overflow"))?;
+        peer.trust_expires_at_unix_ms = approval.trust_expires_at_unix_ms;
+        peer.last_key_rotation_at_unix_ms = Some(approval.approved_at_unix_ms);
+        transaction.execute(
+            "UPDATE trusted_peers
+             SET trust_expires_at_unix_ms = ?2, record = ?3
+             WHERE peer_id = ?1 AND trust_status = 1",
+            params![peer.peer_id, peer.trust_expires_at_unix_ms, encode(&peer)?],
+        )?;
+        transaction.execute(
+            "DELETE FROM pending_credential_rotations WHERE rotation_id = ?1",
+            [approval.rotation_id.to_string()],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: approval.approved_at_unix_ms,
+                kind: AuditKind::CredentialRotated,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: Some(approval.owner_authority_digest),
+                subject_digest: Some(peer.identity_digest),
+                context_digest: Some(current_digest),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(CredentialRotationOutcome::Rotated(peer))
+    }
+
+    /// Internal test helper for transport epoch tests. Production callers must
+    /// use the owner-approved `PairingManager` ceremony.
+    #[cfg(test)]
+    pub(crate) fn rotate_peer_credential(
         &self,
         peer_id: &str,
         expected_public_key_digest: Sha256Digest,
@@ -1694,6 +2052,18 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          CREATE INDEX IF NOT EXISTS pending_pairings_peer_idx
              ON pending_pairings(peer_id);
 
+         CREATE TABLE IF NOT EXISTS pending_credential_rotations (
+             rotation_id TEXT PRIMARY KEY NOT NULL,
+             peer_id TEXT NOT NULL,
+             pairing_id TEXT NOT NULL,
+             expires_at_unix_ms INTEGER NOT NULL,
+             record BLOB NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS pending_credential_rotations_expiry_idx
+             ON pending_credential_rotations(expires_at_unix_ms);
+         CREATE INDEX IF NOT EXISTS pending_credential_rotations_peer_idx
+             ON pending_credential_rotations(peer_id);
+
          CREATE TABLE IF NOT EXISTS pairings (
              pairing_id TEXT PRIMARY KEY NOT NULL,
              peer_id TEXT NOT NULL UNIQUE,
@@ -1770,7 +2140,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
              VALUES (1, 0, zeroblob(32))
              ON CONFLICT(singleton) DO NOTHING;
-         PRAGMA user_version = 3;",
+         PRAGMA user_version = 4;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -1791,6 +2161,27 @@ fn append_pairing_rejection_audit(
             request_id: None,
             actor_digest: None,
             subject_digest: Some(sha256(pending.peer_id.as_bytes())),
+            context_digest: Some(sha256(reason)),
+        },
+    )?;
+    Ok(())
+}
+
+fn append_credential_rotation_rejection_audit(
+    transaction: &Transaction<'_>,
+    pending: &PendingCredentialRotation,
+    occurred_at_unix_ms: i64,
+    reason: &[u8],
+) -> Result<(), StoreError> {
+    append_audit_in_transaction(
+        transaction,
+        AuditEventDraft {
+            occurred_at_unix_ms,
+            kind: AuditKind::CredentialRotationRejected,
+            outcome: AuditOutcome::Rejected,
+            request_id: None,
+            actor_digest: None,
+            subject_digest: Some(pending.new_identity_digest),
             context_digest: Some(sha256(reason)),
         },
     )?;
@@ -2417,6 +2808,28 @@ mod tests {
             migrated.admit_remote_request_at(&peer.peer_id, 2, 2, NOW)?,
             RemoteRequestAdmission::Admitted { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_three_store_migrates_to_credential_rotation_challenges() -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let before = store.verify_audit_chain()?;
+        drop(store);
+
+        let legacy = Connection::open(&path)?;
+        legacy
+            .execute_batch("DROP TABLE pending_credential_rotations; PRAGMA user_version = 3;")?;
+        drop(legacy);
+
+        let migrated = StateStore::open(path)?;
+        assert!(
+            migrated
+                .pending_credential_rotation(Uuid::new_v4())?
+                .is_none()
+        );
+        assert_eq!(migrated.verify_audit_chain()?, before);
         Ok(())
     }
 

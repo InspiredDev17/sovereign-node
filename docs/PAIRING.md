@@ -17,15 +17,25 @@ The shipping ceremony is owner-local CLI based. It displays the stable NodeId,
 node device-key fingerprint, owner/broker key fingerprints, exact client-leaf
 fingerprint, requested capability scope, signed trust expiry, a 256-bit random
 challenge, and expiration. Owner and broker Ed25519 proofs cover that exact
-transcript, including the node device-key digest, and `--confirm` is required
-locally before the SQLite trust transaction commits. Revocation immediately
+transcript, including the node device-key digest. The node also signs the
+displayed proof payload, and successful approval returns a node-signed receipt
+binding the pairing, capability digest, transport pin, trust epoch, and expiry.
+`--confirm` is required locally before the SQLite trust transaction commits. Revocation immediately
 blocks every subsequent action through the per-action trust lookup and persists
 across restart.
 
+Peer credential rotation is also implemented as a two-step owner-local
+ceremony. `pair rotation-request` creates a short-lived node-signed transcript;
+`pair rotation-approve` requires strict Ed25519 proofs from the current owner,
+current broker, next owner, and next broker plus local `--confirm`. The store
+atomically rechecks the current credential and epoch, increments the epoch,
+consumes the challenge, audits only digests, and returns a node-signed rotation
+receipt. The production library does not expose the old raw credential-mutation
+primitive.
+
 The remainder of this document is the target pairing contract. v0.1 does not
-yet provide a GUI prompt, a client-generated challenge, a node-signed receipt,
-recovery re-pairing under the same peer ID, or the full proof-of-possession
-credential-rotation ceremony. Pending invitations
+yet provide a GUI prompt, a client-generated challenge, or recovery re-pairing
+under the same peer ID. Pending invitations
 survive a daemon restart only until their original expiration and are not action
 authority. The TLS verifier reloads owner-approved client trust and established
 sessions recheck their exact leaf and trust epoch every 250 milliseconds.
@@ -76,7 +86,8 @@ credentials, or other unnecessary hardware identifiers.
    supported protocol version, and its own random challenge. The untrusted
    bootstrap channel accepts no action messages.
 5. **Prove key possession.** The node, owner client, and broker each sign the
-   canonical pairing transcript and both challenges with their Ed25519 keys.
+   canonical pairing transcript with their Ed25519 keys. The target client-side
+   challenge is not yet present in v0.1.
    Standard library verification proves possession; the short displayed code
    is only an owner comparison aid and never substitutes for signatures.
 6. **Compare out of band.** The owner compares the node fingerprint shown by the
@@ -146,6 +157,15 @@ Routine rotation is an authenticated, owner-approved transition:
 - active sessions and old authorizations are invalidated; and
 - the transition is durably audited.
 
+In v0.1, both roles on both sides of the transition sign the same canonical,
+short-lived transcript. This deliberately requires four signature fields even
+when one role key is unchanged. The transcript binds the stable NodeId, node key
+digest, pairing ID, peer ID, current trust epoch, current and next material
+digests, next transport leaf pin, challenge, and expiry. The clear challenge is
+never stored. Approval fails closed if the peer was revoked or expired, the
+current credential or epoch changed, any proof is invalid, or the durable audit
+transaction fails.
+
 For Action Broker rotation, the current broker, replacement broker, and owner
 sign the rotation transcript. For owner-key rotation, the current owner and
 replacement owner sign it. If a current private key is lost or suspected
@@ -167,8 +187,12 @@ The node records:
 - local approval or denial;
 - trust-store commit outcome and trust generation;
 - revocation and quarantine;
-- credential rotation; and
-- session termination caused by a trust change.
+- credential-rotation challenge, denial, commit, and old/new identity digests.
+
+The ceremony additionally returns node-signed pairing and rotation receipts to
+the local operator. v0.1 does not persist receipt bodies or a distinct
+session-termination audit event; trust-change and rotation events provide the
+durable correlation point.
 
 Audit records include time, local actor category, reason code, and correlation
 ID. Sensitive challenge values are not retained after the pairing safety

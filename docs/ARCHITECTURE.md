@@ -60,8 +60,11 @@ v0.1 acquires an owner-only, non-blocking singleton daemon lease before opening
 the runtime. Only while holding that lease may startup reconcile nonterminal
 reservations from a prior process to `Indeterminate`. Reconciliation never
 dispatches or resumes the action. A separate short-lived admin mutation lease
-serializes pairing, revocation, and device-key rotation without preventing live
-revocation checks in the daemon.
+serializes pairing, peer credential rotation, revocation, and device-key
+rotation without preventing live revocation checks in the daemon. Pairing and
+peer rotation use node-signed transcripts and return node-signed receipts;
+credential rotation additionally requires proofs from both current roles and
+both replacement roles before its atomic trust-epoch change.
 
 ### Identity and trust store
 

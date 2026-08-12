@@ -27,7 +27,10 @@ trust.
 
 - Stable random `NodeId` and Ed25519 device identity created locally.
 - Explicit multi-step pairing with local owner approval, proof of both owner and broker keys,
-  certificate pinning, expiry, revocation, and durable audit records.
+  certificate pinning, expiry, a node-signed trust receipt, revocation, and durable audit records.
+- Peer credential rotation requires current owner/broker proofs, replacement owner/broker proofs,
+  explicit local confirmation, an atomic epoch change, and a node-signed rotation receipt. The
+  production library exposes no raw credential-mutation API.
 - Every action is signed by the paired broker key **and** the owner authority key. The signed body
   binds request, task, agent, node, capability, target, typed arguments digest, validity window,
   trust generation, and protocol version.

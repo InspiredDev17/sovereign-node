@@ -168,7 +168,9 @@ This table is the release-gate target matrix. The current automated suite covers
 pairing approval and both remote key proofs, revocation persistence, replay and
 duplicates across reopen/reconnect, forged/expired/wrong-node/capability/version
 denials, traversal rejection before reservation, bounded replay exhaustion,
-restart identity stability, and credential epoch rotation. Session closure,
+restart identity stability, node-signed pairing receipts, and credential epoch
+rotation requiring current and replacement owner/broker proofs plus local
+confirmation. Session closure,
 TLS 1.3 handshake, exact-leaf matching, and live pairing/revocation/rotation
 reload are covered with real loopback sockets and ephemeral test certificates.
 Full filesystem-race and persistent update-workflow cases remain explicit
@@ -181,7 +183,7 @@ They assert that denied requests produce no capability side effect.
 
 | Scenario | Acceptance criterion |
 | --- | --- |
-| Pairing | Remote action remains disabled until local approval and owner/broker proofs over the node-bound transcript succeed |
+| Pairing | Remote action remains disabled until local approval and owner/broker proofs over the node-bound transcript succeed; the node signs the transcript and resulting receipt |
 | Revocation | Revocation survives restart, rejects old credentials and queued work, and closes bound TLS sessions within the trust-check interval |
 | Replay | A consumed authorization or replay value cannot execute under a new delivery |
 | Forged authorization | A modified field, digest, owner signature, or broker signature is rejected |
@@ -195,7 +197,7 @@ They assert that denied requests produce no capability side effect.
 | Resource exhaustion | Oversized input, full queue, excessive concurrency, and output pressure yield bounded rejection without evicting security state |
 | Unauthorized file access | Parent traversal, absolute escape, symlink, sensitive store, device, and disallowed root are rejected without content disclosure |
 | Node restart | NodeId, trust generation, revocation, replay reservation, and audit state persist; incomplete side effects become Indeterminate, not retried |
-| Credential rotation | Old sessions and authorizations stop working; new credentials work only after local approval and durable generation change |
+| Credential rotation | All current and replacement owner/broker proofs plus local confirmation are required; old sessions and authorizations stop working after the atomic durable epoch change, and the node signs the receipt |
 
 Additional tests cover malformed canonical encodings, TLS peer mismatch,
 pairing-window expiry, duplicate enrollment, corrupt state, untrustworthy time,

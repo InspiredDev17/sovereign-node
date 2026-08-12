@@ -16,7 +16,10 @@ use sovereign_node::capabilities::CapabilityExecutor;
 use sovereign_node::config::{HealthConfig, NodeConfig, PolicyConfig};
 use sovereign_node::identity::NodeIdentity;
 use sovereign_node::lifecycle::{LeaseKind, LifecycleLease};
-use sovereign_node::pairing::{PairingKeyMaterialV1, PairingManager, PairingProof, PairingRequest};
+use sovereign_node::pairing::{
+    CredentialRotationProof, CredentialRotationRequest, PairingKeyMaterialV1, PairingManager,
+    PairingProof, PairingRequest,
+};
 use sovereign_node::protocol::{
     Capability, CapabilityManifestV1, PairingId, PublicKeyBytes, Sha256Digest, SignatureBytes,
     SignedNodeRegistrationV1, TrustStatus, UnixMillis,
@@ -77,6 +80,10 @@ enum PairCommand {
     Request(PairRequestArgs),
     /// Verify both transcript signatures and commit trust after local confirmation.
     Approve(PairApproveArgs),
+    /// Create and display a short-lived, node-bound peer credential rotation transcript.
+    RotationRequest(PairRotationRequestArgs),
+    /// Verify current/new role proofs and atomically rotate after local confirmation.
+    RotationApprove(PairRotationApproveArgs),
     /// Durably revoke a peer after local confirmation.
     Revoke(PairRevokeArgs),
 }
@@ -132,6 +139,50 @@ struct PairRevokeArgs {
     peer_id: String,
     #[arg(long)]
     reason: String,
+    #[arg(long)]
+    confirm: bool,
+}
+
+#[derive(Debug, Args)]
+struct PairRotationRequestArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    peer_id: String,
+    #[arg(long)]
+    owner_id: String,
+    #[arg(long)]
+    owner_public_key_hex: String,
+    #[arg(long)]
+    broker_public_key_hex: String,
+    #[arg(long)]
+    client_ca_pem: PathBuf,
+    #[arg(long)]
+    client_certificate_pem: PathBuf,
+    #[arg(long = "capability", required = true)]
+    capabilities: Vec<String>,
+    #[arg(long, default_value_t = 300)]
+    ttl_seconds: u64,
+    #[arg(long)]
+    trust_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct PairRotationApproveArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    rotation_id: Uuid,
+    #[arg(long)]
+    challenge_hex: String,
+    #[arg(long)]
+    current_owner_signature_hex: String,
+    #[arg(long)]
+    current_broker_signature_hex: String,
+    #[arg(long)]
+    next_owner_signature_hex: String,
+    #[arg(long)]
+    next_broker_signature_hex: String,
     #[arg(long)]
     confirm: bool,
 }
@@ -260,6 +311,8 @@ fn pair(command: PairCommand) -> Result<()> {
     match command {
         PairCommand::Request(args) => pair_request(args),
         PairCommand::Approve(args) => pair_approve(args),
+        PairCommand::RotationRequest(args) => pair_rotation_request(args),
+        PairCommand::RotationApprove(args) => pair_rotation_approve(args),
         PairCommand::Revoke(args) => pair_revoke(args),
     }
 }
@@ -335,6 +388,75 @@ fn pair_approve(args: PairApproveArgs) -> Result<()> {
         args.confirm,
     )?;
     print_json(&trusted)
+}
+
+fn pair_rotation_request(args: PairRotationRequestArgs) -> Result<()> {
+    let (config, identity, store, _admin_lease) = pairing_context(&args.config)?;
+    let now = now()?;
+    let trust_expires_at = args
+        .trust_ttl_seconds
+        .map(|seconds| {
+            seconds
+                .checked_mul(1_000)
+                .and_then(|millis| now.0.checked_add(millis))
+                .map(UnixMillis)
+                .ok_or_else(|| anyhow!("trust TTL is too large"))
+        })
+        .transpose()?;
+    let client_leaf_der = first_pem_certificate(&args.client_certificate_pem)?;
+    let key_material = PairingKeyMaterialV1 {
+        schema_version: 1,
+        owner_id: args.owner_id,
+        owner_public_key: public_key(&args.owner_public_key_hex)?,
+        broker_public_key: public_key(&args.broker_public_key_hex)?,
+        client_ca_der: first_pem_certificate(&args.client_ca_pem)?,
+        client_certificate_sha256: Sha256Digest(Sha256::digest(client_leaf_der).into()),
+        allowed_capabilities: args
+            .capabilities
+            .iter()
+            .map(|value| parse_capability(value))
+            .collect::<Result<Vec<_>>>()?,
+        trust_expires_at,
+    };
+    let manager = PairingManager::new(
+        identity,
+        store,
+        config.policy.enabled_capabilities.iter().copied(),
+    );
+    let display = manager.begin_credential_rotation(
+        CredentialRotationRequest {
+            peer_id: args.peer_id,
+            key_material,
+            ttl_millis: args
+                .ttl_seconds
+                .checked_mul(1_000)
+                .ok_or_else(|| anyhow!("rotation TTL is too large"))?,
+        },
+        now,
+    )?;
+    print_json(&display)
+}
+
+fn pair_rotation_approve(args: PairRotationApproveArgs) -> Result<()> {
+    let (config, identity, store, _admin_lease) = pairing_context(&args.config)?;
+    let manager = PairingManager::new(
+        identity,
+        store,
+        config.policy.enabled_capabilities.iter().copied(),
+    );
+    let result = manager.approve_credential_rotation_local(
+        &CredentialRotationProof {
+            rotation_id: args.rotation_id,
+            challenge_secret: fixed_bytes::<32>(&args.challenge_hex, "challenge")?,
+            current_owner_signature: signature(&args.current_owner_signature_hex)?,
+            current_broker_signature: signature(&args.current_broker_signature_hex)?,
+            next_owner_signature: signature(&args.next_owner_signature_hex)?,
+            next_broker_signature: signature(&args.next_broker_signature_hex)?,
+            approved_at: now()?,
+        },
+        args.confirm,
+    )?;
+    print_json(&result)
 }
 
 fn pair_revoke(args: PairRevokeArgs) -> Result<()> {
