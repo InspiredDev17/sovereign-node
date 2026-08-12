@@ -4,6 +4,7 @@ pub mod authz;
 pub mod capabilities;
 pub mod config;
 pub mod identity;
+pub mod lifecycle;
 pub mod pairing;
 pub mod protocol;
 pub mod resources;

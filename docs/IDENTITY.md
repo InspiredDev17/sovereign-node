@@ -28,6 +28,15 @@ That snapshot has no requester challenge or expiry and must not be treated as
 fresh proof of current trust. The richer challenge-bound registration and trust
 state model below is the target contract.
 
+The v0.1 rotation CLI is narrower than the target ceremony: it requires local
+confirmation, serializes against every pairing/revocation mutation, refuses to
+run while the daemon or any trusted peer is active, preserves NodeId, writes a
+dual-signed old/new-key continuity binding, and appends digest-only rotation
+intent and completion audit events. A surviving intent without completion makes
+an interrupted rotation visible to the owner. It does not rotate TLS credentials
+or silently preserve remote trust; the daemon must be restarted and peers
+re-established explicitly.
+
 ## Stable NodeId
 
 On first initialization, the daemon obtains at least 128 bits from the operating

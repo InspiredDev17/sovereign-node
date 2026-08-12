@@ -26,6 +26,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::lifecycle::{LeaseKind, LifecycleLease};
+
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
@@ -343,6 +345,8 @@ pub enum AuditKind {
     PairingRejected,
     PeerRevoked,
     CredentialRotated,
+    NodeIdentityRotationStarted,
+    NodeIdentityRotated,
     PolicyActivated,
     AuthorizationRejected,
     RequestReserved,
@@ -1325,6 +1329,67 @@ impl StateStore {
         Ok(outcome)
     }
 
+    /// Mark reservations from a prior daemon process as spent and indeterminate.
+    /// The daemon lease makes this safe against a concurrently executing runtime.
+    pub fn reconcile_open_replays(
+        &self,
+        daemon_lease: &LifecycleLease,
+        now_unix_ms: i64,
+    ) -> Result<u64, StoreError> {
+        if daemon_lease.kind() != LeaseKind::Daemon {
+            return Err(StoreError::InvalidInput(
+                "open replay reconciliation requires the daemon lease",
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut statement = transaction.prepare(
+            "SELECT request_id, request_fingerprint FROM request_replays
+             WHERE terminal_record IS NULL ORDER BY reserved_at_unix_ms",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let reconciled = u64::try_from(rows.len())
+            .map_err(|_| StoreError::CorruptData("replay reconciliation count overflow"))?;
+        for (request_id, fingerprint) in rows {
+            let request_id = Uuid::parse_str(&request_id)
+                .map_err(|_| StoreError::CorruptData("replay request ID is invalid"))?;
+            let fingerprint = digest_from_blob(fingerprint)?;
+            let terminal = TerminalResponseMetadata {
+                status: TerminalStatus::Indeterminate,
+                response_digest: sha256(b"indeterminate-after-daemon-restart"),
+                redacted_error_digest: Some(sha256(b"prior-runtime-ended-before-terminal-record")),
+                response_size_bytes: 0,
+                completed_at_unix_ms: now_unix_ms,
+            };
+            transaction.execute(
+                "UPDATE request_replays SET terminal_record = ?2
+                 WHERE request_id = ?1 AND terminal_record IS NULL",
+                params![request_id.to_string(), encode(&terminal)?],
+            )?;
+            append_audit_in_transaction(
+                &transaction,
+                AuditEventDraft {
+                    occurred_at_unix_ms: now_unix_ms,
+                    kind: AuditKind::TerminalResponseRecorded,
+                    outcome: AuditOutcome::Observed,
+                    request_id: Some(request_id),
+                    actor_digest: None,
+                    subject_digest: Some(fingerprint),
+                    context_digest: Some(terminal.response_digest),
+                },
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(reconciled)
+    }
+
     pub fn terminal_response(
         &self,
         request_id: Uuid,
@@ -2048,6 +2113,40 @@ mod tests {
         assert!(matches!(
             reopened.reserve_validated_replay_at(&collision, NOW + 2)?,
             ReplayOutcome::Collision { existing_fingerprint } if existing_fingerprint == fingerprint
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_daemon_lease_reconciles_open_replay_without_retry() -> Result<(), StoreError> {
+        let (directory, path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        store.reserve_validated_replay_at(&request, NOW)?;
+        drop(store);
+
+        let reopened = StateStore::open(path)?;
+        assert!(matches!(
+            reopened.replay_outcome(&request)?,
+            Some(ReplayOutcome::DuplicateSame { terminal: None, .. })
+        ));
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let admin_lease = LifecycleLease::acquire(directory.path(), LeaseKind::AdminMutation)
+            .map_err(|_| StoreError::InvalidInput("could not acquire test admin lease"))?;
+        assert!(matches!(
+            reopened.reconcile_open_replays(&admin_lease, NOW + 1),
+            Err(StoreError::InvalidInput(_))
+        ));
+        let daemon_lease = LifecycleLease::acquire(directory.path(), LeaseKind::Daemon)
+            .map_err(|_| StoreError::InvalidInput("could not acquire test daemon lease"))?;
+        assert_eq!(reopened.reconcile_open_replays(&daemon_lease, NOW + 2)?, 1);
+        assert_eq!(reopened.reconcile_open_replays(&daemon_lease, NOW + 3)?, 0);
+        assert!(matches!(
+            reopened.terminal_response(request.request_id)?,
+            Some(TerminalResponseMetadata {
+                status: TerminalStatus::Indeterminate,
+                ..
+            })
         ));
         Ok(())
     }

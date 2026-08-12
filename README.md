@@ -32,7 +32,8 @@ trust.
   binds request, task, agent, node, capability, target, typed arguments digest, validity window,
   trust generation, and protocol version.
 - Replay reservation and audit-start persistence occur atomically before dispatch. A crash never
-  causes an action to be automatically executed again.
+  causes an action to be automatically executed again. A singleton daemon lease safely marks
+  prior open reservations `Indeterminate` on restart and keeps them spent.
 - TLS 1.3 mutual authentication is mandatory when the LAN listener is enabled. Public, wildcard,
   and plaintext listeners are rejected.
 - Only capabilities in both the local manifest and the paired peer's scope can run. The default
@@ -40,6 +41,8 @@ trust.
 - File and approved-action wire types are reserved for later hardening, but v0.1 configuration
   rejects advertising or executing them. There is no shell command string or code-upload path.
 - The v0.1 daemon serves only on Unix, refuses to serve as root, and keeps identity/state owner-only.
+- Pairing, revocation, and identity rotation are serialized by an owner-only admin lease; device
+  identity rotation is refused while the daemon or a trusted peer is active and is audited.
 - Remote execution fails closed if trust, replay, audit, time, or policy state cannot be verified.
 
 See [Architecture](docs/ARCHITECTURE.md), [Pairing](docs/PAIRING.md),

@@ -259,7 +259,7 @@ impl PairingManager {
             .revoke_peer(
                 peer_id,
                 millis_to_i64(now)?,
-                self.identity.key_id().0,
+                sha256(b"local-owner-confirmed-revocation-v1"),
                 sha256(reason.as_bytes()),
             )
             .map_err(Into::into)

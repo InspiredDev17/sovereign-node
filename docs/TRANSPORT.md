@@ -23,6 +23,11 @@ physically closing stale sessions requires a daemon restart in v0.1. The node
 server certificate must be provisioned to clients through a separate
 owner-controlled channel.
 
+Only one v0.1 daemon may hold the node's owner-only singleton lease. At startup,
+after acquiring that lease, it converts prior nonterminal replay reservations to
+durable `Indeterminate` metadata and never retries them. Merely opening the store
+from a status or administration command cannot perform this reconciliation.
+
 ## Endpoints
 
 ### Local administration

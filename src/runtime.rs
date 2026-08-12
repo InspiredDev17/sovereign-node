@@ -10,6 +10,7 @@ use crate::authz::{
 };
 use crate::capabilities::{CapabilityError, CapabilityExecutor};
 use crate::identity::{IdentityError, NodeIdentity};
+use crate::lifecycle::LifecycleLease;
 use crate::protocol::{
     ActionErrorCode, ActionErrorV1, ActionResponseV1, ActionStatus, PROTOCOL_VERSION_V1, RequestId,
     SCHEMA_VERSION_V1, SignedActionResponseV1, SignedActionV1, TaskId, TrustStatus, UnixMillis,
@@ -27,6 +28,12 @@ pub enum RuntimeError {
     Identity(#[from] IdentityError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeCapacity {
+    pub max_concurrent_actions: usize,
+    pub queue_capacity: usize,
+}
+
 #[derive(Debug)]
 pub struct NodeRuntime {
     identity: Arc<NodeIdentity>,
@@ -38,6 +45,8 @@ pub struct NodeRuntime {
     admitted: AtomicU32,
     running: AtomicU32,
     queue_capacity: u32,
+    /// Every connection task holds the runtime, so the daemon lease outlives all dispatch work.
+    _daemon_lease: LifecycleLease,
 }
 
 impl NodeRuntime {
@@ -48,8 +57,8 @@ impl NodeRuntime {
         executor: CapabilityExecutor,
         store: Arc<StateStore>,
         clock: Arc<dyn Clock>,
-        max_concurrent_actions: usize,
-        queue_capacity: usize,
+        capacity: RuntimeCapacity,
+        daemon_lease: LifecycleLease,
     ) -> Self {
         Self {
             identity,
@@ -57,10 +66,11 @@ impl NodeRuntime {
             executor,
             store,
             clock,
-            concurrency: Arc::new(Semaphore::new(max_concurrent_actions)),
+            concurrency: Arc::new(Semaphore::new(capacity.max_concurrent_actions)),
             admitted: AtomicU32::new(0),
             running: AtomicU32::new(0),
-            queue_capacity: u32::try_from(queue_capacity).unwrap_or(u32::MAX),
+            queue_capacity: u32::try_from(capacity.queue_capacity).unwrap_or(u32::MAX),
+            _daemon_lease: daemon_lease,
         }
     }
 

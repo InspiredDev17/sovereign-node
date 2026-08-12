@@ -169,9 +169,10 @@ pairing approval and both remote key proofs, revocation persistence, replay and
 duplicates across reopen/reconnect, forged/expired/wrong-node/capability/version
 denials, traversal rejection before reservation, bounded replay exhaustion,
 restart identity stability, and credential epoch rotation. Session-closure,
-crash-Indeterminate, full filesystem race, transport handshake, and persistent
-update-workflow cases remain explicit pre-enablement gates; the associated
-capabilities are unavailable in v0.1.
+full filesystem race, transport handshake, and persistent update-workflow cases
+remain explicit pre-enablement gates; the associated capabilities are
+unavailable in v0.1. The suite also verifies singleton/admin lease separation
+and daemon-lease-only crash reconciliation to `Indeterminate` without retry.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.

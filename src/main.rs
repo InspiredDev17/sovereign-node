@@ -15,14 +15,17 @@ use sovereign_node::authz::{AuthorizationEngine, Clock, SystemClock};
 use sovereign_node::capabilities::CapabilityExecutor;
 use sovereign_node::config::{HealthConfig, NodeConfig, PolicyConfig};
 use sovereign_node::identity::NodeIdentity;
+use sovereign_node::lifecycle::{LeaseKind, LifecycleLease};
 use sovereign_node::pairing::{PairingKeyMaterialV1, PairingManager, PairingProof, PairingRequest};
 use sovereign_node::protocol::{
     Capability, CapabilityManifestV1, PairingId, PublicKeyBytes, Sha256Digest, SignatureBytes,
     SignedNodeRegistrationV1, TrustStatus, UnixMillis,
 };
 use sovereign_node::resources::ResourceReporter;
-use sovereign_node::runtime::NodeRuntime;
-use sovereign_node::store::{RevocationOutcome, StateStore};
+use sovereign_node::runtime::{NodeRuntime, RuntimeCapacity};
+use sovereign_node::store::{
+    AuditEventDraft, AuditKind, AuditOutcome, RevocationOutcome, StateStore, sha256,
+};
 use uuid::Uuid;
 
 const STATE_DATABASE: &str = "state.sqlite3";
@@ -262,7 +265,7 @@ fn pair(command: PairCommand) -> Result<()> {
 }
 
 fn pair_request(args: PairRequestArgs) -> Result<()> {
-    let (config, identity, store) = pairing_context(&args.config)?;
+    let (config, identity, store, _admin_lease) = pairing_context(&args.config)?;
     let owner_public_key = public_key(&args.owner_public_key_hex)?;
     let broker_public_key = public_key(&args.broker_public_key_hex)?;
     let client_ca_der = first_pem_certificate(&args.client_ca_pem)?;
@@ -314,7 +317,7 @@ fn pair_request(args: PairRequestArgs) -> Result<()> {
 }
 
 fn pair_approve(args: PairApproveArgs) -> Result<()> {
-    let (config, identity, store) = pairing_context(&args.config)?;
+    let (config, identity, store, _admin_lease) = pairing_context(&args.config)?;
     let manager = PairingManager::new(
         identity,
         store,
@@ -335,7 +338,7 @@ fn pair_approve(args: PairApproveArgs) -> Result<()> {
 }
 
 fn pair_revoke(args: PairRevokeArgs) -> Result<()> {
-    let (config, identity, store) = pairing_context(&args.config)?;
+    let (config, identity, store, _admin_lease) = pairing_context(&args.config)?;
     let manager = PairingManager::new(
         identity,
         store,
@@ -351,15 +354,45 @@ fn pair_revoke(args: PairRevokeArgs) -> Result<()> {
 }
 
 fn rotate_identity(config_path: &Path, confirm: bool) -> Result<()> {
+    if !confirm {
+        bail!("device identity rotation requires explicit local --confirm");
+    }
     let config = NodeConfig::load(config_path)?;
+    let _admin_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::AdminMutation)?;
+    let _daemon_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::Daemon)
+        .context("identity rotation requires the daemon to be stopped")?;
     let identity = NodeIdentity::load(&config.data_dir)?;
     let store = open_store(&config)?;
-    if !store.currently_trusted_peers(to_i64(now()?)?)?.is_empty() {
+    let rotation_time = now()?;
+    if !store
+        .currently_trusted_peers(to_i64(rotation_time)?)?
+        .is_empty()
+    {
         bail!(
             "device identity rotation is refused while trusted peers exist; revoke them and restart before rotating"
         );
     }
-    let (rotated, binding) = identity.rotate_locally(&config.data_dir, now()?, confirm)?;
+    let old_key_id = identity.key_id();
+    let local_actor = sha256(b"local-owner-confirmed-identity-rotation-v1");
+    store.append_audit(AuditEventDraft {
+        occurred_at_unix_ms: to_i64(rotation_time)?,
+        kind: AuditKind::NodeIdentityRotationStarted,
+        outcome: AuditOutcome::Observed,
+        request_id: None,
+        actor_digest: Some(local_actor),
+        subject_digest: Some(old_key_id.0),
+        context_digest: Some(sha256(identity.node_id().to_string().as_bytes())),
+    })?;
+    let (rotated, binding) = identity.rotate_locally(&config.data_dir, rotation_time, confirm)?;
+    store.append_audit(AuditEventDraft {
+        occurred_at_unix_ms: to_i64(rotation_time)?,
+        kind: AuditKind::NodeIdentityRotated,
+        outcome: AuditOutcome::Accepted,
+        request_id: None,
+        actor_digest: Some(local_actor),
+        subject_digest: Some(old_key_id.0),
+        context_digest: Some(rotated.key_id().0),
+    })?;
     print_json(&serde_json::json!({
         "node_id": rotated.node_id().to_string(),
         "identity_fingerprint_sha256": rotated.fingerprint(),
@@ -376,9 +409,17 @@ async fn serve(config_path: &Path) -> Result<()> {
         bail!("the Sovereign Node daemon refuses to run as root");
     }
     let config = Arc::new(NodeConfig::load(config_path)?);
+    let daemon_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::Daemon)
+        .context("could not acquire the singleton daemon lease")?;
     let identity = Arc::new(NodeIdentity::load(&config.data_dir)?);
     let store = Arc::new(open_store(&config)?);
     store.verify_audit_chain()?;
+    let reconciled = store.reconcile_open_replays(&daemon_lease, to_i64(now()?)?)?;
+    if reconciled > 0 {
+        eprintln!(
+            "reconciled {reconciled} prior open request(s) as Indeterminate; none were retried"
+        );
+    }
 
     if config.listen.is_none() {
         eprintln!(
@@ -407,19 +448,30 @@ async fn serve(config_path: &Path) -> Result<()> {
         executor,
         store.clone(),
         clock,
-        config.policy.max_concurrent_actions,
-        config.policy.queue_capacity,
+        RuntimeCapacity {
+            max_concurrent_actions: config.policy.max_concurrent_actions,
+            queue_capacity: config.policy.queue_capacity,
+        },
+        daemon_lease.clone(),
     ));
     sovereign_node::transport::serve(config, store, runtime).await?;
     Ok(())
 }
 
-fn pairing_context(config_path: &Path) -> Result<(NodeConfig, Arc<NodeIdentity>, Arc<StateStore>)> {
+fn pairing_context(
+    config_path: &Path,
+) -> Result<(
+    NodeConfig,
+    Arc<NodeIdentity>,
+    Arc<StateStore>,
+    LifecycleLease,
+)> {
     let config = NodeConfig::load(config_path)?;
+    let admin_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::AdminMutation)?;
     let identity = Arc::new(NodeIdentity::load(&config.data_dir)?);
     let store = Arc::new(open_store(&config)?);
     store.verify_audit_chain()?;
-    Ok((config, identity, store))
+    Ok((config, identity, store, admin_lease))
 }
 
 fn open_store(config: &NodeConfig) -> Result<StateStore> {

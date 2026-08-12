@@ -56,6 +56,13 @@ only after validating its configuration, identity key, trust store, capability
 policy, replay ledger, and audit store. Corrupt or unavailable security state
 prevents remote action execution.
 
+v0.1 acquires an owner-only, non-blocking singleton daemon lease before opening
+the runtime. Only while holding that lease may startup reconcile nonterminal
+reservations from a prior process to `Indeterminate`. Reconciliation never
+dispatches or resumes the action. A separate short-lived admin mutation lease
+serializes pairing, revocation, and device-key rotation without preventing live
+revocation checks in the daemon.
+
 ### Identity and trust store
 
 The identity subsystem holds a stable random NodeId, an Ed25519 device key pair,
@@ -106,6 +113,11 @@ persisted atomically. A repeated request cannot execute twice:
 The ledger is bounded by policy, but entries are never evicted before their
 authorization lifetime plus the configured safety window. Resource pressure
 must cause rejection, not replay protection bypass.
+
+After an unclean daemon exit, a later daemon instance first acquires the
+singleton lease and atomically records every nonterminal prior reservation as
+`Indeterminate`. This frees bounded open-reservation capacity while preserving
+the consumed RequestId and requiring owner reconciliation.
 
 ### Capability registry and executors
 

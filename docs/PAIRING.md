@@ -29,6 +29,10 @@ or the full proof-of-possession credential-rotation ceremony. Pending invitation
 survive a daemon restart only until their original expiration and are not action
 authority. New/rotated TLS peers require daemon restart because the TLS verifier
 is built from a startup snapshot; revocation still denies actions immediately.
+All v0.1 pairing and revocation state changes share a non-blocking owner-only
+admin mutation lease, preventing concurrent approval/revocation/identity-rotation
+races. The daemon uses a separate lease, so local revocation remains available
+while it is running.
 
 ## Identities displayed for approval
 
