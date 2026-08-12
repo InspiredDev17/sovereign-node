@@ -22,6 +22,7 @@ use crate::store::{
 pub struct TransportPeer {
     pub peer_id: String,
     pub certificate_sha256: Sha256Digest,
+    pub trust_epoch: u64,
 }
 
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -240,6 +241,9 @@ impl AuthorizationEngine {
         material: &PairingKeyMaterialV1,
         now: UnixMillis,
     ) -> Result<(), AuthorizationError> {
+        if transport_peer.trust_epoch != trusted.trust_epoch {
+            return Err(AuthorizationError::TrustEpoch);
+        }
         request
             .validate_for_node(self.node_id, now, trusted.trust_epoch)
             .map_err(map_validation)?;

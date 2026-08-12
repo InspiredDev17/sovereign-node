@@ -34,8 +34,8 @@ run while the daemon or any trusted peer is active, preserves NodeId, writes a
 dual-signed old/new-key continuity binding, and appends digest-only rotation
 intent and completion audit events. A surviving intent without completion makes
 an interrupted rotation visible to the owner. It does not rotate TLS credentials
-or silently preserve remote trust; the daemon must be restarted and peers
-re-established explicitly.
+or silently preserve remote trust; the daemon must already be stopped and peers
+must be re-established explicitly.
 
 ## Stable NodeId
 

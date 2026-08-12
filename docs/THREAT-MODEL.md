@@ -94,7 +94,7 @@ operation fails closed.
 | Resource-exhaustion attack | Bounded frames, atomic durable per-peer and global admission, queues, concurrency, time, output, and backpressure cause rejection without security bypass |
 | Disconnect ambiguity | Durable execution state returns recorded or Indeterminate outcome and never silently retries |
 | Version downgrade | Locally allowed versions and versions bound into signatures reject unsupported or downgraded semantics |
-| Revoked credential reuse | Trust generation increments, sessions close, and all old-generation authorizations are rejected |
+| Revoked credential reuse | Revocation invalidates the trust record, rotation increments its generation, bound sessions close, and stale authorizations are rejected |
 | Malicious update bundle | Pinned release signature, content hashes, version policy, local owner approval, audit, and rollback metadata are required |
 | Automatic supply-chain compromise | The daemon contains no Internet updater or unattended install path |
 | Agent Green suppression | Node lacks Agent Green control capability and reports only independently obtained tri-state health |
@@ -168,11 +168,13 @@ This table is the release-gate target matrix. The current automated suite covers
 pairing approval and both remote key proofs, revocation persistence, replay and
 duplicates across reopen/reconnect, forged/expired/wrong-node/capability/version
 denials, traversal rejection before reservation, bounded replay exhaustion,
-restart identity stability, and credential epoch rotation. Session-closure,
-full filesystem race, transport handshake, and persistent update-workflow cases
-remain explicit pre-enablement gates; the associated capabilities are
-unavailable in v0.1. The suite also verifies singleton/admin lease separation
-and daemon-lease-only crash reconciliation to `Indeterminate` without retry.
+restart identity stability, and credential epoch rotation. Session closure,
+TLS 1.3 handshake, exact-leaf matching, and live pairing/revocation/rotation
+reload are covered with real loopback sockets and ephemeral test certificates.
+Full filesystem-race and persistent update-workflow cases remain explicit
+pre-enablement gates; the associated capabilities are unavailable in v0.1. The
+suite also verifies singleton/admin lease separation and daemon-lease-only crash
+reconciliation to `Indeterminate` without retry.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.
@@ -180,7 +182,7 @@ They assert that denied requests produce no capability side effect.
 | Scenario | Acceptance criterion |
 | --- | --- |
 | Pairing | Remote action remains disabled until local approval and owner/broker proofs over the node-bound transcript succeed |
-| Revocation | Revocation survives restart and rejects old credentials and queued work; forced TLS close is a future gate |
+| Revocation | Revocation survives restart, rejects old credentials and queued work, and closes bound TLS sessions within the trust-check interval |
 | Replay | A consumed authorization or replay value cannot execute under a new delivery |
 | Forged authorization | A modified field, digest, owner signature, or broker signature is rejected |
 | Expired authorization | Requests at or beyond expiration are rejected before execution; clock uncertainty fails closed |

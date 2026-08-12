@@ -147,6 +147,7 @@ impl Harness {
         TransportPeer {
             peer_id: PEER_ID.to_owned(),
             certificate_sha256: CERTIFICATE_DIGEST,
+            trust_epoch: 1,
         }
     }
 
@@ -761,12 +762,14 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
     assert_eq!(rotated_peer.trust_epoch, 2);
 
     let engine = harness.engine();
-    let transport = harness.transport_peer();
+    let old_transport = harness.transport_peer();
     let old_epoch = harness.system_info_action(700, 60)?;
     assert!(matches!(
-        engine.verify_and_reserve(old_epoch, &transport),
+        engine.verify_and_reserve(old_epoch, &old_transport),
         Err(AuthorizationError::TrustEpoch)
     ));
+    let mut rotated_transport = old_transport;
+    rotated_transport.trust_epoch = 2;
 
     let old_broker_at_new_epoch = signed_action(ActionSpec {
         request_seed: 701,
@@ -784,7 +787,7 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
         broker_key: &harness.broker_key,
     })?;
     assert!(matches!(
-        engine.verify_and_reserve(old_broker_at_new_epoch, &transport),
+        engine.verify_and_reserve(old_broker_at_new_epoch, &rotated_transport),
         Err(AuthorizationError::Forged)
     ));
 
@@ -804,7 +807,7 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
         broker_key: &new_broker_key,
     })?;
     assert!(matches!(
-        engine.verify_and_reserve(rotated_action, &transport)?,
+        engine.verify_and_reserve(rotated_action, &rotated_transport)?,
         AuthorizationOutcome::Fresh(_)
     ));
 

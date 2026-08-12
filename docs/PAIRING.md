@@ -24,11 +24,11 @@ across restart.
 
 The remainder of this document is the target pairing contract. v0.1 does not
 yet provide a GUI prompt, a client-generated challenge, a node-signed receipt,
-live TLS-session termination/reload, recovery re-pairing under the same peer ID,
-or the full proof-of-possession credential-rotation ceremony. Pending invitations
+recovery re-pairing under the same peer ID, or the full proof-of-possession
+credential-rotation ceremony. Pending invitations
 survive a daemon restart only until their original expiration and are not action
-authority. New/rotated TLS peers require daemon restart because the TLS verifier
-is built from a startup snapshot; revocation still denies actions immediately.
+authority. The TLS verifier reloads owner-approved client trust and established
+sessions recheck their exact leaf and trust epoch every 250 milliseconds.
 All v0.1 pairing and revocation state changes share a non-blocking owner-only
 admin mutation lease, preventing concurrent approval/revocation/identity-rotation
 races. The daemon uses a separate lease, so local revocation remains available
@@ -119,10 +119,10 @@ be online. The node:
 
 1. displays the identity and key fingerprints to be revoked;
 2. asks for explicit local confirmation;
-3. marks the trust record revoked and increments the trust generation;
+3. durably marks the trust record revoked;
 4. invalidates owner, broker, and transport credentials from the old
    generation;
-5. closes active sessions;
+5. closes active sessions within the transport trust-check interval;
 6. rejects queued and new remote actions, including actions signed before the
    revocation;
 7. retains replay and audit history; and

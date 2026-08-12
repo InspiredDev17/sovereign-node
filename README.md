@@ -37,6 +37,8 @@ trust.
 - TLS 1.3 mutual authentication is mandatory when the LAN listener is enabled. Public, wildcard,
   and plaintext listeners are rejected. Atomic durable per-paired-peer and node-global request
   limits are enforced before authorization and replay reservation; reconnecting resets neither.
+- Paired client trust reloads while the daemon runs. Sessions are bound to the exact certificate
+  and trust epoch and close promptly after revocation, expiry, rotation, or trust-store loss.
 - Only capabilities in both the local manifest and the paired peer's scope can run. The default
   manifest is read-only: `SystemInfo` and `ResourceStatus`.
 - File and approved-action wire types are reserved for later hardening, but v0.1 configuration

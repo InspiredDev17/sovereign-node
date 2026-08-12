@@ -20,11 +20,19 @@ after bounded decoding and before authorization or replay reservation.
 Reconnecting or reopening the state store does not reset either limit; a
 backwards clock step fails closed. Every admitted frame is authorized again
 against current durable trust. Local administration is CLI-only, not a Unix
-socket. Application version negotiation, live TLS trust reload, and forced
-session closure are target work. Revocation blocks new actions immediately;
-accepting newly paired/rotated transport credentials or physically closing
-stale sessions requires a daemon restart in v0.1. The node server certificate
-must be provisioned to clients through a separate owner-controlled channel.
+socket. Paired client trust snapshots reload every 250 milliseconds. New and
+rotated pairings become eligible for a new handshake without daemon restart.
+Every established session is bound to its exact leaf digest and trust epoch and
+is rechecked on the same interval while reading, waiting for runtime work, and
+writing. Revocation, expiry, rotation, malformed trust, or an unavailable trust
+store closes the session. Application version negotiation remains target work.
+The node server certificate must be provisioned to clients through a separate
+owner-controlled channel and does not reload in v0.1.
+
+An action already durably dispatched is not cancelled solely because its
+session closes; it finishes under the normal bounded runtime and terminal-state
+rules. Work that was only queued rechecks current trust before reservation and
+cannot execute under the invalidated session epoch.
 
 Loopback socket tests generate ephemeral certificates at test time and prove
 TLS 1.3 negotiation, rejection when the client certificate is absent, and exact
@@ -85,8 +93,9 @@ issuance may use an owner-controlled private CA or pinned self-managed
 certificates; the application is not coupled to a commercial certificate
 service.
 
-Revoking or rotating paired credentials closes existing sessions and changes
-the trust generation. TLS session resumption must not outlive the credential or
+Revoking a paired credential invalidates its trust record and closes existing
+sessions. Rotation increments the trust generation and closes sessions bound to
+the prior generation. TLS session resumption must not outlive the credential or
 generation that created it.
 
 ## Application authentication
@@ -136,8 +145,10 @@ must enforce decompressed-size and ratio limits.
 5. Negotiate one locally allowed application-protocol version.
 6. Process bounded requests; authorize each action independently.
 7. Use deadlines and cancellation without converting cancellation into retry.
-8. Close on authentication failure, malformed framing, revocation, rotation,
-   trust-generation change, or repeated policy violations.
+8. Recheck certificate binding, trust epoch, revocation, expiry, and trust-store
+   availability at most every 250 milliseconds while a session is active.
+9. Close on authentication failure, malformed framing, revocation, rotation,
+   trust-generation change, trust-state loss, or repeated policy violations.
 
 Authentication failures return minimal error categories and never reveal which
 key, NodeId, capability, path, process, or service would have been valid.
