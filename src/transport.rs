@@ -643,6 +643,7 @@ mod tests {
             peer_id.to_owned(),
             format!("Test {peer_id}"),
             encoded,
+            vec![client.certificate.as_ref().to_vec()],
             &challenge,
             sha256(b"node-identity"),
             certificate_digest,

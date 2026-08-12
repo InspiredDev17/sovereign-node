@@ -28,6 +28,9 @@ trust.
 - Stable random `NodeId` and Ed25519 device identity created locally.
 - Explicit multi-step pairing with local owner approval, proof of both owner and broker keys,
   certificate pinning, expiry, a node-signed trust receipt, revocation, and durable audit records.
+- Pairing and credential rotation validate the submitted X.509 leaf and intermediates against the
+  submitted CA at both request and approval time, require CA constraints and clientAuth purpose,
+  enforce certificate validity, and bind the exact leaf SHA-256 fingerprint.
 - Peer credential rotation requires current owner/broker proofs, replacement owner/broker proofs,
   explicit local confirmation, an atomic epoch change, and a node-signed rotation receipt. The
   production library exposes no raw credential-mutation API.

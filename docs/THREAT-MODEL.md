@@ -173,6 +173,9 @@ rotation requiring current and replacement owner/broker proofs plus local
 confirmation. Session closure,
 TLS 1.3 handshake, exact-leaf matching, and live pairing/revocation/rotation
 reload are covered with real loopback sockets and ephemeral test certificates.
+Certificate enrollment tests cover exact fingerprint mismatch, malformed DER,
+non-CA trust anchors, wrong issuer, serverAuth-only leaves, missing TLS-signing
+usage, expired leaves, approval-time expiry, and a valid intermediate chain.
 Full filesystem-race and persistent update-workflow cases remain explicit
 pre-enablement gates; the associated capabilities are unavailable in v0.1. The
 suite also verifies singleton/admin lease separation and daemon-lease-only crash

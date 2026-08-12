@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
@@ -7,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+use x509_parser::{parse_x509_certificate, time::ASN1Time};
+
+use rustls::pki_types::{CertificateDer, UnixTime};
+use rustls::server::WebPkiClientVerifier;
 
 use crate::identity::{NodeIdentity, key_id};
 use crate::protocol::{
@@ -43,6 +48,9 @@ pub struct PairingRequest {
     pub peer_id: String,
     pub device_label: String,
     pub key_material: PairingKeyMaterialV1,
+    /// Leaf first, followed by any intermediates. This is validated at request
+    /// and approval time but only its exact leaf digest is retained as trust.
+    pub client_certificate_chain_der: Vec<Vec<u8>>,
     pub ttl_millis: u64,
 }
 
@@ -160,6 +168,7 @@ pub struct PairingApprovalResult {
 pub struct CredentialRotationRequest {
     pub peer_id: String,
     pub key_material: PairingKeyMaterialV1,
+    pub client_certificate_chain_der: Vec<Vec<u8>>,
     pub ttl_millis: u64,
 }
 
@@ -257,6 +266,7 @@ impl PairingManager {
             request.peer_id.clone(),
             request.device_label.clone(),
             material,
+            request.client_certificate_chain_der.clone(),
             &challenge_secret,
             self.identity.key_id().0,
             request.key_material.client_certificate_sha256.0,
@@ -322,6 +332,18 @@ impl PairingManager {
             return Err(PairingError::InvalidProof);
         }
         let material = decode_key_material(&pending.peer_public_key)?;
+        if let Err(error) = validate_client_certificate_binding(
+            &material,
+            &pending.client_certificate_chain_der,
+            proof.approved_at,
+        ) {
+            self.store.audit_pairing_rejection(
+                proof.pairing_id.0,
+                millis_to_i64(proof.approved_at)?,
+                b"client-certificate-invalid",
+            )?;
+            return Err(error);
+        }
         let proof_payload = pairing_proof_bytes(&pending, &proof.challenge_secret, &material)?;
         if verify(
             material.owner_public_key,
@@ -393,6 +415,11 @@ impl PairingManager {
             ));
         }
         validate_key_material(&request.key_material)?;
+        validate_client_certificate_binding(
+            &request.key_material,
+            &request.client_certificate_chain_der,
+            now,
+        )?;
         if request
             .key_material
             .allowed_capabilities
@@ -445,6 +472,7 @@ impl PairingManager {
             sha256(&trusted.public_key),
             trusted.trust_epoch,
             next_encoded,
+            request.client_certificate_chain_der.clone(),
             self.identity.key_id().0,
             &challenge_secret,
             millis_to_i64(now)?,
@@ -534,6 +562,18 @@ impl PairingManager {
         }
         let current_material = decode_key_material(&current.public_key)?;
         let next_material = decode_key_material(&pending.new_public_key)?;
+        if let Err(error) = validate_client_certificate_binding(
+            &next_material,
+            &pending.client_certificate_chain_der,
+            proof.approved_at,
+        ) {
+            self.store.audit_credential_rotation_rejection(
+                proof.rotation_id,
+                millis_to_i64(proof.approved_at)?,
+                b"client-certificate-invalid",
+            )?;
+            return Err(error);
+        }
         let payload = credential_rotation_proof_bytes(
             &pending,
             &proof.challenge_secret,
@@ -713,6 +753,11 @@ fn validate_pairing_request(
         ));
     }
     validate_key_material(&request.key_material)?;
+    validate_client_certificate_binding(
+        &request.key_material,
+        &request.client_certificate_chain_der,
+        now,
+    )?;
     if request
         .key_material
         .allowed_capabilities
@@ -757,6 +802,7 @@ fn validate_key_material(material: &PairingKeyMaterialV1) -> Result<(), PairingE
             "client CA is missing or too large".to_owned(),
         ));
     }
+    validate_ca_certificate(&material.client_ca_der)?;
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(
@@ -774,6 +820,159 @@ fn validate_key_material(material: &PairingKeyMaterialV1) -> Result<(), PairingE
             "pairing capability scope contains duplicates".to_owned(),
         ));
     }
+    Ok(())
+}
+
+fn validate_ca_certificate(certificate_der: &[u8]) -> Result<(), PairingError> {
+    let (remainder, certificate) = parse_x509_certificate(certificate_der)
+        .map_err(|_| PairingError::Invalid("client CA certificate is invalid".to_owned()))?;
+    if !remainder.is_empty() {
+        return Err(PairingError::Invalid(
+            "client CA certificate has trailing data".to_owned(),
+        ));
+    }
+    let constraints = certificate
+        .basic_constraints()
+        .map_err(|_| PairingError::Invalid("client CA constraints are invalid".to_owned()))?
+        .ok_or_else(|| PairingError::Invalid("client CA lacks basic constraints".to_owned()))?;
+    if !constraints.value.ca {
+        return Err(PairingError::Invalid(
+            "client CA basic constraints do not permit certificate signing".to_owned(),
+        ));
+    }
+    if certificate
+        .key_usage()
+        .map_err(|_| PairingError::Invalid("client CA key usage is invalid".to_owned()))?
+        .is_some_and(|usage| !usage.value.key_cert_sign())
+    {
+        return Err(PairingError::Invalid(
+            "client CA key usage does not permit certificate signing".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_client_certificate_binding(
+    material: &PairingKeyMaterialV1,
+    chain_der: &[Vec<u8>],
+    now: UnixMillis,
+) -> Result<(), PairingError> {
+    let now_seconds = i64::try_from(now.0 / 1_000).map_err(|_| PairingError::TimeRange)?;
+    let validation_time = ASN1Time::from_timestamp(now_seconds)
+        .map_err(|_| PairingError::Invalid("certificate validation time is invalid".to_owned()))?;
+    let (_, ca) = parse_x509_certificate(&material.client_ca_der)
+        .map_err(|_| PairingError::Invalid("client CA certificate is invalid".to_owned()))?;
+    if !ca.validity().is_valid_at(validation_time) {
+        return Err(PairingError::Invalid(
+            "client CA certificate is not currently valid".to_owned(),
+        ));
+    }
+    if chain_der.is_empty() || chain_der.len() > 8 {
+        return Err(PairingError::Invalid(
+            "client certificate chain count is out of range".to_owned(),
+        ));
+    }
+    let total = chain_der.iter().try_fold(0_usize, |total, certificate| {
+        if certificate.is_empty() {
+            return Err(PairingError::Invalid(
+                "client certificate chain contains an empty certificate".to_owned(),
+            ));
+        }
+        total.checked_add(certificate.len()).ok_or_else(|| {
+            PairingError::Invalid("client certificate chain is too large".to_owned())
+        })
+    })?;
+    if total > 262_144 {
+        return Err(PairingError::Invalid(
+            "client certificate chain is too large".to_owned(),
+        ));
+    }
+    let leaf_der = &chain_der[0];
+    if Sha256::digest(leaf_der).as_slice() != material.client_certificate_sha256.0 {
+        return Err(PairingError::Invalid(
+            "client certificate does not match its signed fingerprint".to_owned(),
+        ));
+    }
+    if leaf_der == &material.client_ca_der {
+        return Err(PairingError::Invalid(
+            "client certificate must not be the CA certificate".to_owned(),
+        ));
+    }
+    let (remainder, leaf) = parse_x509_certificate(leaf_der)
+        .map_err(|_| PairingError::Invalid("client certificate is invalid".to_owned()))?;
+    if !remainder.is_empty() {
+        return Err(PairingError::Invalid(
+            "client certificate has trailing data".to_owned(),
+        ));
+    }
+    if leaf
+        .basic_constraints()
+        .map_err(|_| {
+            PairingError::Invalid("client certificate constraints are invalid".to_owned())
+        })?
+        .is_some_and(|constraints| constraints.value.ca)
+    {
+        return Err(PairingError::Invalid(
+            "client certificate must be an end-entity certificate".to_owned(),
+        ));
+    }
+    let extended_usage = leaf
+        .extended_key_usage()
+        .map_err(|_| PairingError::Invalid("client certificate purpose is invalid".to_owned()))?
+        .ok_or_else(|| {
+            PairingError::Invalid("client certificate lacks clientAuth purpose".to_owned())
+        })?;
+    if !extended_usage.value.client_auth {
+        return Err(PairingError::Invalid(
+            "client certificate is not valid for clientAuth".to_owned(),
+        ));
+    }
+    let key_usage = leaf
+        .key_usage()
+        .map_err(|_| PairingError::Invalid("client certificate key usage is invalid".to_owned()))?
+        .ok_or_else(|| {
+            PairingError::Invalid("client certificate lacks TLS signing key usage".to_owned())
+        })?;
+    if !key_usage.value.digital_signature() {
+        return Err(PairingError::Invalid(
+            "client certificate cannot create TLS signatures".to_owned(),
+        ));
+    }
+    for intermediate in &chain_der[1..] {
+        let (remainder, _) = parse_x509_certificate(intermediate)
+            .map_err(|_| PairingError::Invalid("client intermediate is invalid".to_owned()))?;
+        if !remainder.is_empty() {
+            return Err(PairingError::Invalid(
+                "client intermediate has trailing data".to_owned(),
+            ));
+        }
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(material.client_ca_der.clone()))
+        .map_err(|_| PairingError::Invalid("client CA certificate is invalid".to_owned()))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+        .build()
+        .map_err(|_| PairingError::Invalid("client certificate verifier is invalid".to_owned()))?;
+    let leaf = CertificateDer::from_slice(leaf_der);
+    let intermediates = chain_der[1..]
+        .iter()
+        .map(|certificate| CertificateDer::from_slice(certificate))
+        .collect::<Vec<_>>();
+    verifier
+        .verify_client_cert(
+            &leaf,
+            &intermediates,
+            UnixTime::since_unix_epoch(Duration::from_secs(
+                u64::try_from(now_seconds).map_err(|_| PairingError::TimeRange)?,
+            )),
+        )
+        .map_err(|_| {
+            PairingError::Invalid(
+                "client certificate chain, validity, or clientAuth purpose is invalid".to_owned(),
+            )
+        })?;
     Ok(())
 }
 

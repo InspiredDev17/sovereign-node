@@ -104,6 +104,7 @@ struct PairRequestArgs {
     broker_public_key_hex: String,
     #[arg(long)]
     client_ca_pem: PathBuf,
+    /// PEM chain with the client leaf first, followed by intermediates.
     #[arg(long)]
     client_certificate_pem: PathBuf,
     #[arg(long = "capability", required = true)]
@@ -157,6 +158,7 @@ struct PairRotationRequestArgs {
     broker_public_key_hex: String,
     #[arg(long)]
     client_ca_pem: PathBuf,
+    /// PEM chain with the replacement client leaf first, followed by intermediates.
     #[arg(long)]
     client_certificate_pem: PathBuf,
     #[arg(long = "capability", required = true)]
@@ -322,8 +324,8 @@ fn pair_request(args: PairRequestArgs) -> Result<()> {
     let owner_public_key = public_key(&args.owner_public_key_hex)?;
     let broker_public_key = public_key(&args.broker_public_key_hex)?;
     let client_ca_der = first_pem_certificate(&args.client_ca_pem)?;
-    let client_leaf_der = first_pem_certificate(&args.client_certificate_pem)?;
-    let certificate_digest = Sha256Digest(Sha256::digest(client_leaf_der).into());
+    let client_certificate_chain_der = pem_certificate_chain(&args.client_certificate_pem)?;
+    let certificate_digest = Sha256Digest(Sha256::digest(&client_certificate_chain_der[0]).into());
     let capabilities = args
         .capabilities
         .iter()
@@ -359,6 +361,7 @@ fn pair_request(args: PairRequestArgs) -> Result<()> {
                 allowed_capabilities: capabilities,
                 trust_expires_at,
             },
+            client_certificate_chain_der,
             ttl_millis: args
                 .ttl_seconds
                 .checked_mul(1_000)
@@ -403,14 +406,16 @@ fn pair_rotation_request(args: PairRotationRequestArgs) -> Result<()> {
                 .ok_or_else(|| anyhow!("trust TTL is too large"))
         })
         .transpose()?;
-    let client_leaf_der = first_pem_certificate(&args.client_certificate_pem)?;
+    let client_certificate_chain_der = pem_certificate_chain(&args.client_certificate_pem)?;
     let key_material = PairingKeyMaterialV1 {
         schema_version: 1,
         owner_id: args.owner_id,
         owner_public_key: public_key(&args.owner_public_key_hex)?,
         broker_public_key: public_key(&args.broker_public_key_hex)?,
         client_ca_der: first_pem_certificate(&args.client_ca_pem)?,
-        client_certificate_sha256: Sha256Digest(Sha256::digest(client_leaf_der).into()),
+        client_certificate_sha256: Sha256Digest(
+            Sha256::digest(&client_certificate_chain_der[0]).into(),
+        ),
         allowed_capabilities: args
             .capabilities
             .iter()
@@ -427,6 +432,7 @@ fn pair_rotation_request(args: PairRotationRequestArgs) -> Result<()> {
         CredentialRotationRequest {
             peer_id: args.peer_id,
             key_material,
+            client_certificate_chain_der,
             ttl_millis: args
                 .ttl_seconds
                 .checked_mul(1_000)
@@ -636,6 +642,21 @@ fn first_pem_certificate(path: &Path) -> Result<Vec<u8>> {
     let certificate = CertificateDer::from_pem_file(path)
         .with_context(|| format!("{} contains no valid certificate", path.display()))?;
     Ok(certificate.as_ref().to_vec())
+}
+
+fn pem_certificate_chain(path: &Path) -> Result<Vec<Vec<u8>>> {
+    let certificates = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("{} could not be opened", path.display()))?
+        .map(|certificate| {
+            certificate
+                .map(|certificate| certificate.as_ref().to_vec())
+                .with_context(|| format!("{} contains an invalid certificate", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if certificates.is_empty() {
+        bail!("{} contains no valid certificate", path.display());
+    }
+    Ok(certificates)
 }
 
 fn parse_capability(value: &str) -> Result<Capability> {

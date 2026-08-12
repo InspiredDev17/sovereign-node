@@ -93,6 +93,14 @@ issuance may use an owner-controlled private CA or pinned self-managed
 certificates; the application is not coupled to a commercial certificate
 service.
 
+Owner-local pairing treats the configured client certificate PEM as a bounded
+leaf-first chain. Before any trust commit it validates CA constraints, every
+DER object, leaf clientAuth and signing usage, the chain to the submitted CA,
+current certificate validity, and the exact leaf fingerprint. The same checks
+run again at local approval so a certificate that expires during a ceremony is
+not enrolled. Only the CA and exact leaf digest become active transport trust;
+intermediates remain short-lived ceremony evidence.
+
 Revoking a paired credential invalidates its trust record and closes existing
 sessions. Rotation increments the trust generation and closes sessions bound to
 the prior generation. TLS session resumption must not outlive the credential or

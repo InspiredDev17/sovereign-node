@@ -20,9 +20,20 @@ challenge, and expiration. Owner and broker Ed25519 proofs cover that exact
 transcript, including the node device-key digest. The node also signs the
 displayed proof payload, and successful approval returns a node-signed receipt
 binding the pairing, capability digest, transport pin, trust epoch, and expiry.
-`--confirm` is required locally before the SQLite trust transaction commits. Revocation immediately
-blocks every subsequent action through the per-action trust lookup and persists
-across restart.
+`--confirm` is required locally before the SQLite trust transaction commits.
+Revocation immediately blocks every subsequent action through the per-action
+trust lookup and persists across restart.
+
+The client certificate PEM contains the leaf first and may contain up to seven
+intermediates. At both ceremony creation and local approval, v0.1 parses every
+DER certificate with bounded size and count, requires the submitted trust
+anchor to carry CA basic constraints and certificate-signing key usage when
+that usage is present, requires an end-entity leaf with explicit clientAuth
+extended usage and TLS-signing usage, validates the chain and current validity
+with rustls WebPKI, and recomputes the exact signed leaf SHA-256 fingerprint. A
+malformed, expired, not-yet-valid, wrong-purpose, wrong-issuer, or
+fingerprint-mismatched certificate cannot enter trust. No custom X.509 or
+signature validation is used.
 
 Peer credential rotation is also implemented as a two-step owner-local
 ceremony. `pair rotation-request` creates a short-lived node-signed transcript;
@@ -43,6 +54,11 @@ All v0.1 pairing and revocation state changes share a non-blocking owner-only
 admin mutation lease, preventing concurrent approval/revocation/identity-rotation
 races. The daemon uses a separate lease, so local revocation remains available
 while it is running.
+
+An upgrade from a pre-certificate-validation state schema invalidates pending
+pairing and rotation invitations because those records do not contain the
+original leaf/intermediate chain needed for approval-time revalidation. Active
+trust, revocation, replay, and audit history are preserved.
 
 ## Identities displayed for approval
 

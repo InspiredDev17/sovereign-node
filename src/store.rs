@@ -31,7 +31,7 @@ use crate::lifecycle::{LeaseKind, LifecycleLease};
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const PEER_RATE_WINDOW_MS: i64 = 60_000;
 const ZERO_HASH: Sha256Digest = [0_u8; 32];
 const MAX_ID_BYTES: usize = 255;
@@ -39,6 +39,8 @@ const MAX_LABEL_BYTES: usize = 255;
 const MAX_CAPABILITY_BYTES: usize = 128;
 // The opaque pairing material may include two public keys and a DER client CA certificate.
 const MAX_PUBLIC_KEY_BYTES: usize = 131_072;
+const MAX_CERTIFICATE_CHAIN_COUNT: usize = 8;
+const MAX_CERTIFICATE_CHAIN_BYTES: usize = 262_144;
 const MIN_PAIRING_CHALLENGE_BYTES: usize = 16;
 
 /// Capacity limits intentionally fail closed instead of allowing unbounded
@@ -155,6 +157,7 @@ pub struct PendingPairingChallenge {
     pub peer_id: String,
     pub device_label: String,
     pub peer_public_key: Vec<u8>,
+    pub client_certificate_chain_der: Vec<Vec<u8>>,
     /// Device-key digest displayed locally and bound into the signed transcript.
     pub node_identity_digest: Sha256Digest,
     pub challenge_digest: Sha256Digest,
@@ -174,6 +177,7 @@ impl PendingPairingChallenge {
         peer_id: String,
         device_label: String,
         peer_public_key: Vec<u8>,
+        client_certificate_chain_der: Vec<Vec<u8>>,
         challenge_secret: &[u8],
         node_identity_digest: Sha256Digest,
         transport_binding_digest: Sha256Digest,
@@ -191,6 +195,7 @@ impl PendingPairingChallenge {
             peer_id,
             device_label,
             peer_public_key,
+            client_certificate_chain_der,
             challenge_digest: sha256(challenge_secret),
             node_identity_digest,
             transport_binding_digest,
@@ -213,6 +218,7 @@ impl PendingPairingChallenge {
         if self.peer_public_key.is_empty() || self.peer_public_key.len() > MAX_PUBLIC_KEY_BYTES {
             return Err(StoreError::InvalidInput("invalid peer public key length"));
         }
+        validate_certificate_chain(&self.client_certificate_chain_der)?;
         if self.expires_at_unix_ms <= self.requested_at_unix_ms {
             return Err(StoreError::InvalidInput(
                 "pairing expiry must follow creation time",
@@ -257,6 +263,7 @@ pub struct PendingCredentialRotation {
     pub current_public_key_digest: Sha256Digest,
     pub current_trust_epoch: u64,
     pub new_public_key: Vec<u8>,
+    pub client_certificate_chain_der: Vec<Vec<u8>>,
     pub new_identity_digest: Sha256Digest,
     pub node_identity_digest: Sha256Digest,
     pub challenge_digest: Sha256Digest,
@@ -274,6 +281,7 @@ impl PendingCredentialRotation {
         current_public_key_digest: Sha256Digest,
         current_trust_epoch: u64,
         new_public_key: Vec<u8>,
+        client_certificate_chain_der: Vec<Vec<u8>>,
         node_identity_digest: Sha256Digest,
         challenge_secret: &[u8],
         requested_at_unix_ms: i64,
@@ -293,6 +301,7 @@ impl PendingCredentialRotation {
             current_trust_epoch,
             new_identity_digest: peer_identity_digest(&peer_id, &new_public_key),
             new_public_key,
+            client_certificate_chain_der,
             node_identity_digest,
             challenge_digest: sha256(challenge_secret),
             requested_at_unix_ms,
@@ -318,6 +327,7 @@ impl PendingCredentialRotation {
         if self.new_public_key.is_empty() || self.new_public_key.len() > MAX_PUBLIC_KEY_BYTES {
             return Err(StoreError::InvalidInput("invalid peer public key length"));
         }
+        validate_certificate_chain(&self.client_certificate_chain_der)?;
         if !constant_time_digest_eq(
             &self.new_identity_digest,
             &peer_identity_digest(&self.peer_id, &self.new_public_key),
@@ -2140,8 +2150,16 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
              VALUES (1, 0, zeroblob(32))
              ON CONFLICT(singleton) DO NOTHING;
-         PRAGMA user_version = 4;",
+         PRAGMA user_version = 5;",
     )?;
+    // Pending ceremonies are authorization-free, short-lived bootstrap state.
+    // Schema 5 adds the certificate chain needed to revalidate X.509 at local
+    // approval, so pre-v5 invitations are invalidated rather than guessed or
+    // silently upgraded without their original leaf/intermediates.
+    if current < 5 {
+        transaction.execute("DELETE FROM pending_pairings", [])?;
+        transaction.execute("DELETE FROM pending_credential_rotations", [])?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -2318,6 +2336,33 @@ fn enforce_count_limit(
     let count = u64::try_from(count).map_err(|_| StoreError::CorruptData("negative row count"))?;
     if count >= maximum {
         return Err(StoreError::ResourceLimit(label));
+    }
+    Ok(())
+}
+
+fn validate_certificate_chain(chain: &[Vec<u8>]) -> Result<(), StoreError> {
+    if chain.is_empty() || chain.len() > MAX_CERTIFICATE_CHAIN_COUNT {
+        return Err(StoreError::InvalidInput(
+            "client certificate chain count is out of range",
+        ));
+    }
+    let mut total = 0_usize;
+    for certificate in chain {
+        if certificate.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "client certificate chain contains an empty certificate",
+            ));
+        }
+        total = total
+            .checked_add(certificate.len())
+            .ok_or(StoreError::InvalidInput(
+                "client certificate chain is too large",
+            ))?;
+        if total > MAX_CERTIFICATE_CHAIN_BYTES {
+            return Err(StoreError::InvalidInput(
+                "client certificate chain is too large",
+            ));
+        }
     }
     Ok(())
 }
@@ -2578,6 +2623,7 @@ mod tests {
             peer_id.to_owned(),
             format!("Owner Action Broker {peer_id}"),
             vec![7_u8; 32],
+            vec![vec![8_u8; 32]],
             challenge_secret,
             sha256(b"node-identity"),
             sha256(b"channel-binding"),
@@ -2812,22 +2858,27 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_store_migrates_to_credential_rotation_challenges() -> Result<(), StoreError> {
+    fn schema_four_migration_invalidates_pending_but_preserves_trust_and_audit()
+    -> Result<(), StoreError> {
         let (_directory, path, store) = test_store()?;
-        pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let (_, trusted) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let pending = pending_for("pending-broker", b"fedcba9876543210fedcba9876543210")?;
+        let pending_id = pending.pairing_id;
+        store.put_pending_pairing(&pending)?;
         let before = store.verify_audit_chain()?;
         drop(store);
 
         let legacy = Connection::open(&path)?;
-        legacy
-            .execute_batch("DROP TABLE pending_credential_rotations; PRAGMA user_version = 3;")?;
+        legacy.execute_batch("PRAGMA user_version = 4;")?;
         drop(legacy);
 
         let migrated = StateStore::open(path)?;
-        assert!(
+        assert!(migrated.pending_pairing(pending_id)?.is_none());
+        assert_eq!(
             migrated
-                .pending_credential_rotation(Uuid::new_v4())?
-                .is_none()
+                .currently_trusted_peer(&trusted.peer_id, NOW + 10)?
+                .map(|peer| peer.pairing_id),
+            Some(trusted.pairing_id)
         );
         assert_eq!(migrated.verify_audit_chain()?, before);
         Ok(())

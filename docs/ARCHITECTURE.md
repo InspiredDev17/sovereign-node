@@ -65,6 +65,9 @@ rotation without preventing live revocation checks in the daemon. Pairing and
 peer rotation use node-signed transcripts and return node-signed receipts;
 credential rotation additionally requires proofs from both current roles and
 both replacement roles before its atomic trust-epoch change.
+Both ceremonies validate the bounded client-certificate chain, CA constraints,
+clientAuth purpose, validity window, and exact leaf digest at creation and
+again at approval using established rustls WebPKI verification.
 
 ### Identity and trust store
 

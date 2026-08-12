@@ -4,8 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey};
-use rustls_pki_types::CertificateDer;
-use rustls_pki_types::pem::PemObject;
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 use sovereign_node::authz::{
     AuthorizationEngine, AuthorizationError, AuthorizationOutcome, Clock, TransportPeer,
 };
@@ -31,7 +33,6 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const NOW: u64 = 2_000_000_000_000;
 const PEER_ID: &str = "owner-action-broker";
 const OWNER_ID: &str = "owner-1";
-const CERTIFICATE_DIGEST: Sha256Digest = Sha256Digest([0x44; 32]);
 const TEST_POLICY_DIGEST: Sha256Digest = Sha256Digest([0x55; 32]);
 
 #[derive(Debug)]
@@ -66,6 +67,7 @@ struct Harness {
     owner_key: SigningKey,
     broker_key: SigningKey,
     material: PairingKeyMaterialV1,
+    client_certificate_chain_der: Vec<Vec<u8>>,
     pairing_id: PairingId,
     clock: Arc<ManualClock>,
 }
@@ -90,7 +92,8 @@ impl Harness {
         store.activate_policy(1, TEST_POLICY_DIGEST.0, NOW as i64)?;
         let owner_key = SigningKey::from_bytes(&[0x11; 32]);
         let broker_key = SigningKey::from_bytes(&[0x22; 32]);
-        let material = key_material(&owner_key, &broker_key);
+        let (material, client_certificate_chain_der) =
+            key_material(&owner_key, &broker_key, ExtendedKeyUsagePurpose::ClientAuth)?;
         let manager = PairingManager::new(
             Arc::clone(&identity),
             Arc::clone(&store),
@@ -100,7 +103,10 @@ impl Harness {
                 Capability::FileRead,
             ],
         );
-        let display = manager.begin(pairing_request(material.clone()), UnixMillis(NOW))?;
+        let display = manager.begin(
+            pairing_request(material.clone(), client_certificate_chain_der.clone()),
+            UnixMillis(NOW),
+        )?;
         let proof = proof_for(&display, &owner_key, &broker_key, UnixMillis(NOW + 1))?;
         let approved = manager.approve_local(&proof, true)?;
         assert_eq!(approved.trusted_peer.trust_epoch, 1);
@@ -114,6 +120,7 @@ impl Harness {
             owner_key,
             broker_key,
             material,
+            client_certificate_chain_der,
             pairing_id: PairingId(approved.trusted_peer.pairing_id),
             clock: Arc::new(ManualClock::new(NOW + 10)),
         })
@@ -145,7 +152,7 @@ impl Harness {
     fn transport_peer(&self) -> TransportPeer {
         TransportPeer {
             peer_id: PEER_ID.to_owned(),
-            certificate_sha256: CERTIFICATE_DIGEST,
+            certificate_sha256: self.material.client_certificate_sha256,
             trust_epoch: 1,
         }
     }
@@ -185,30 +192,128 @@ struct ActionSpec<'a> {
     broker_key: &'a SigningKey,
 }
 
-fn key_material(owner_key: &SigningKey, broker_key: &SigningKey) -> PairingKeyMaterialV1 {
-    let client_ca_der = CertificateDer::from_pem_slice(include_bytes!("fixtures/test-ca.pem"))
-        .map_or_else(|_| Vec::new(), |certificate| certificate.as_ref().to_vec());
-    PairingKeyMaterialV1 {
+fn key_material(
+    owner_key: &SigningKey,
+    broker_key: &SigningKey,
+    extended_usage: ExtendedKeyUsagePurpose,
+) -> TestResult<(PairingKeyMaterialV1, Vec<Vec<u8>>)> {
+    key_material_with_validity(owner_key, broker_key, extended_usage, None)
+}
+
+fn key_material_with_validity(
+    owner_key: &SigningKey,
+    broker_key: &SigningKey,
+    extended_usage: ExtendedKeyUsagePurpose,
+    leaf_validity_unix_seconds: Option<(i64, i64)>,
+) -> TestResult<(PairingKeyMaterialV1, Vec<Vec<u8>>)> {
+    key_material_with_options(
+        owner_key,
+        broker_key,
+        extended_usage,
+        leaf_validity_unix_seconds,
+        true,
+    )
+}
+
+fn key_material_with_options(
+    owner_key: &SigningKey,
+    broker_key: &SigningKey,
+    extended_usage: ExtendedKeyUsagePurpose,
+    leaf_validity_unix_seconds: Option<(i64, i64)>,
+    include_leaf_key_usage: bool,
+) -> TestResult<(PairingKeyMaterialV1, Vec<Vec<u8>>)> {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_key = KeyPair::generate()?;
+    let ca_certificate = ca_params.self_signed(&ca_key)?;
+    let issuer = Issuer::new(ca_params, ca_key);
+    let mut leaf_params = CertificateParams::new(vec!["paired-client".to_owned()])?;
+    if let Some((not_before, not_after)) = leaf_validity_unix_seconds {
+        leaf_params.not_before = time::OffsetDateTime::from_unix_timestamp(not_before)?;
+        leaf_params.not_after = time::OffsetDateTime::from_unix_timestamp(not_after)?;
+    }
+    if include_leaf_key_usage {
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    }
+    leaf_params.extended_key_usages = vec![extended_usage];
+    leaf_params.use_authority_key_identifier_extension = true;
+    let leaf_key = KeyPair::generate()?;
+    let leaf_certificate = leaf_params.signed_by(&leaf_key, &issuer)?;
+    let client_ca_der = ca_certificate.der().as_ref().to_vec();
+    let client_leaf_der = leaf_certificate.der().as_ref().to_vec();
+    let material = PairingKeyMaterialV1 {
         schema_version: 1,
         owner_id: OWNER_ID.to_owned(),
         owner_public_key: PublicKeyBytes(owner_key.verifying_key().to_bytes()),
         broker_public_key: PublicKeyBytes(broker_key.verifying_key().to_bytes()),
         client_ca_der,
-        client_certificate_sha256: CERTIFICATE_DIGEST,
+        client_certificate_sha256: Sha256Digest(sha256(&client_leaf_der)),
         allowed_capabilities: vec![
             Capability::SystemInfo,
             Capability::ResourceStatus,
             Capability::FileRead,
         ],
         trust_expires_at: None,
-    }
+    };
+    Ok((material, vec![client_leaf_der]))
 }
 
-fn pairing_request(material: PairingKeyMaterialV1) -> PairingRequest {
+fn key_material_with_intermediate(
+    owner_key: &SigningKey,
+    broker_key: &SigningKey,
+) -> TestResult<(PairingKeyMaterialV1, Vec<Vec<u8>>)> {
+    let mut root_params = CertificateParams::new(Vec::<String>::new())?;
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root_key = KeyPair::generate()?;
+    let root_certificate = root_params.self_signed(&root_key)?;
+    let root_issuer = Issuer::new(root_params, root_key);
+
+    let mut intermediate_params = CertificateParams::new(Vec::<String>::new())?;
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    intermediate_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    intermediate_params.use_authority_key_identifier_extension = true;
+    let intermediate_key = KeyPair::generate()?;
+    let intermediate_certificate =
+        intermediate_params.signed_by(&intermediate_key, &root_issuer)?;
+    let intermediate_issuer = Issuer::new(intermediate_params, intermediate_key);
+
+    let mut leaf_params = CertificateParams::new(vec!["intermediate-client".to_owned()])?;
+    leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    leaf_params.use_authority_key_identifier_extension = true;
+    let leaf_key = KeyPair::generate()?;
+    let leaf_certificate = leaf_params.signed_by(&leaf_key, &intermediate_issuer)?;
+    let leaf_der = leaf_certificate.der().as_ref().to_vec();
+    Ok((
+        PairingKeyMaterialV1 {
+            schema_version: 1,
+            owner_id: OWNER_ID.to_owned(),
+            owner_public_key: PublicKeyBytes(owner_key.verifying_key().to_bytes()),
+            broker_public_key: PublicKeyBytes(broker_key.verifying_key().to_bytes()),
+            client_ca_der: root_certificate.der().as_ref().to_vec(),
+            client_certificate_sha256: Sha256Digest(sha256(&leaf_der)),
+            allowed_capabilities: vec![Capability::SystemInfo],
+            trust_expires_at: None,
+        },
+        vec![leaf_der, intermediate_certificate.der().as_ref().to_vec()],
+    ))
+}
+
+fn pairing_request(
+    material: PairingKeyMaterialV1,
+    client_certificate_chain_der: Vec<Vec<u8>>,
+) -> PairingRequest {
     PairingRequest {
         peer_id: PEER_ID.to_owned(),
         device_label: "Owner Action Broker".to_owned(),
         key_material: material,
+        client_certificate_chain_der,
         ttl_millis: 60_000,
     }
 }
@@ -339,9 +444,13 @@ fn pairing_requires_local_approval_and_both_key_proofs() -> TestResult {
         Arc::clone(&store),
         [Capability::SystemInfo],
     );
-    let mut material = key_material(&owner_key, &broker_key);
+    let (mut material, client_certificate_chain_der) =
+        key_material(&owner_key, &broker_key, ExtendedKeyUsagePurpose::ClientAuth)?;
     material.allowed_capabilities = vec![Capability::SystemInfo];
-    let display = manager.begin(pairing_request(material), UnixMillis(NOW))?;
+    let display = manager.begin(
+        pairing_request(material, client_certificate_chain_der),
+        UnixMillis(NOW),
+    )?;
     assert_eq!(display.node_id, identity.node_id().to_string());
     assert_eq!(display.node_identity_fingerprint, identity.fingerprint());
     assert_eq!(display.peer_id, PEER_ID);
@@ -399,6 +508,138 @@ fn pairing_requires_local_approval_and_both_key_proofs() -> TestResult {
         store
             .currently_trusted_peer(PEER_ID, NOW as i64 + 2)?
             .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn pairing_rejects_invalid_client_certificate_bindings() -> TestResult {
+    let directory = TempDir::new()?;
+    let (identity, _) = NodeIdentity::load_or_initialize(
+        &directory.path().join("identity"),
+        "certificate-validation-node",
+        UnixMillis(NOW),
+    )?;
+    let store = Arc::new(StateStore::open(directory.path().join("state.sqlite3"))?);
+    let manager = PairingManager::new(
+        Arc::new(identity),
+        Arc::clone(&store),
+        [Capability::SystemInfo],
+    );
+    let owner = SigningKey::from_bytes(&[0x41; 32]);
+    let broker = SigningKey::from_bytes(&[0x42; 32]);
+    let (mut valid_material, valid_chain) =
+        key_material(&owner, &broker, ExtendedKeyUsagePurpose::ClientAuth)?;
+    valid_material.allowed_capabilities = vec![Capability::SystemInfo];
+
+    let mut digest_mismatch = valid_chain.clone();
+    digest_mismatch[0].push(0);
+    assert!(matches!(
+        manager.begin(
+            pairing_request(valid_material.clone(), digest_mismatch),
+            UnixMillis(NOW)
+        ),
+        Err(PairingError::Invalid(_))
+    ));
+
+    let (mut other_material, other_chain) =
+        key_material(&owner, &broker, ExtendedKeyUsagePurpose::ClientAuth)?;
+    other_material.allowed_capabilities = vec![Capability::SystemInfo];
+    let mut wrong_issuer = valid_material.clone();
+    wrong_issuer.client_certificate_sha256 = other_material.client_certificate_sha256;
+    assert!(matches!(
+        manager.begin(pairing_request(wrong_issuer, other_chain), UnixMillis(NOW)),
+        Err(PairingError::Invalid(_))
+    ));
+
+    let (mut server_only, server_chain) =
+        key_material(&owner, &broker, ExtendedKeyUsagePurpose::ServerAuth)?;
+    server_only.allowed_capabilities = vec![Capability::SystemInfo];
+    assert!(matches!(
+        manager.begin(pairing_request(server_only, server_chain), UnixMillis(NOW)),
+        Err(PairingError::Invalid(_))
+    ));
+
+    let (mut no_signing_usage, no_signing_usage_chain) = key_material_with_options(
+        &owner,
+        &broker,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        None,
+        false,
+    )?;
+    no_signing_usage.allowed_capabilities = vec![Capability::SystemInfo];
+    assert!(matches!(
+        manager.begin(
+            pairing_request(no_signing_usage, no_signing_usage_chain),
+            UnixMillis(NOW)
+        ),
+        Err(PairingError::Invalid(_))
+    ));
+
+    let mut non_ca = valid_material.clone();
+    non_ca.client_ca_der = valid_chain[0].clone();
+    assert!(matches!(
+        manager.begin(
+            pairing_request(non_ca, valid_chain.clone()),
+            UnixMillis(NOW)
+        ),
+        Err(PairingError::Invalid(_))
+    ));
+
+    let mut malformed = valid_material.clone();
+    malformed.client_certificate_sha256 = Sha256Digest(sha256(b"not-der"));
+    assert!(matches!(
+        manager.begin(
+            pairing_request(malformed, vec![b"not-der".to_vec()]),
+            UnixMillis(NOW)
+        ),
+        Err(PairingError::Invalid(_))
+    ));
+
+    let now_seconds = i64::try_from(NOW / 1_000)?;
+    let (mut expired, expired_chain) = key_material_with_validity(
+        &owner,
+        &broker,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        Some((now_seconds - 100, now_seconds - 1)),
+    )?;
+    expired.allowed_capabilities = vec![Capability::SystemInfo];
+    assert!(matches!(
+        manager.begin(pairing_request(expired, expired_chain), UnixMillis(NOW)),
+        Err(PairingError::Invalid(_))
+    ));
+
+    let (intermediate_material, intermediate_chain) =
+        key_material_with_intermediate(&owner, &broker)?;
+    assert!(
+        manager
+            .begin(
+                pairing_request(intermediate_material, intermediate_chain),
+                UnixMillis(NOW)
+            )
+            .is_ok()
+    );
+
+    let (mut short_lived, short_lived_chain) = key_material_with_validity(
+        &owner,
+        &broker,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        Some((now_seconds - 100, now_seconds + 10)),
+    )?;
+    short_lived.allowed_capabilities = vec![Capability::SystemInfo];
+    let display = manager.begin(
+        pairing_request(short_lived, short_lived_chain),
+        UnixMillis(NOW),
+    )?;
+    let proof = proof_for(&display, &owner, &broker, UnixMillis(NOW + 11_000))?;
+    assert!(matches!(
+        manager.approve_local(&proof, true),
+        Err(PairingError::Invalid(_))
+    ));
+    assert!(
+        store
+            .currently_trusted_peer(PEER_ID, NOW as i64 + 11_000)?
+            .is_none()
     );
     Ok(())
 }
@@ -764,6 +1005,32 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
     );
     let new_owner_key = SigningKey::from_bytes(&[0x55; 32]);
     let new_broker_key = SigningKey::from_bytes(&[0x66; 32]);
+    let (mut server_only_material, server_only_chain) = key_material(
+        &new_owner_key,
+        &new_broker_key,
+        ExtendedKeyUsagePurpose::ServerAuth,
+    )?;
+    server_only_material.allowed_capabilities = harness.material.allowed_capabilities.clone();
+    assert!(matches!(
+        manager.begin_credential_rotation(
+            CredentialRotationRequest {
+                peer_id: PEER_ID.to_owned(),
+                key_material: server_only_material,
+                client_certificate_chain_der: server_only_chain,
+                ttl_millis: 60_000,
+            },
+            UnixMillis(NOW + 19),
+        ),
+        Err(PairingError::Invalid(_))
+    ));
+    assert_eq!(
+        harness
+            .store
+            .peer_record(PEER_ID)?
+            .ok_or_else(|| test_error("paired peer record was missing"))?
+            .trust_epoch,
+        1
+    );
     let mut next_material = harness.material.clone();
     next_material.owner_public_key = PublicKeyBytes(new_owner_key.verifying_key().to_bytes());
     next_material.broker_public_key = PublicKeyBytes(new_broker_key.verifying_key().to_bytes());
@@ -771,6 +1038,7 @@ fn credential_rotation_increments_epoch_and_invalidates_old_authorizations() -> 
         CredentialRotationRequest {
             peer_id: PEER_ID.to_owned(),
             key_material: next_material,
+            client_certificate_chain_der: harness.client_certificate_chain_der.clone(),
             ttl_millis: 60_000,
         },
         UnixMillis(NOW + 20),
@@ -928,6 +1196,7 @@ fn credential_rotation_expiry_is_consumed_without_changing_trust() -> TestResult
         CredentialRotationRequest {
             peer_id: PEER_ID.to_owned(),
             key_material: next_material,
+            client_certificate_chain_der: harness.client_certificate_chain_der.clone(),
             ttl_millis: 60_000,
         },
         UnixMillis(NOW + 20),
