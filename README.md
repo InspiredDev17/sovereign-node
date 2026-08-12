@@ -35,8 +35,8 @@ trust.
   causes an action to be automatically executed again. A singleton daemon lease safely marks
   prior open reservations `Indeterminate` on restart and keeps them spent.
 - TLS 1.3 mutual authentication is mandatory when the LAN listener is enabled. Public, wildcard,
-  and plaintext listeners are rejected. A durable per-paired-peer request limit is enforced before
-  authorization and replay reservation, and reconnecting does not reset its window.
+  and plaintext listeners are rejected. Atomic durable per-paired-peer and node-global request
+  limits are enforced before authorization and replay reservation; reconnecting resets neither.
 - Only capabilities in both the local manifest and the paired peer's scope can run. The default
   manifest is read-only: `SystemInfo` and `ResourceStatus`.
 - File and approved-action wire types are reserved for later hardening, but v0.1 configuration

@@ -91,7 +91,7 @@ operation fails closed.
 | General command injection | No shell exists; approved actions use a fixed executable and typed arguments without shell parsing |
 | Arbitrary code upload | No upload-and-execute capability exists; file writes cannot create executable authority |
 | Credential theft through status or logs | Reports and audit are schema-limited and redacted; security stores are excluded from file capabilities |
-| Resource-exhaustion attack | Bounded frames, durable per-peer admission, queues, concurrency, time, output, and backpressure cause rejection without security bypass; a separate global request rate remains future work |
+| Resource-exhaustion attack | Bounded frames, atomic durable per-peer and global admission, queues, concurrency, time, output, and backpressure cause rejection without security bypass |
 | Disconnect ambiguity | Durable execution state returns recorded or Indeterminate outcome and never silently retries |
 | Version downgrade | Locally allowed versions and versions bound into signatures reject unsupported or downgraded semantics |
 | Revoked credential reuse | Trust generation increments, sessions close, and all old-generation authorizations are rejected |

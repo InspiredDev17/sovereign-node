@@ -20,7 +20,7 @@ use crate::pairing::decode_key_material;
 use crate::protocol::{MAX_WIRE_MESSAGE_BYTES, Sha256Digest, SignedActionV1};
 use crate::runtime::{NodeRuntime, RuntimeError};
 use crate::security::SecureFileError;
-use crate::store::{PeerRequestAdmission, StateStore, StoreError};
+use crate::store::{RemoteRequestAdmission, RequestLimitScope, StateStore, StoreError};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,8 +45,11 @@ pub enum TransportError {
     Frame,
     #[error("authenticated TLS client is not paired")]
     UnpairedClient,
-    #[error("authenticated peer exceeded its request limit; retry after {retry_after_ms} ms")]
-    RateLimited { retry_after_ms: u64 },
+    #[error("authenticated request exceeded the {scope:?} limit; retry after {retry_after_ms} ms")]
+    RateLimited {
+        scope: RequestLimitScope,
+        retry_after_ms: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -81,7 +84,8 @@ pub async fn serve(
         let runtime = runtime.clone();
         let store = store.clone();
         let max_frame = config.policy.max_frame_bytes.min(MAX_WIRE_MESSAGE_BYTES);
-        let maximum_per_minute = config.policy.max_requests_per_peer_per_minute;
+        let peer_maximum_per_minute = config.policy.max_requests_per_peer_per_minute;
+        let global_maximum_per_minute = config.policy.max_requests_global_per_minute;
         tokio::spawn(async move {
             let _permit = permit;
             let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
@@ -97,7 +101,8 @@ pub async fn serve(
                 runtime,
                 store,
                 max_frame,
-                maximum_per_minute,
+                peer_maximum_per_minute,
+                global_maximum_per_minute,
             )
             .await;
         });
@@ -110,7 +115,8 @@ async fn serve_connection(
     runtime: Arc<NodeRuntime>,
     store: Arc<StateStore>,
     max_frame: usize,
-    maximum_per_minute: u32,
+    peer_maximum_per_minute: u32,
+    global_maximum_per_minute: u32,
 ) -> Result<(), TransportError> {
     loop {
         let mut length_bytes = [0_u8; 4];
@@ -143,10 +149,20 @@ async fn serve_connection(
         if !remainder.is_empty() {
             return Err(TransportError::Frame);
         }
-        match store.admit_peer_request(&peer.peer_id, maximum_per_minute)? {
-            PeerRequestAdmission::Admitted { .. } => {}
-            PeerRequestAdmission::Limited { retry_after_ms } => {
-                return Err(TransportError::RateLimited { retry_after_ms });
+        match store.admit_remote_request(
+            &peer.peer_id,
+            peer_maximum_per_minute,
+            global_maximum_per_minute,
+        )? {
+            RemoteRequestAdmission::Admitted { .. } => {}
+            RemoteRequestAdmission::Limited {
+                scope,
+                retry_after_ms,
+            } => {
+                return Err(TransportError::RateLimited {
+                    scope,
+                    retry_after_ms,
+                });
             }
         }
         // Once dispatch begins, it is not cancelled solely because the client disconnects. The

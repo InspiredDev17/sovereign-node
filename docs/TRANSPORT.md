@@ -14,14 +14,14 @@ Knowing the node hostname, DNS record, or IP address grants no trust.
 v0.1 implements an opt-in, exact private/loopback TCP listener with rustls
 TLS 1.3 only, mandatory client certificate validation, exact paired leaf digest,
 bounded length-prefixed postcard frames, connection/action semaphores, and read,
-handshake, and write deadlines. An authenticated peer has a durable one-minute
-fixed-window request limit that is applied after bounded decoding and before
-authorization or replay reservation. Reconnecting or reopening the state store
-does not reset that limit; a backwards clock step fails closed. Every admitted
-frame is authorized again against current durable trust. Local administration
-is CLI-only, not a Unix socket. Application version negotiation, a separate
-global request-rate limit, live TLS trust reload, and forced session closure are
-target work. Revocation blocks new actions on an existing session immediately;
+handshake, and write deadlines. Every authenticated request is atomically
+checked against durable per-peer and node-global one-minute fixed-window limits
+after bounded decoding and before authorization or replay reservation.
+Reconnecting or reopening the state store does not reset either limit; a
+backwards clock step fails closed. Every admitted frame is authorized again
+against current durable trust. Local administration is CLI-only, not a Unix
+socket. Application version negotiation, live TLS trust reload, and forced
+session closure are target work. Revocation blocks new actions immediately;
 accepting newly paired/rotated transport credentials or physically closing
 stale sessions requires a daemon restart in v0.1. The node server certificate
 must be provisioned to clients through a separate owner-controlled channel.
@@ -177,18 +177,20 @@ behavior.
 Before cryptographic and capability work, the endpoint enforces:
 
 - maximum concurrent connections and handshakes;
-- a durable per-peer request rate;
+- atomic durable per-peer and node-global request rates;
 - read, handshake, queue, execution, and idle deadlines;
 - bounded frame and argument sizes;
 - bounded in-memory queues;
 - bounded result size and streaming backpressure; and
 - fair concurrency limits for expensive capabilities.
 
-When the v0.1 per-peer limit is reached, the connection is closed before action
-authorization or replay reservation. Reconnecting remains limited for the
-current window. A structured bounded retry response and a separate global rate
-are future protocol work. The node never evicts live replay records, skips
-authorization, expands file scope, or elevates privilege to recover capacity.
+When either v0.1 request limit is reached, the connection is closed before
+action authorization or replay reservation. Reconnecting remains limited for
+the current window. The two counters advance atomically only when both admit,
+so a global rejection does not consume a peer allowance. A structured bounded
+retry response is future protocol work. The node never evicts live replay
+records, skips authorization, expands file scope, or elevates privilege to
+recover capacity.
 
 ## Offline operation
 
