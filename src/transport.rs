@@ -20,7 +20,7 @@ use crate::pairing::decode_key_material;
 use crate::protocol::{MAX_WIRE_MESSAGE_BYTES, Sha256Digest, SignedActionV1};
 use crate::runtime::{NodeRuntime, RuntimeError};
 use crate::security::SecureFileError;
-use crate::store::{StateStore, StoreError};
+use crate::store::{PeerRequestAdmission, StateStore, StoreError};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,6 +45,8 @@ pub enum TransportError {
     Frame,
     #[error("authenticated TLS client is not paired")]
     UnpairedClient,
+    #[error("authenticated peer exceeded its request limit; retry after {retry_after_ms} ms")]
+    RateLimited { retry_after_ms: u64 },
 }
 
 #[derive(Debug)]
@@ -77,7 +79,9 @@ pub async fn serve(
         let acceptor = acceptor.clone();
         let trust = trust.clone();
         let runtime = runtime.clone();
+        let store = store.clone();
         let max_frame = config.policy.max_frame_bytes.min(MAX_WIRE_MESSAGE_BYTES);
+        let maximum_per_minute = config.policy.max_requests_per_peer_per_minute;
         tokio::spawn(async move {
             let _permit = permit;
             let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
@@ -87,7 +91,15 @@ pub async fn serve(
             let Some(peer) = authenticated_peer(&tls_stream, &trust.peer_by_leaf) else {
                 return;
             };
-            let _ = serve_connection(tls_stream, peer, runtime, max_frame).await;
+            let _ = serve_connection(
+                tls_stream,
+                peer,
+                runtime,
+                store,
+                max_frame,
+                maximum_per_minute,
+            )
+            .await;
         });
     }
 }
@@ -96,7 +108,9 @@ async fn serve_connection(
     mut stream: tokio_rustls::server::TlsStream<TcpStream>,
     peer: TransportPeer,
     runtime: Arc<NodeRuntime>,
+    store: Arc<StateStore>,
     max_frame: usize,
+    maximum_per_minute: u32,
 ) -> Result<(), TransportError> {
     loop {
         let mut length_bytes = [0_u8; 4];
@@ -128,6 +142,12 @@ async fn serve_connection(
             postcard::take_from_bytes(&frame).map_err(|_| TransportError::Frame)?;
         if !remainder.is_empty() {
             return Err(TransportError::Frame);
+        }
+        match store.admit_peer_request(&peer.peer_id, maximum_per_minute)? {
+            PeerRequestAdmission::Admitted { .. } => {}
+            PeerRequestAdmission::Limited { retry_after_ms } => {
+                return Err(TransportError::RateLimited { retry_after_ms });
+            }
         }
         // Once dispatch begins, it is not cancelled solely because the client disconnects. The
         // durable request ID remains the source of truth on reconnect.
@@ -184,7 +204,19 @@ fn build_transport_trust(
             ));
         }
     }
-    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+    let tls = tls13_server_config(certificate_chain, private_key, roots)?;
+    Ok(TransportTrust {
+        tls: Arc::new(tls),
+        peer_by_leaf,
+    })
+}
+
+fn tls13_server_config(
+    certificate_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+    client_roots: RootCertStore,
+) -> Result<ServerConfig, TransportError> {
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
         .build()
         .map_err(|error| TransportError::Configuration(error.to_string()))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -192,10 +224,7 @@ fn build_transport_trust(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(certificate_chain, private_key)?;
-    Ok(TransportTrust {
-        tls: Arc::new(tls),
-        peer_by_leaf,
-    })
+    Ok(tls)
 }
 
 fn authenticated_peer(
@@ -235,10 +264,182 @@ fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>, Tr
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+    use rustls::{ClientConfig, ProtocolVersion};
+    use rustls_pki_types::{PrivatePkcs8KeyDer, ServerName};
+    use tokio_rustls::TlsConnector;
+
     use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    #[derive(Debug)]
+    struct TestIdentity {
+        certificate: CertificateDer<'static>,
+        private_key: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    struct TestPki {
+        ca: CertificateDer<'static>,
+        server: TestIdentity,
+        paired_client: TestIdentity,
+        unpaired_client: TestIdentity,
+    }
+
+    fn test_pki() -> TestResult<TestPki> {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate()?;
+        let ca_certificate = ca_params.self_signed(&ca_key)?;
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        Ok(TestPki {
+            ca: ca_certificate.der().clone(),
+            server: issue_identity("localhost", ExtendedKeyUsagePurpose::ServerAuth, &issuer)?,
+            paired_client: issue_identity(
+                "paired-client",
+                ExtendedKeyUsagePurpose::ClientAuth,
+                &issuer,
+            )?,
+            unpaired_client: issue_identity(
+                "unpaired-client",
+                ExtendedKeyUsagePurpose::ClientAuth,
+                &issuer,
+            )?,
+        })
+    }
+
+    fn issue_identity(
+        name: &str,
+        extended_usage: ExtendedKeyUsagePurpose,
+        issuer: &Issuer<'_, KeyPair>,
+    ) -> TestResult<TestIdentity> {
+        let mut params = CertificateParams::new(vec![name.to_owned()])?;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![extended_usage];
+        params.use_authority_key_identifier_extension = true;
+        let private_key = KeyPair::generate()?;
+        let certificate = params.signed_by(&private_key, issuer)?;
+        Ok(TestIdentity {
+            certificate: certificate.der().clone(),
+            private_key: private_key.serialize_der(),
+        })
+    }
+
+    fn server_config(pki: &TestPki) -> TestResult<Arc<ServerConfig>> {
+        let mut roots = RootCertStore::empty();
+        roots.add(pki.ca.clone())?;
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pki.server.private_key.clone()));
+        Ok(Arc::new(tls13_server_config(
+            vec![pki.server.certificate.clone()],
+            key,
+            roots,
+        )?))
+    }
+
+    fn client_config(
+        pki: &TestPki,
+        identity: Option<&TestIdentity>,
+    ) -> TestResult<Arc<ClientConfig>> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?;
+        let mut roots = RootCertStore::empty();
+        roots.add(pki.ca.clone())?;
+        let config = match identity {
+            Some(identity) => builder
+                .with_root_certificates(roots)
+                .with_client_auth_cert(
+                    vec![identity.certificate.clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.clone())),
+                )?,
+            None => builder.with_root_certificates(roots).with_no_client_auth(),
+        };
+        Ok(Arc::new(config))
+    }
+
+    async fn connect_once(
+        server_config: Arc<ServerConfig>,
+        client_config: Arc<ClientConfig>,
+        peer_by_leaf: HashMap<[u8; 32], String>,
+    ) -> TestResult<(
+        Result<(), std::io::Error>,
+        Result<(Option<ProtocolVersion>, Option<TransportPeer>), String>,
+    )> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let acceptor = TlsAcceptor::from(server_config);
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.map_err(|error| error.to_string())?;
+            let tls = acceptor
+                .accept(tcp)
+                .await
+                .map_err(|error| error.to_string())?;
+            let version = tls.get_ref().1.protocol_version();
+            let peer = authenticated_peer(&tls, &peer_by_leaf);
+            Ok::<_, String>((version, peer))
+        });
+
+        let tcp = TcpStream::connect(address).await?;
+        let connector = TlsConnector::from(client_config);
+        let client = connector
+            .connect(ServerName::try_from("localhost")?, tcp)
+            .await
+            .map(|_| ());
+        let server = server.await?;
+        Ok((client, server))
+    }
 
     #[test]
     fn frame_size_constant_fits_u32_prefix() {
         assert!(MAX_WIRE_MESSAGE_BYTES < u32::MAX as usize);
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_is_tls13_only_and_requires_the_paired_leaf() -> TestResult {
+        let pki = test_pki()?;
+        let paired_digest: [u8; 32] = Sha256::digest(pki.paired_client.certificate.as_ref()).into();
+        let peer_by_leaf = HashMap::from([(paired_digest, "peer-01".to_owned())]);
+
+        let (client, server) = connect_once(
+            server_config(&pki)?,
+            client_config(&pki, Some(&pki.paired_client))?,
+            peer_by_leaf.clone(),
+        )
+        .await?;
+        assert!(client.is_ok());
+        let (version, peer) = server.map_err(std::io::Error::other)?;
+        assert_eq!(version, Some(ProtocolVersion::TLSv1_3));
+        assert_eq!(peer.map(|value| value.peer_id), Some("peer-01".to_owned()));
+
+        let (client, server) = connect_once(
+            server_config(&pki)?,
+            client_config(&pki, Some(&pki.unpaired_client))?,
+            peer_by_leaf.clone(),
+        )
+        .await?;
+        assert!(client.is_ok());
+        let (_, peer) = server.map_err(std::io::Error::other)?;
+        assert!(peer.is_none());
+
+        let (_client, server) = connect_once(
+            server_config(&pki)?,
+            client_config(&pki, None)?,
+            peer_by_leaf,
+        )
+        .await?;
+        assert!(server.is_err());
+        Ok(())
     }
 }

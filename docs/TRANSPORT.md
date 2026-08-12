@@ -14,14 +14,21 @@ Knowing the node hostname, DNS record, or IP address grants no trust.
 v0.1 implements an opt-in, exact private/loopback TCP listener with rustls
 TLS 1.3 only, mandatory client certificate validation, exact paired leaf digest,
 bounded length-prefixed postcard frames, connection/action semaphores, and read,
-handshake, and write deadlines. Every frame is authorized again against current
-durable trust. Local administration is CLI-only, not a Unix socket. Application
-version negotiation, per-peer rate limiting, live TLS trust reload, and forced
-session closure are target work. Revocation blocks new actions on an existing
-session immediately; accepting newly paired/rotated transport credentials or
-physically closing stale sessions requires a daemon restart in v0.1. The node
-server certificate must be provisioned to clients through a separate
-owner-controlled channel.
+handshake, and write deadlines. An authenticated peer has a durable one-minute
+fixed-window request limit that is applied after bounded decoding and before
+authorization or replay reservation. Reconnecting or reopening the state store
+does not reset that limit; a backwards clock step fails closed. Every admitted
+frame is authorized again against current durable trust. Local administration
+is CLI-only, not a Unix socket. Application version negotiation, a separate
+global request-rate limit, live TLS trust reload, and forced session closure are
+target work. Revocation blocks new actions on an existing session immediately;
+accepting newly paired/rotated transport credentials or physically closing
+stale sessions requires a daemon restart in v0.1. The node server certificate
+must be provisioned to clients through a separate owner-controlled channel.
+
+Loopback socket tests generate ephemeral certificates at test time and prove
+TLS 1.3 negotiation, rejection when the client certificate is absent, and exact
+paired-leaf matching even when a different leaf chains to the trusted CA.
 
 Only one v0.1 daemon may hold the node's owner-only singleton lease. At startup,
 after acquiring that lease, it converts prior nonterminal replay reservations to
@@ -170,16 +177,18 @@ behavior.
 Before cryptographic and capability work, the endpoint enforces:
 
 - maximum concurrent connections and handshakes;
-- per-peer and global request rates;
+- a durable per-peer request rate;
 - read, handshake, queue, execution, and idle deadlines;
 - bounded frame and argument sizes;
 - bounded in-memory queues;
 - bounded result size and streaming backpressure; and
 - fair concurrency limits for expensive capabilities.
 
-When a limit is reached, new work is rejected with a bounded retry indication.
-The node never evicts live replay records, skips authorization, expands file
-scope, or elevates privilege to recover capacity.
+When the v0.1 per-peer limit is reached, the connection is closed before action
+authorization or replay reservation. Reconnecting remains limited for the
+current window. A structured bounded retry response and a separate global rate
+are future protocol work. The node never evicts live replay records, skips
+authorization, expands file scope, or elevates privilege to recover capacity.
 
 ## Offline operation
 

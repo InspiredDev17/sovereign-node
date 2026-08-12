@@ -16,6 +16,8 @@ enabled_capabilities = ["SystemInfo", "ResourceStatus"]
 max_frame_bytes = 1048576
 max_concurrent_actions = 4
 queue_capacity = 32
+# Durable per-paired-peer admission limit; reconnecting does not reset the window.
+max_requests_per_peer_per_minute = 120
 max_action_ttl_secs = 300
 require_owner_signature_for_all_actions = true
 max_file_read_bytes = 524288

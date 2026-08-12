@@ -31,7 +31,8 @@ use crate::lifecycle::{LeaseKind, LifecycleLease};
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const PEER_RATE_WINDOW_MS: i64 = 60_000;
 const ZERO_HASH: Sha256Digest = [0_u8; 32];
 const MAX_ID_BYTES: usize = 255;
 const MAX_LABEL_BYTES: usize = 255;
@@ -105,6 +106,14 @@ pub enum StoreError {
     PolicyRollback,
     #[error("policy content changed without increasing its version")]
     PolicyVersionReuse,
+    #[error("system clock moved backwards across a peer admission window")]
+    ClockRollback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerRequestAdmission {
+    Admitted { remaining: u32 },
+    Limited { retry_after_ms: u64 },
 }
 
 /// A pending, locally displayed pairing challenge.  Only a digest of the
@@ -438,6 +447,99 @@ impl StateStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Atomically admit an authenticated peer within a durable one-minute fixed window.
+    /// The row is keyed by the paired peer identity, so reconnecting or reopening the store does
+    /// not reset the allowance. A backwards wall-clock step fails closed.
+    pub fn admit_peer_request(
+        &self,
+        peer_id: &str,
+        maximum_per_minute: u32,
+    ) -> Result<PeerRequestAdmission, StoreError> {
+        self.admit_peer_request_at(peer_id, maximum_per_minute, unix_time_ms()?)
+    }
+
+    pub fn admit_peer_request_at(
+        &self,
+        peer_id: &str,
+        maximum_per_minute: u32,
+        now_unix_ms: i64,
+    ) -> Result<PeerRequestAdmission, StoreError> {
+        validate_identifier(peer_id)?;
+        if maximum_per_minute == 0 {
+            return Err(StoreError::InvalidInput(
+                "peer request limit must be non-zero",
+            ));
+        }
+        if now_unix_ms < 0 {
+            return Err(StoreError::InvalidInput(
+                "peer request time must not predate the Unix epoch",
+            ));
+        }
+
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT window_started_at_unix_ms, request_count
+                 FROM peer_rate_limits WHERE peer_id = ?1",
+                [peer_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let outcome = match existing {
+            None => {
+                transaction.execute(
+                    "INSERT INTO peer_rate_limits
+                         (peer_id, window_started_at_unix_ms, request_count)
+                     VALUES (?1, ?2, 1)",
+                    params![peer_id, now_unix_ms],
+                )?;
+                PeerRequestAdmission::Admitted {
+                    remaining: maximum_per_minute - 1,
+                }
+            }
+            Some((window_started_at, request_count)) => {
+                if now_unix_ms < window_started_at {
+                    return Err(StoreError::ClockRollback);
+                }
+                let elapsed = now_unix_ms - window_started_at;
+                if elapsed >= PEER_RATE_WINDOW_MS {
+                    transaction.execute(
+                        "UPDATE peer_rate_limits
+                         SET window_started_at_unix_ms = ?2, request_count = 1
+                         WHERE peer_id = ?1",
+                        params![peer_id, now_unix_ms],
+                    )?;
+                    PeerRequestAdmission::Admitted {
+                        remaining: maximum_per_minute - 1,
+                    }
+                } else {
+                    let request_count = u32::try_from(request_count)
+                        .map_err(|_| StoreError::CorruptData("invalid peer request count"))?;
+                    if request_count >= maximum_per_minute {
+                        let retry_after_ms = u64::try_from(PEER_RATE_WINDOW_MS - elapsed)
+                            .map_err(|_| StoreError::CorruptData("invalid peer rate window"))?;
+                        PeerRequestAdmission::Limited { retry_after_ms }
+                    } else {
+                        let next_count = request_count
+                            .checked_add(1)
+                            .ok_or(StoreError::CorruptData("peer request count overflow"))?;
+                        transaction.execute(
+                            "UPDATE peer_rate_limits SET request_count = ?2 WHERE peer_id = ?1",
+                            params![peer_id, i64::from(next_count)],
+                        )?;
+                        PeerRequestAdmission::Admitted {
+                            remaining: maximum_per_minute - next_count,
+                        }
+                    }
+                }
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
     }
 
     /// Persist the canonical local policy binding and reject rollback or same-version remapping.
@@ -1590,6 +1692,12 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
              policy_digest BLOB NOT NULL CHECK (length(policy_digest) = 32)
          ) STRICT;
 
+         CREATE TABLE IF NOT EXISTS peer_rate_limits (
+             peer_id TEXT PRIMARY KEY NOT NULL REFERENCES trusted_peers(peer_id),
+             window_started_at_unix_ms INTEGER NOT NULL CHECK (window_started_at_unix_ms >= 0),
+             request_count INTEGER NOT NULL CHECK (request_count > 0)
+         ) STRICT;
+
          CREATE TABLE IF NOT EXISTS audit_events (
              sequence INTEGER PRIMARY KEY NOT NULL,
              event_id TEXT NOT NULL UNIQUE,
@@ -1606,7 +1714,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
              VALUES (1, 0, zeroblob(32))
              ON CONFLICT(singleton) DO NOTHING;
-         PRAGMA user_version = 1;",
+         PRAGMA user_version = 2;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -2086,6 +2194,92 @@ mod tests {
                 .currently_trusted_peer(&peer.peer_id, NOW + 20)?
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_request_limit_survives_reconnect_and_store_reopen() -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let (_, peer) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        assert_eq!(
+            store.admit_peer_request_at(&peer.peer_id, 2, NOW)?,
+            PeerRequestAdmission::Admitted { remaining: 1 }
+        );
+        assert_eq!(
+            store.admit_peer_request_at(&peer.peer_id, 2, NOW + 1)?,
+            PeerRequestAdmission::Admitted { remaining: 0 }
+        );
+        drop(store);
+
+        let reopened = StateStore::open(path)?;
+        assert_eq!(
+            reopened.admit_peer_request_at(&peer.peer_id, 2, NOW + 2)?,
+            PeerRequestAdmission::Limited {
+                retry_after_ms: 59_998
+            }
+        );
+        assert_eq!(
+            reopened.admit_peer_request_at(&peer.peer_id, 2, NOW + 60_000)?,
+            PeerRequestAdmission::Admitted { remaining: 1 }
+        );
+        assert!(matches!(
+            reopened.admit_peer_request_at(&peer.peer_id, 2, NOW + 59_999),
+            Err(StoreError::ClockRollback)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_one_store_migrates_to_durable_peer_admission() -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let (_, peer) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        drop(store);
+
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch("DROP TABLE peer_rate_limits; PRAGMA user_version = 1;")?;
+        drop(legacy);
+
+        let migrated = StateStore::open(path)?;
+        assert_eq!(
+            migrated.admit_peer_request_at(&peer.peer_id, 1, NOW)?,
+            PeerRequestAdmission::Admitted { remaining: 0 }
+        );
+        assert_eq!(
+            migrated.admit_peer_request_at(&peer.peer_id, 1, NOW + 1)?,
+            PeerRequestAdmission::Limited {
+                retry_after_ms: 59_999
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_peer_admission_never_exceeds_the_limit() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let (_, peer) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let store = std::sync::Arc::new(store);
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let peer_id = peer.peer_id.clone();
+            workers.push(std::thread::spawn(move || {
+                store.admit_peer_request_at(&peer_id, 3, NOW)
+            }));
+        }
+
+        let mut admitted = 0;
+        let mut limited = 0;
+        for worker in workers {
+            match worker
+                .join()
+                .map_err(|_| StoreError::CorruptData("peer admission worker panicked"))??
+            {
+                PeerRequestAdmission::Admitted { .. } => admitted += 1,
+                PeerRequestAdmission::Limited { .. } => limited += 1,
+            }
+        }
+        assert_eq!(admitted, 3);
+        assert_eq!(limited, 13);
         Ok(())
     }
 

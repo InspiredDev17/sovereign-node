@@ -13,6 +13,7 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_CONCURRENT_ACTIONS: usize = 4;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 32;
 pub const DEFAULT_MAX_ACTION_TTL_SECS: i64 = 300;
+pub const DEFAULT_MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 120;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +49,8 @@ pub struct PolicyConfig {
     pub max_frame_bytes: usize,
     pub max_concurrent_actions: usize,
     pub queue_capacity: usize,
+    /// Durable fixed-window admission limit applied to each authenticated peer before authz.
+    pub max_requests_per_peer_per_minute: u32,
     pub max_action_ttl_secs: i64,
     pub require_owner_signature_for_all_actions: bool,
     pub max_file_read_bytes: usize,
@@ -63,6 +66,7 @@ impl Default for PolicyConfig {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             max_concurrent_actions: DEFAULT_MAX_CONCURRENT_ACTIONS,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            max_requests_per_peer_per_minute: DEFAULT_MAX_REQUESTS_PER_PEER_PER_MINUTE,
             max_action_ttl_secs: DEFAULT_MAX_ACTION_TTL_SECS,
             require_owner_signature_for_all_actions: true,
             max_file_read_bytes: 524_288,
@@ -174,6 +178,13 @@ impl NodeConfig {
         if policy.queue_capacity < policy.max_concurrent_actions || policy.queue_capacity > 4096 {
             return Err(ConfigError::Invalid(
                 "queue_capacity must cover concurrency and be at most 4096".to_owned(),
+            ));
+        }
+        if policy.max_requests_per_peer_per_minute == 0
+            || policy.max_requests_per_peer_per_minute > 60_000
+        {
+            return Err(ConfigError::Invalid(
+                "max_requests_per_peer_per_minute must be between 1 and 60000".to_owned(),
             ));
         }
         if policy.max_action_ttl_secs <= 0 || policy.max_action_ttl_secs > 3600 {
@@ -431,6 +442,15 @@ mod tests {
             "unsafe".to_owned(),
             PathBuf::from("/var/lib/sovereign-node/files"),
         );
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn peer_request_limit_must_be_bounded() {
+        let mut config = minimal_config();
+        config.policy.max_requests_per_peer_per_minute = 0;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        config.policy.max_requests_per_peer_per_minute = 60_001;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 }

@@ -128,6 +128,11 @@ ExecuteApprovedAction selects a preinstalled action identifier and fixed
 executable; it cannot accept a shell string, executable path, script body, or
 uploaded binary.
 
+Before the authorization layer sees a decoded remote action, transport applies
+an atomic per-paired-peer admission limit stored in the local state database.
+The fixed one-minute window survives reconnects and database reopen, and it
+does not consume the action RequestId when rejecting excess traffic.
+
 ### Resource reporter
 
 The reporter exposes bounded, non-sensitive summaries for CPU, memory, disk,
