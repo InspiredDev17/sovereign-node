@@ -189,7 +189,10 @@ authoritative request state.
 The transport test harness exercises this boundary over real TLS 1.3 loopback
 connections: a partial-frame disconnect creates no reservation, the complete
 signed request succeeds after reauthentication, and its next delivery returns
-only a duplicate response.
+only a duplicate response. It also drops a client after full request delivery
+but before response receipt, confirms the durable execution record completed,
+then verifies the retried envelope is duplicate-only and cannot create another
+execution attempt.
 
 For an action whose side effect cannot be proven after a crash, the result is
 Indeterminate and requires owner reconciliation. The runtime must not guess and

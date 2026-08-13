@@ -550,7 +550,7 @@ mod tests {
     use crate::runtime::{NodeRuntime, RuntimeCapacity};
     use crate::store::{
         CredentialRotationOutcome, PairingApproval, PendingPairingChallenge, RevocationOutcome,
-        TrustedPeer, sha256,
+        TerminalStatus, TrustedPeer, sha256,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -719,6 +719,7 @@ mod tests {
         owner: &SigningKey,
         broker: &SigningKey,
         issued_at: UnixMillis,
+        sequence: u64,
         request_id: RequestId,
     ) -> TestResult<SignedActionV1> {
         let request = ActionRequestV1::new(
@@ -739,7 +740,7 @@ mod tests {
             UnixMillis(issued_at.0 + 60_000),
             ReplayProtectionV1 {
                 nonce: Nonce(sha256(request_id.as_uuid().as_bytes())),
-                sequence: 1,
+                sequence,
             },
             AuthorizationClaimsV1 {
                 authorization_id: AuthorizationId(Uuid::new_v4()),
@@ -867,6 +868,20 @@ mod tests {
             return Err(std::io::Error::other("non-canonical response frame").into());
         }
         Ok(response)
+    }
+
+    async fn send_action_without_reading_response(
+        stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+        action: &SignedActionV1,
+    ) -> TestResult {
+        let encoded = postcard::to_allocvec(action)?;
+        stream
+            .write_all(&u32::try_from(encoded.len())?.to_be_bytes())
+            .await?;
+        stream.write_all(&encoded).await?;
+        stream.flush().await?;
+        stream.shutdown().await?;
+        Ok(())
     }
 
     #[test]
@@ -1038,7 +1053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_before_frame_does_not_reserve_and_reconnect_executes_once() -> TestResult {
+    async fn disconnects_before_and_after_reservation_never_execute_twice() -> TestResult {
         let pki = test_pki()?;
         let directory = tempfile::TempDir::new()?;
         let data_dir = directory.path().join("node");
@@ -1132,6 +1147,7 @@ mod tests {
             &owner,
             &broker,
             UnixMillis(now),
+            1,
             request_id,
         )?;
         let client_config = client_config(&pki, Some(&pki.paired_client))?;
@@ -1178,17 +1194,72 @@ mod tests {
         assert!(store.action_audit_record(request_id.0)?.is_some());
 
         let third_server = tokio::spawn(accept_runtime_connection(
-            listener,
-            trust,
-            runtime,
-            store,
+            listener.clone(),
+            trust.clone(),
+            runtime.clone(),
+            store.clone(),
             request_policy,
         ));
-        let mut duplicate_connection = connect_test_client(address, client_config).await?;
+        let mut duplicate_connection = connect_test_client(address, client_config.clone()).await?;
         let duplicate_response = send_action_and_close(&mut duplicate_connection, &action).await?;
         assert_eq!(duplicate_response.response.status, ActionStatus::Duplicate);
         duplicate_response.response.validate()?;
         assert!(third_server.await?.is_ok());
+
+        let lost_response_request_id = RequestId(Uuid::new_v4());
+        let lost_response_action = signed_system_info_action(
+            identity.node_id(),
+            PairingId(trusted.pairing_id),
+            "owner-peer-reconnect",
+            &owner,
+            &broker,
+            UnixMillis(now),
+            2,
+            lost_response_request_id,
+        )?;
+        let fourth_server = tokio::spawn(accept_runtime_connection(
+            listener.clone(),
+            trust.clone(),
+            runtime.clone(),
+            store.clone(),
+            request_policy,
+        ));
+        let mut lost_response_connection =
+            connect_test_client(address, client_config.clone()).await?;
+        send_action_without_reading_response(&mut lost_response_connection, &lost_response_action)
+            .await?;
+        drop(lost_response_connection);
+        let _server_write_outcome =
+            tokio::time::timeout(Duration::from_secs(2), fourth_server).await??;
+        let completed_record = store
+            .action_audit_record(lost_response_request_id.0)?
+            .ok_or_else(|| std::io::Error::other("lost-response action was not recorded"))?;
+        assert!(completed_record.execution_started_at_unix_ms.is_some());
+        assert!(matches!(
+            completed_record.terminal.as_ref().map(|value| value.status),
+            Some(TerminalStatus::Succeeded)
+        ));
+
+        let fifth_server = tokio::spawn(accept_runtime_connection(
+            listener,
+            trust,
+            runtime,
+            store.clone(),
+            request_policy,
+        ));
+        let mut lost_response_retry = connect_test_client(address, client_config).await?;
+        let lost_response_duplicate =
+            send_action_and_close(&mut lost_response_retry, &lost_response_action).await?;
+        assert_eq!(
+            lost_response_duplicate.response.status,
+            ActionStatus::Duplicate
+        );
+        lost_response_duplicate.response.validate()?;
+        assert!(fifth_server.await?.is_ok());
+        assert_eq!(
+            store.action_audit_record(lost_response_request_id.0)?,
+            Some(completed_record)
+        );
         Ok(())
     }
 
