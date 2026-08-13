@@ -194,6 +194,11 @@ but before response receipt, confirms the durable execution record completed,
 then verifies the retried envelope is duplicate-only and cannot create another
 execution attempt.
 
+Credential-rotation transport tests hold an authenticated old TLS session open
+across an atomic trust-epoch and leaf-pin change. The old session closes within
+the trust-check interval, reconnecting with the prior leaf resolves to no paired
+session, and only the replacement leaf resolves to the incremented epoch.
+
 For an action whose side effect cannot be proven after a crash, the result is
 Indeterminate and requires owner reconciliation. The runtime must not guess and
 execute it again.

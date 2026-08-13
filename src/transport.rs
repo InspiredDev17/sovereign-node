@@ -1264,6 +1264,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_rotation_closes_old_session_and_rebinds_exact_leaf() -> TestResult {
+        let pki = test_pki()?;
+        let directory = tempfile::TempDir::new()?;
+        let store = Arc::new(StateStore::open(directory.path().join("state.sqlite3"))?);
+        let trusted = pair_transport_peer(&store, &pki, "peer-rotate", &pki.paired_client, 5)?;
+        let old_trust = Arc::new(
+            build_transport_trust(&server_identity(&pki), &store)?
+                .ok_or_else(|| std::io::Error::other("transport trust missing"))?,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let acceptor = TlsAcceptor::from(old_trust.tls.clone());
+        let server_store = store.clone();
+        let (session_ready, session_established) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.map_err(TransportError::Io)?;
+            let mut tls = acceptor.accept(tcp).await.map_err(TransportError::Io)?;
+            let session = authenticated_session(&tls, &old_trust.session_by_leaf)
+                .ok_or(TransportError::UnpairedClient)?;
+            session_ready
+                .send(())
+                .map_err(|()| TransportError::RuntimeTask)?;
+            read_frame_with_trust(&mut tls, &server_store, &session, 1024).await
+        });
+
+        let tcp = TcpStream::connect(address).await?;
+        let connector = TlsConnector::from(client_config(&pki, Some(&pki.paired_client))?);
+        let mut old_client = connector
+            .connect(ServerName::try_from("localhost")?, tcp)
+            .await?;
+        session_established.await?;
+
+        let mut rotated_material = decode_key_material(&trusted.public_key)?;
+        let rotated_broker = SigningKey::generate(&mut OsRng);
+        rotated_material.broker_public_key =
+            PublicKeyBytes(rotated_broker.verifying_key().to_bytes());
+        rotated_material.client_certificate_sha256 =
+            Sha256Digest(Sha256::digest(pki.unpaired_client.certificate.as_ref()).into());
+        let rotated = match store.rotate_peer_credential(
+            &trusted.peer_id,
+            sha256(&trusted.public_key),
+            postcard::to_allocvec(&rotated_material)?,
+            sha256(b"owner-approved-rotation"),
+            current_time_millis()?,
+        )? {
+            CredentialRotationOutcome::Rotated(peer) => peer,
+            CredentialRotationOutcome::AlreadyCurrent(_) => {
+                return Err(std::io::Error::other("rotation was unexpectedly idempotent").into());
+            }
+        };
+        assert_eq!(rotated.trust_epoch, trusted.trust_epoch + 1);
+
+        let server_result = tokio::time::timeout(Duration::from_secs(2), server).await??;
+        assert!(matches!(
+            server_result,
+            Err(TransportError::SessionTrustChanged)
+        ));
+        let mut byte = [0_u8; 1];
+        let old_client_read =
+            tokio::time::timeout(Duration::from_secs(2), old_client.read(&mut byte)).await?;
+        assert!(matches!(old_client_read, Ok(0) | Err(_)));
+
+        let refreshed = build_transport_trust(&server_identity(&pki), &store)?
+            .ok_or_else(|| std::io::Error::other("refreshed transport trust missing"))?;
+        assert_eq!(refreshed.session_by_leaf.len(), 1);
+        let refreshed_tls = refreshed.tls.clone();
+        let refreshed_sessions = refreshed.session_by_leaf.clone();
+        let (old_reconnect, old_server) = connect_once(
+            refreshed_tls.clone(),
+            client_config(&pki, Some(&pki.paired_client))?,
+            refreshed_sessions.clone(),
+        )
+        .await?;
+        assert!(old_reconnect.is_ok());
+        let (_, old_session) = old_server.map_err(std::io::Error::other)?;
+        assert!(old_session.is_none());
+
+        let (new_reconnect, new_server) = connect_once(
+            refreshed_tls,
+            client_config(&pki, Some(&pki.unpaired_client))?,
+            refreshed_sessions,
+        )
+        .await?;
+        assert!(new_reconnect.is_ok());
+        let (version, new_session) = new_server.map_err(std::io::Error::other)?;
+        assert_eq!(version, Some(ProtocolVersion::TLSv1_3));
+        let new_session =
+            new_session.ok_or_else(|| std::io::Error::other("rotated leaf was not bound"))?;
+        assert_eq!(new_session.peer.peer_id, trusted.peer_id);
+        assert_eq!(new_session.peer.trust_epoch, rotated.trust_epoch);
+        assert_eq!(
+            new_session.peer.certificate_sha256,
+            rotated_material.client_certificate_sha256
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn idle_tls_session_closes_promptly_after_revocation() -> TestResult {
         let pki = test_pki()?;
         let directory = tempfile::TempDir::new()?;

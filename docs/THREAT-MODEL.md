@@ -234,6 +234,9 @@ success, and confirm a second reconnect returns a non-executing duplicate. A
 second path disconnects after full delivery without reading the response,
 requires durable execution-start and terminal evidence, then proves the
 reauthenticated retry is duplicate-only and leaves that action record unchanged.
+Credential-rotation transport tests additionally prove an established old TLS
+session closes after the durable epoch change, the prior leaf cannot recover a
+paired session, and only the replacement leaf binds to the incremented epoch.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.
