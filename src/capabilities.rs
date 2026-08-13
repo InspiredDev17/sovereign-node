@@ -18,11 +18,11 @@ use crate::config::{ApprovedActionConfig, NodeConfig};
 use crate::protocol::{
     ActionArguments, ActionErrorCode, ActionResultV1, ActionTarget, ApprovedActionOutcome,
     ApprovedActionResultV1, EntityStatusV1, FileReadResultV1, FileWriteMode, FileWriteResultV1,
-    Sha256Digest, TrustStatus, UnixMillis,
+    GpuResourceV1, InferenceEngineStatusV1, LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
 };
 use crate::resources::{HealthReporter, QueueSnapshot, ResourceReporter, ResourceSnapshotReporter};
 
-#[derive(Debug, Error)]
+#[derive(Debug, Eq, Error, PartialEq)]
 pub enum CapabilityError {
     #[error("capability target is not locally allowlisted")]
     TargetNotAllowed,
@@ -137,12 +137,37 @@ impl CapabilityExecutor {
                 .execute_approved_action(action_id, parameters)
                 .await
                 .map(ActionResultV1::ExecuteApprovedAction),
-            (ActionTarget::Gpu { .. }, ActionArguments::GpuStatus)
-            | (ActionTarget::Engine { .. }, ActionArguments::EngineStatus)
-            | (ActionTarget::Model { .. }, ActionArguments::ModelStatus)
-            | (ActionTarget::AgentGreen, ActionArguments::AgentGreenHealth)
-            | (ActionTarget::ActionBroker, ActionArguments::ActionBrokerHealth)
-            | (ActionTarget::Service { .. }, ActionArguments::ServiceStatus)
+            (ActionTarget::Gpu { index }, ActionArguments::GpuStatus) => {
+                let snapshot = self
+                    .resources
+                    .signed_resource_snapshot(now, &self.external_resources);
+                filter_gpu_status(snapshot.gpus, *index).map(ActionResultV1::GpuStatus)
+            }
+            (ActionTarget::Engine { engine_id }, ActionArguments::EngineStatus) => {
+                let snapshot = self
+                    .resources
+                    .signed_resource_snapshot(now, &self.external_resources);
+                filter_engine_status(
+                    snapshot.inference_engines,
+                    engine_id.as_deref(),
+                    snapshot.observed_at.is_some(),
+                )
+                .map(ActionResultV1::EngineStatus)
+            }
+            (ActionTarget::Model { model_id }, ActionArguments::ModelStatus) => {
+                let snapshot = self
+                    .resources
+                    .signed_resource_snapshot(now, &self.external_resources);
+                filter_model_status(snapshot.loaded_models, model_id.as_deref())
+                    .map(ActionResultV1::ModelStatus)
+            }
+            (ActionTarget::AgentGreen, ActionArguments::AgentGreenHealth) => Ok(
+                ActionResultV1::AgentGreenHealth(self.health.agent_green(now)),
+            ),
+            (ActionTarget::ActionBroker, ActionArguments::ActionBrokerHealth) => Ok(
+                ActionResultV1::ActionBrokerHealth(self.health.action_broker(now)),
+            ),
+            (ActionTarget::Service { .. }, ActionArguments::ServiceStatus)
             | (ActionTarget::Repository { .. }, ActionArguments::RepositoryStatus { .. }) => {
                 Err(CapabilityError::Unsupported)
             }
@@ -356,6 +381,50 @@ impl CapabilityExecutor {
     }
 }
 
+fn filter_gpu_status(
+    gpus: Vec<GpuResourceV1>,
+    requested_index: Option<u16>,
+) -> Result<Vec<GpuResourceV1>, CapabilityError> {
+    match requested_index {
+        None => Ok(gpus),
+        Some(index) => gpus
+            .into_iter()
+            .find(|gpu| gpu.index == index)
+            .map(|gpu| vec![gpu])
+            .ok_or(CapabilityError::TargetNotAllowed),
+    }
+}
+
+fn filter_engine_status(
+    engines: Vec<InferenceEngineStatusV1>,
+    requested_id: Option<&str>,
+    verified_snapshot: bool,
+) -> Result<Vec<InferenceEngineStatusV1>, CapabilityError> {
+    match requested_id {
+        None => Ok(engines),
+        Some(_) if !verified_snapshot => Err(CapabilityError::TargetNotAllowed),
+        Some(engine_id) => engines
+            .into_iter()
+            .find(|engine| engine.engine_id == engine_id)
+            .map(|engine| vec![engine])
+            .ok_or(CapabilityError::TargetNotAllowed),
+    }
+}
+
+fn filter_model_status(
+    models: Vec<LoadedModelV1>,
+    requested_id: Option<&str>,
+) -> Result<Vec<LoadedModelV1>, CapabilityError> {
+    match requested_id {
+        None => Ok(models),
+        Some(model_id) => models
+            .into_iter()
+            .find(|model| model.model_id == model_id)
+            .map(|model| vec![model])
+            .ok_or(CapabilityError::TargetNotAllowed),
+    }
+}
+
 async fn read_bounded_and_drain<R>(
     mut reader: R,
     retain_limit: usize,
@@ -435,6 +504,8 @@ fn is_shell_or_interpreter(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::protocol::{Availability, GpuMemoryKind, ModelLoadState, UtilizationPermille};
+
     use super::*;
 
     #[test]
@@ -445,5 +516,62 @@ mod tests {
         assert!(!is_shell_or_interpreter(Path::new(
             "/usr/local/libexec/fixed-action"
         )));
+    }
+
+    #[test]
+    fn dedicated_status_filters_deny_unknown_specific_targets() {
+        let gpus = vec![GpuResourceV1 {
+            index: 2,
+            utilization: Some(UtilizationPermille(500)),
+            memory_kind: GpuMemoryKind::DedicatedVram,
+            total_memory_bytes: Some(8_000),
+            used_memory_bytes: Some(4_000),
+            temperature_millidegrees_celsius: None,
+        }];
+        assert_eq!(filter_gpu_status(gpus.clone(), None), Ok(gpus.clone()));
+        assert_eq!(filter_gpu_status(gpus.clone(), Some(2)), Ok(gpus));
+        assert!(matches!(
+            filter_gpu_status(Vec::new(), Some(2)),
+            Err(CapabilityError::TargetNotAllowed)
+        ));
+
+        let engines = vec![InferenceEngineStatusV1 {
+            engine_id: "native-engine".to_owned(),
+            native: true,
+            availability: Availability::Available,
+            version: None,
+        }];
+        assert_eq!(
+            filter_engine_status(engines.clone(), Some("native-engine"), true),
+            Ok(engines)
+        );
+        assert!(matches!(
+            filter_engine_status(
+                vec![InferenceEngineStatusV1 {
+                    engine_id: "native-inference-engine".to_owned(),
+                    native: true,
+                    availability: Availability::Unknown,
+                    version: None,
+                }],
+                Some("native-inference-engine"),
+                false,
+            ),
+            Err(CapabilityError::TargetNotAllowed)
+        ));
+
+        let models = vec![LoadedModelV1 {
+            model_id: "owner-model".to_owned(),
+            engine_id: "native-engine".to_owned(),
+            state: ModelLoadState::Loaded,
+            allocated_memory_bytes: None,
+        }];
+        assert_eq!(
+            filter_model_status(models.clone(), Some("owner-model")),
+            Ok(models)
+        );
+        assert!(matches!(
+            filter_model_status(Vec::new(), Some("owner-model")),
+            Err(CapabilityError::TargetNotAllowed)
+        ));
     }
 }

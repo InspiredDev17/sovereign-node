@@ -97,7 +97,7 @@ operation fails closed.
 | Revoked credential reuse | Revocation invalidates the trust record, rotation increments its generation, bound sessions close, and stale authorizations are rejected |
 | Malicious update bundle | Pinned release signature, content hashes, version policy, local owner approval, audit, and rollback metadata are required |
 | Automatic supply-chain compromise | The daemon contains no Internet updater or unattended install path |
-| Agent Green suppression | Node lacks Agent Green control capability and reports only independently obtained tri-state health |
+| Agent Green suppression | Node lacks Agent Green control capability and reports only independently obtained signed health state; unverifiable state is Unknown |
 | Audit tampering | Restrictive storage and optional node-signed hash linking provide damage evidence; external owner-controlled export improves survivability |
 
 ## Local privilege and filesystem containment

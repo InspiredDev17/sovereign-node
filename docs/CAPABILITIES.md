@@ -16,15 +16,18 @@ control, or automatic update.
 
 ## v0.1 implementation status
 
-The hardened v0.1 production manifest permits only `SystemInfo` and
-`ResourceStatus`. Configuration validation rejects advertising every other
-capability below. Their enum values and typed request schemas reserve stable
-protocol names, but they are not production authority. In particular,
-`FileRead`, `FileWrite`, and `ExecuteApprovedAction` remain unavailable until
+The hardened v0.1 default manifest permits only `SystemInfo` and
+`ResourceStatus`. When its corresponding component-specific signed local
+adapter is configured, the owner may explicitly add `GpuStatus`,
+`EngineStatus`, `ModelStatus`, `AgentGreenHealth`, or `ActionBrokerHealth` and
+increment `policy_version`. Configuration validation rejects those capabilities
+without their exact adapter and rejects advertising every other capability
+below. In particular, `FileRead`, `FileWrite`, and `ExecuteApprovedAction`
+remain unavailable until
 descriptor-relative no-follow access, credential exclusions, atomic writes,
-and a separate OS sandbox/process boundary are implemented and tested. GPU,
-thermal, engine, model, repository, Agent Green, and Action Broker measurements
-report `Unknown`/unsupported rather than inventing health.
+and a separate OS sandbox/process boundary are implemented and tested.
+Unverifiable GPU, engine, model, Agent Green, and Action Broker measurements
+report `Unknown`/no verified entries rather than inventing state.
 
 ## Manifest
 
@@ -174,25 +177,28 @@ version.
 
 ### GPUStatus
 
-Returns bounded adapter availability, broad device class, utilization, memory
-totals and use, driver or runtime compatibility, temperature or thermal state
-when supported, and freshness.
+Returns bounded verified GPU indexes, utilization, memory kind, memory totals
+and use, and temperature when supported. An optional target selects one GPU by
+its local numeric index; a missing exact index is denied. Snapshot freshness is
+enforced locally before the result is returned.
 
 Serial numbers, PCI topology, device UUIDs, and vendor account data are omitted
-unless the owner has a narrow local reason to expose them. Vendor-tool failure
-returns Unknown, not Healthy.
+unless the owner has a narrow local reason to expose them. Producer failure
+returns no verified GPU entries, not a fabricated zero or Healthy state.
 
 ### EngineStatus
 
-Reports configured native inference-engine availability, compatible runtime
-version, readiness, bounded queue information, and last verified health time.
+Reports configured native inference-engine availability and compatible runtime
+version. An optional target selects one engine by its owner-safe logical ID; a
+missing exact ID is denied. Snapshot freshness is enforced locally.
 It does not submit inference work, download an engine, alter engine settings, or
 return engine credentials.
 
 ### ModelStatus
 
-Reports only owner-configured model aliases, loaded or unloaded state, broad
-precision or memory class when allowed, engine association, and freshness. It
+Reports only verified loaded/loading/unloading/failed model aliases, engine
+association, and optional allocated memory. An optional target selects one
+model by its owner-safe logical ID; a missing exact ID is denied. It
 does not return model weights, secret filesystem paths, license credentials, or
 provider tokens. Loading, unloading, downloading, and deleting models require
 separate future capabilities and are not implied.

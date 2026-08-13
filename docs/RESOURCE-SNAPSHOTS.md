@@ -19,6 +19,12 @@ producers. The key must also be distinct from update release and owner-approval
 keys. Changing the producer, path, or freshness policy requires a higher node
 `policy_version`.
 
+After configuring this adapter, the owner may optionally add `GpuStatus`,
+`EngineStatus`, and `ModelStatus` to `policy.enabled_capabilities`. The aggregate
+forms return every verified bounded entry. A request may instead name one GPU
+index or one logical engine/model ID; an exact target that is not present in a
+fresh verified snapshot is denied rather than returned as an empty success.
+
 ## Envelope and signature
 
 The snapshot file is strict JSON:
@@ -97,7 +103,9 @@ for longer than the configured maximum age, over protocol collection limits,
 or internally inconsistent. It also rejects duplicate GPU, engine, or model
 IDs; impossible memory totals; out-of-range utilization or temperatures;
 unknown model-to-engine references; and unified-memory totals larger than host
-RAM. The fallback is `Unknown` thermal/native-engine availability, no asserted
+RAM. A `Loaded` model must reference an `Available` or `Degraded` engine, and
+its allocation cannot exceed host RAM plus reported dedicated VRAM. The
+fallback is `Unknown` thermal/native-engine availability, no asserted
 unified memory, and empty GPU/model lists. Those empty lists do not prove
 hardware or models are absent.
 

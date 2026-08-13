@@ -19,6 +19,12 @@ public_key_hex = "<a different 32-byte Ed25519 public key in hexadecimal>"
 max_age_secs = 30
 ```
 
+After configuring a producer, the owner may optionally add its matching
+`AgentGreenHealth` or `ActionBrokerHealth` capability to
+`policy.enabled_capabilities`. This is a policy change and requires a higher
+`policy_version`. The capability only returns the same signed read-only health
+observation; it grants no component control.
+
 The outer snapshot file is strict JSON with exactly two hexadecimal fields:
 
 ```json

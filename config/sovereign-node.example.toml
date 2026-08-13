@@ -20,6 +20,8 @@ policy_version = 1
 # max_artifact_bytes = 1073741824
 
 [policy]
+# With the matching signed adapters below, the owner may also add `GpuStatus`, `EngineStatus`,
+# `ModelStatus`, `AgentGreenHealth`, or `ActionBrokerHealth`. Every addition is a policy change.
 enabled_capabilities = ["SystemInfo", "ResourceStatus"]
 max_frame_bytes = 1048576
 max_concurrent_actions = 4

@@ -757,15 +757,9 @@ impl ActionResultV1 {
             {
                 Err(ValidationError::LimitExceeded("approved action output"))
             }
-            Self::GpuStatus(gpus) if gpus.len() > MAX_GPUS => {
-                Err(ValidationError::LimitExceeded("GPU results"))
-            }
-            Self::EngineStatus(engines) if engines.len() > MAX_ENGINE_STATUSES => {
-                Err(ValidationError::LimitExceeded("engine results"))
-            }
-            Self::ModelStatus(models) if models.len() > MAX_LOADED_MODELS => {
-                Err(ValidationError::LimitExceeded("model results"))
-            }
+            Self::GpuStatus(gpus) => validate_gpu_results(gpus),
+            Self::EngineStatus(engines) => validate_engine_results(engines),
+            Self::ModelStatus(models) => validate_model_results(models),
             Self::ProcessStatus(status) | Self::ServiceStatus(status) => status.validate(),
             Self::AgentGreenHealth(health) | Self::ActionBrokerHealth(health) => {
                 validate_optional_string(&health.detail, MAX_DETAIL_BYTES, "health detail")
@@ -1201,8 +1195,10 @@ impl NodeResourceReportV1 {
         if self.loaded_models.len() > MAX_LOADED_MODELS {
             return Err(ValidationError::LimitExceeded("loaded models"));
         }
-        if self.queue.running > self.queue.capacity {
-            return Err(ValidationError::InvalidValue("queue running count"));
+        if self.queue.running > self.queue.capacity
+            || self.queue.queued.saturating_add(self.queue.running) > self.queue.capacity
+        {
+            return Err(ValidationError::InvalidValue("queue capacity"));
         }
         for disk in &self.disks {
             validate_local_identifier(&disk.label, "disk label")?;
@@ -1210,47 +1206,48 @@ impl NodeResourceReportV1 {
                 return Err(ValidationError::InvalidValue("disk capacity"));
             }
         }
-        let mut gpu_indexes = BTreeSet::new();
-        for gpu in &self.gpus {
-            if !gpu_indexes.insert(gpu.index) {
-                return Err(ValidationError::InvalidValue("GPU index"));
-            }
-            if gpu.utilization.is_some_and(|value| value.0 > 1_000) {
-                return Err(ValidationError::InvalidValue("GPU utilization"));
-            }
-            validate_temperature(gpu.temperature_millidegrees_celsius, "GPU temperature")?;
-            if matches!(
-                (gpu.total_memory_bytes, gpu.used_memory_bytes),
-                (None, Some(_)) | (Some(_), None)
-            ) || matches!(
-                (gpu.total_memory_bytes, gpu.used_memory_bytes),
-                (Some(total), Some(used)) if used > total
-            ) {
-                return Err(ValidationError::InvalidValue("GPU memory"));
-            }
+        validate_gpu_results(&self.gpus)?;
+        validate_engine_results(&self.inference_engines)?;
+        validate_model_results(&self.loaded_models)?;
+        let engine_ids: BTreeSet<_> = self
+            .inference_engines
+            .iter()
+            .map(|engine| engine.engine_id.as_str())
+            .collect();
+        if self
+            .loaded_models
+            .iter()
+            .any(|model| !engine_ids.contains(model.engine_id.as_str()))
+        {
+            return Err(ValidationError::InvalidValue("model engine id"));
         }
-        let mut engine_ids = BTreeSet::new();
-        for engine in &self.inference_engines {
-            validate_local_identifier(&engine.engine_id, "inference engine id")?;
-            if !engine_ids.insert(engine.engine_id.as_str()) {
-                return Err(ValidationError::InvalidValue("inference engine id"));
-            }
-            validate_optional_string(
-                &engine.version,
-                MAX_VERSION_BYTES,
-                "inference engine version",
-            )?;
+        let engine_states: BTreeMap<_, _> = self
+            .inference_engines
+            .iter()
+            .map(|engine| (engine.engine_id.as_str(), engine.availability))
+            .collect();
+        if self.loaded_models.iter().any(|model| {
+            model.state == ModelLoadState::Loaded
+                && !matches!(
+                    engine_states.get(model.engine_id.as_str()),
+                    Some(Availability::Available | Availability::Degraded)
+                )
+        }) {
+            return Err(ValidationError::InvalidValue("loaded model engine state"));
         }
-        let mut model_ids = BTreeSet::new();
-        for model in &self.loaded_models {
-            validate_local_identifier(&model.model_id, "model id")?;
-            validate_local_identifier(&model.engine_id, "model engine id")?;
-            if !model_ids.insert(model.model_id.as_str()) {
-                return Err(ValidationError::InvalidValue("model id"));
-            }
-            if !engine_ids.contains(model.engine_id.as_str()) {
-                return Err(ValidationError::InvalidValue("model engine id"));
-            }
+        let dedicated_vram = self
+            .gpus
+            .iter()
+            .filter(|gpu| gpu.memory_kind == GpuMemoryKind::DedicatedVram)
+            .filter_map(|gpu| gpu.total_memory_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let maximum_model_memory = self.ram.total_bytes.saturating_add(dedicated_vram);
+        if self.loaded_models.iter().any(|model| {
+            model
+                .allocated_memory_bytes
+                .is_some_and(|bytes| bytes > maximum_model_memory)
+        }) {
+            return Err(ValidationError::InvalidValue("model allocated memory"));
         }
         validate_optional_string(
             &self.agent_green.detail,
@@ -1445,6 +1442,66 @@ fn validate_temperature(value: Option<i32>, field: &'static str) -> Result<(), V
     Ok(())
 }
 
+fn validate_gpu_results(gpus: &[GpuResourceV1]) -> Result<(), ValidationError> {
+    if gpus.len() > MAX_GPUS {
+        return Err(ValidationError::LimitExceeded("GPU results"));
+    }
+    let mut indexes = BTreeSet::new();
+    for gpu in gpus {
+        if !indexes.insert(gpu.index) {
+            return Err(ValidationError::InvalidValue("GPU index"));
+        }
+        if gpu.utilization.is_some_and(|value| value.0 > 1_000) {
+            return Err(ValidationError::InvalidValue("GPU utilization"));
+        }
+        validate_temperature(gpu.temperature_millidegrees_celsius, "GPU temperature")?;
+        if matches!(
+            (gpu.total_memory_bytes, gpu.used_memory_bytes),
+            (None, Some(_)) | (Some(_), None)
+        ) || matches!(
+            (gpu.total_memory_bytes, gpu.used_memory_bytes),
+            (Some(total), Some(used)) if used > total
+        ) {
+            return Err(ValidationError::InvalidValue("GPU memory"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_engine_results(engines: &[InferenceEngineStatusV1]) -> Result<(), ValidationError> {
+    if engines.len() > MAX_ENGINE_STATUSES {
+        return Err(ValidationError::LimitExceeded("engine results"));
+    }
+    let mut ids = BTreeSet::new();
+    for engine in engines {
+        validate_local_identifier(&engine.engine_id, "inference engine id")?;
+        if !ids.insert(engine.engine_id.as_str()) {
+            return Err(ValidationError::InvalidValue("inference engine id"));
+        }
+        validate_optional_string(
+            &engine.version,
+            MAX_VERSION_BYTES,
+            "inference engine version",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_model_results(models: &[LoadedModelV1]) -> Result<(), ValidationError> {
+    if models.len() > MAX_LOADED_MODELS {
+        return Err(ValidationError::LimitExceeded("model results"));
+    }
+    let mut ids = BTreeSet::new();
+    for model in models {
+        validate_local_identifier(&model.model_id, "model id")?;
+        validate_local_identifier(&model.engine_id, "model engine id")?;
+        if !ids.insert(model.model_id.as_str()) {
+            return Err(ValidationError::InvalidValue("model id"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1633,5 +1690,127 @@ mod tests {
         let encoded = postcard::to_allocvec(&vec![1_u8; 63])?;
         assert!(postcard::from_bytes::<SignatureBytes>(&encoded).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn dedicated_status_results_reject_malformed_or_duplicate_entries() {
+        let gpu = GpuResourceV1 {
+            index: 1,
+            utilization: Some(UtilizationPermille(500)),
+            memory_kind: GpuMemoryKind::DedicatedVram,
+            total_memory_bytes: Some(8_000),
+            used_memory_bytes: Some(4_000),
+            temperature_millidegrees_celsius: Some(60_000),
+        };
+        assert!(
+            ActionResultV1::GpuStatus(vec![gpu.clone()])
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            ActionResultV1::GpuStatus(vec![gpu.clone(), gpu])
+                .validate()
+                .is_err()
+        );
+
+        let engine = InferenceEngineStatusV1 {
+            engine_id: "native-engine".to_owned(),
+            native: true,
+            availability: Availability::Available,
+            version: Some("1.0".to_owned()),
+        };
+        assert!(
+            ActionResultV1::EngineStatus(vec![engine.clone()])
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            ActionResultV1::EngineStatus(vec![engine.clone(), engine])
+                .validate()
+                .is_err()
+        );
+
+        let model = LoadedModelV1 {
+            model_id: "owner-model".to_owned(),
+            engine_id: "native-engine".to_owned(),
+            state: ModelLoadState::Loaded,
+            allocated_memory_bytes: None,
+        };
+        assert!(
+            ActionResultV1::ModelStatus(vec![model.clone()])
+                .validate()
+                .is_ok()
+        );
+        let mut invalid = model;
+        invalid.model_id = "private/path".to_owned();
+        assert!(
+            ActionResultV1::ModelStatus(vec![invalid])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resource_report_rejects_queue_and_loaded_model_inconsistency() {
+        let mut report = NodeResourceReportV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            protocol_version: PROTOCOL_VERSION_V1,
+            node_id: NodeId(id(900)),
+            observed_at: UnixMillis(1),
+            cpu: CpuResourceV1 {
+                logical_cpu_count: 1,
+                utilization: UtilizationPermille(0),
+                load_one_minute_milli: None,
+                temperature_millidegrees_celsius: None,
+            },
+            ram: MemoryResourceV1 {
+                total_bytes: 1_000,
+                available_bytes: 500,
+                used_bytes: 500,
+            },
+            unified_memory: None,
+            disks: Vec::new(),
+            gpus: Vec::new(),
+            thermal_state: ThermalState::Unknown,
+            inference_engines: vec![InferenceEngineStatusV1 {
+                engine_id: "native-engine".to_owned(),
+                native: true,
+                availability: Availability::Unavailable,
+                version: None,
+            }],
+            loaded_models: vec![LoadedModelV1 {
+                model_id: "owner-model".to_owned(),
+                engine_id: "native-engine".to_owned(),
+                state: ModelLoadState::Loaded,
+                allocated_memory_bytes: Some(500),
+            }],
+            queue: QueueStatusV1 {
+                queued: 1,
+                running: 1,
+                capacity: 1,
+                accepting_local_work: true,
+                accepting_remote_work: true,
+            },
+            agent_green: ComponentHealthV1 {
+                state: HealthState::Unknown,
+                last_observed_at: UnixMillis(1),
+                detail: None,
+            },
+            action_broker: ComponentHealthV1 {
+                state: HealthState::Unknown,
+                last_observed_at: UnixMillis(1),
+                detail: None,
+            },
+        };
+        assert!(report.validate().is_err());
+
+        report.queue.queued = 0;
+        assert!(report.validate().is_err());
+
+        report.inference_engines[0].availability = Availability::Available;
+        assert!(report.validate().is_ok());
+
+        report.loaded_models[0].allocated_memory_bytes = Some(1_001);
+        assert!(report.validate().is_err());
     }
 }

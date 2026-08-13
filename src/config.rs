@@ -210,9 +210,13 @@ impl NodeConfig {
         for capability in &policy.enabled_capabilities {
             match capability {
                 Capability::SystemInfo | Capability::ResourceStatus => {}
+                Capability::GpuStatus | Capability::EngineStatus | Capability::ModelStatus
+                    if self.resource_reporting.snapshot.is_some() => {}
+                Capability::AgentGreenHealth if self.health.agent_green.is_some() => {}
+                Capability::ActionBrokerHealth if self.health.action_broker.is_some() => {}
                 _ => {
                     return Err(ConfigError::Invalid(format!(
-                        "capability {capability:?} is reserved but not available in the hardened v0.1 runtime"
+                        "capability {capability:?} is unavailable without its hardened local adapter"
                     )));
                 }
             }
@@ -787,6 +791,44 @@ mod tests {
             owner_approval_public_key_hex: hex::encode(update_owner.verifying_key().to_bytes()),
             max_artifact_bytes: 1_024,
         });
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn dedicated_status_capabilities_require_their_exact_adapters() {
+        let resource_key = SigningKey::from_bytes(&[0x66; 32]);
+        let health_key = SigningKey::from_bytes(&[0x67; 32]);
+        let mut config = minimal_config();
+        config.policy.enabled_capabilities.extend([
+            Capability::GpuStatus,
+            Capability::EngineStatus,
+            Capability::ModelStatus,
+        ]);
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        config.resource_reporting.snapshot = Some(ResourceSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/sovereign-resources/snapshot.json"),
+            public_key_hex: hex::encode(resource_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        assert!(config.validate().is_ok());
+
+        config
+            .policy
+            .enabled_capabilities
+            .push(Capability::AgentGreenHealth);
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        config.health.agent_green = Some(HealthSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/agentgreen/health.json"),
+            public_key_hex: hex::encode(health_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        assert!(config.validate().is_ok());
+
+        config
+            .policy
+            .enabled_capabilities
+            .push(Capability::ActionBrokerHealth);
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 }

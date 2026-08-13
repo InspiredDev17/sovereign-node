@@ -95,8 +95,9 @@ revocation commands are owner-local operations; run `sovereign-node --help` for 
 | `ResourceStatus` | Enabled | CPU/RAM/disk/load, live bounded queue state, and optional signed accelerator, model, and health snapshots |
 | `FileRead` / `FileWrite` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
 | `ExecuteApprovedAction` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
-| Process/service/GPU/engine/model/repository status | Disabled | Explicit adapter/allowlist required |
-| Agent Green / Action Broker health | Optional within `ResourceStatus` | Fresh Ed25519-signed local snapshots only; never control or attestation |
+| `GpuStatus` / `EngineStatus` / `ModelStatus` | Optional, disabled by default | Requires the signed local resource adapter; aggregate or exact logical target only |
+| `AgentGreenHealth` / `ActionBrokerHealth` | Optional, disabled by default | Requires its component-specific signed health adapter; never control or attestation |
+| Process/service/repository status | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
 
 The producer format and fail-closed freshness rules are documented in
 [Signed local health snapshots](docs/HEALTH-SNAPSHOTS.md) and

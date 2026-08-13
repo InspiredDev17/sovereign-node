@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,11 +13,12 @@ use crate::config::{
 };
 use crate::protocol::{
     Architecture, Availability, ComponentHealthV1, CpuResourceV1, DeviceIdentityV1, DiskResourceV1,
-    GpuResourceV1, HardwareSummaryV1, HealthState, InferenceEngineStatusV1, LoadedModelV1,
-    MAX_DISKS, MAX_ENGINE_STATUSES, MAX_GPUS, MAX_ID_BYTES, MAX_LOADED_MODELS, MAX_VERSION_BYTES,
-    MemoryResourceV1, NodeId, NodeResourceReportV1, NodeSystemInfoV1, OperatingSystemFamily,
-    PROTOCOL_VERSION_V1, PlatformInfoV1, QueueStatusV1, SCHEMA_VERSION_V1, SoftwareVersionV1,
-    ThermalState, TrustStatus, UnixMillis, UtilizationPermille,
+    GpuMemoryKind, GpuResourceV1, HardwareSummaryV1, HealthState, InferenceEngineStatusV1,
+    LoadedModelV1, MAX_DISKS, MAX_ENGINE_STATUSES, MAX_GPUS, MAX_ID_BYTES, MAX_LOADED_MODELS,
+    MAX_VERSION_BYTES, MemoryResourceV1, ModelLoadState, NodeId, NodeResourceReportV1,
+    NodeSystemInfoV1, OperatingSystemFamily, PROTOCOL_VERSION_V1, PlatformInfoV1, QueueStatusV1,
+    SCHEMA_VERSION_V1, SoftwareVersionV1, ThermalState, TrustStatus, UnixMillis,
+    UtilizationPermille,
 };
 
 const HEALTH_SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"sovereign-node/local-health-snapshot/v1\0";
@@ -378,10 +379,12 @@ fn snapshot_valid(
         return false;
     }
 
-    let mut engine_ids = BTreeSet::new();
+    let mut engine_states = BTreeMap::new();
     if snapshot.inference_engines.iter().any(|engine| {
         !local_identifier_valid(&engine.engine_id)
-            || !engine_ids.insert(engine.engine_id.as_str())
+            || engine_states
+                .insert(engine.engine_id.as_str(), engine.availability)
+                .is_some()
             || engine
                 .version
                 .as_ref()
@@ -395,10 +398,25 @@ fn snapshot_valid(
     }
 
     let mut model_ids = BTreeSet::new();
+    let dedicated_vram = snapshot
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.memory_kind == GpuMemoryKind::DedicatedVram)
+        .filter_map(|gpu| gpu.total_memory_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let maximum_model_memory = total_ram_bytes.saturating_add(dedicated_vram);
     !snapshot.loaded_models.iter().any(|model| {
         !local_identifier_valid(&model.model_id)
             || !model_ids.insert(model.model_id.as_str())
-            || !engine_ids.contains(model.engine_id.as_str())
+            || !engine_states.contains_key(model.engine_id.as_str())
+            || (model.state == ModelLoadState::Loaded
+                && !matches!(
+                    engine_states.get(model.engine_id.as_str()),
+                    Some(Availability::Available | Availability::Degraded)
+                ))
+            || model
+                .allocated_memory_bytes
+                .is_some_and(|bytes| bytes > maximum_model_memory)
     })
 }
 
@@ -477,6 +495,15 @@ impl ResourceReporter {
             software: software_version(),
             trust_status,
         }
+    }
+
+    #[must_use]
+    pub fn signed_resource_snapshot(
+        &self,
+        now: UnixMillis,
+        reporter: &ResourceSnapshotReporter,
+    ) -> VerifiedResourceSnapshot {
+        reporter.read(now, System::new_all().total_memory())
     }
 
     #[must_use]
@@ -1020,6 +1047,36 @@ mod tests {
         }
         let path =
             write_resource_snapshot(&directory, "memory.json", &key, excessive_unified_memory)?;
+        assert_eq!(
+            ResourceSnapshotReporter::new(&resource_adapter(path, &key))
+                .read(UnixMillis(15_000), 32_000)
+                .thermal_state,
+            ThermalState::Unknown
+        );
+
+        let mut unavailable_engine = resource_snapshot();
+        unavailable_engine.inference_engines[0].availability = Availability::Unavailable;
+        let path = write_resource_snapshot(
+            &directory,
+            "unavailable-engine.json",
+            &key,
+            unavailable_engine,
+        )?;
+        assert_eq!(
+            ResourceSnapshotReporter::new(&resource_adapter(path, &key))
+                .read(UnixMillis(15_000), 32_000)
+                .thermal_state,
+            ThermalState::Unknown
+        );
+
+        let mut excessive_model_memory = resource_snapshot();
+        excessive_model_memory.loaded_models[0].allocated_memory_bytes = Some(40_000);
+        let path = write_resource_snapshot(
+            &directory,
+            "model-memory.json",
+            &key,
+            excessive_model_memory,
+        )?;
         assert_eq!(
             ResourceSnapshotReporter::new(&resource_adapter(path, &key))
                 .read(UnixMillis(15_000), 32_000)
