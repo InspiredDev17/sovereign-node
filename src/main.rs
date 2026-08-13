@@ -11,7 +11,9 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sovereign_node::audit::{MAX_AUDIT_EXPORT_EVENTS, export_local_audit};
+use sovereign_node::audit::{
+    MAX_AUDIT_EXPORT_EVENTS, export_local_audit, verify_audit_export_file,
+};
 use sovereign_node::authz::{AuthorizationEngine, Clock, SystemClock};
 use sovereign_node::capabilities::CapabilityExecutor;
 use sovereign_node::config::{
@@ -102,6 +104,8 @@ enum ClockCommand {
 enum AuditCommand {
     /// Verify the full chain and print one local-only signed JSON page.
     Export(AuditExportArgs),
+    /// Verify one untrusted export against owner-retained identity and chain pins.
+    Verify(AuditVerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -114,6 +118,25 @@ struct AuditExportArgs {
     /// Maximum events in this page. Hard limited to 1000.
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_AUDIT_EXPORT_EVENTS)))]
     limit: u32,
+}
+
+#[derive(Debug, Args)]
+struct AuditVerifyArgs {
+    /// Strict JSON audit export already present on this machine.
+    #[arg(long)]
+    input: PathBuf,
+    /// Owner-retained stable NodeId expected in the signed export.
+    #[arg(long)]
+    expected_node_id: Uuid,
+    /// Owner-retained SHA-256 of the expected node device public key.
+    #[arg(long)]
+    expected_node_key_id_sha256: String,
+    /// Exact exclusive cursor used when requesting this page.
+    #[arg(long)]
+    expected_after_sequence: u64,
+    /// Previous page's final event hash, or 64 zeroes for the genesis page.
+    #[arg(long)]
+    expected_anchor_sha256: String,
 }
 
 #[derive(Debug, Args)]
@@ -352,6 +375,7 @@ async fn main() -> Result<()> {
 fn audit(command: AuditCommand) -> Result<()> {
     match command {
         AuditCommand::Export(args) => audit_export(args),
+        AuditCommand::Verify(args) => audit_verify(args),
     }
 }
 
@@ -361,6 +385,23 @@ fn audit_export(args: AuditExportArgs) -> Result<()> {
     let store = open_store(&config)?;
     let export = export_local_audit(&store, &identity, args.after_sequence, args.limit, now()?)?;
     print_json(&export)
+}
+
+fn audit_verify(args: AuditVerifyArgs) -> Result<()> {
+    let receipt = verify_audit_export_file(
+        &args.input,
+        sovereign_node::protocol::NodeId::from_uuid(args.expected_node_id),
+        Sha256Digest(fixed_bytes::<32>(
+            &args.expected_node_key_id_sha256,
+            "expected node key SHA-256",
+        )?),
+        args.expected_after_sequence,
+        Sha256Digest(fixed_bytes::<32>(
+            &args.expected_anchor_sha256,
+            "expected audit anchor SHA-256",
+        )?),
+    )?;
+    print_json(&receipt)
 }
 
 fn update(command: UpdateCommand) -> Result<()> {

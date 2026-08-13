@@ -106,6 +106,11 @@ The LAN listener is disabled until the owner supplies a TLS certificate/key, at 
 paired client CA and leaf certificate, and an exact private or loopback bind address. Pairing and
 revocation commands are owner-local operations; run `sovereign-node --help` for the current CLI.
 
+`sovereign-node audit export` emits a bounded, redacted, node-signed journal page. Verify an
+exported page offline with `sovereign-node audit verify`, supplying the owner-retained NodeId,
+device-key SHA-256, expected cursor, and prior verified chain anchor. The verifier reads only a
+bounded no-follow regular file and does not open node state or contact a network.
+
 Inspect the durable authorization-time checkpoint with `sovereign-node clock status`. If an owner
 intentionally corrects the host clock backwards beyond policy, recovery is an explicit maintenance
 operation: stop the daemon, verify the new time independently, then run

@@ -218,6 +218,12 @@ prints JSON to standard output; it never opens a listener, writes an export
 file, or transmits evidence. See `AUDIT.md` for pagination, verification,
 redaction, key-rotation, and root-compromise limitations.
 
+The companion offline verifier reads one bounded no-follow regular JSON file
+and requires owner-supplied NodeId, device-key, cursor, and prior-anchor pins.
+It prints a concise continuation receipt only after structural, chain-page,
+signature, and exact-pin validation. It does not open node state or infer trust
+from values embedded only in the untrusted export.
+
 The journal is access controlled and may be hash-linked and node-signed for
 damage evidence. It is not claimed to be tamper-proof against an attacker with
 root access who can steal the node key and rewrite local storage. Export to an

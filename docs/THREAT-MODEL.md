@@ -216,7 +216,10 @@ preserves older replay/audit history without fabricating context.
 Local audit-export tests cover strict page bounds, full-chain verification,
 cursor and anchor semantics, domain-separated node signatures, key matching,
 multi-page continuity, action-context linkage, raw-value exclusion, and event
-or payload tamper rejection.
+or payload tamper rejection. Offline-verifier tests additionally cover explicit
+NodeId/device-key/cursor/anchor pins, malformed or oversized JSON,
+nonprogressing pages, concise continuation receipts, and no-follow regular-file
+input.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.

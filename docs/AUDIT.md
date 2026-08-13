@@ -25,6 +25,34 @@ immediately before the page. Continue with the last returned event sequence.
 An offset beyond the current tail is rejected rather than treated as an empty
 successful page.
 
+## Offline verification
+
+Verify a page only against identity and chain values retained separately by the
+owner. Do not copy the expected values out of the untrusted export itself.
+
+```text
+sovereign-node audit verify \
+  --input /absolute/path/to/audit-page.json \
+  --expected-node-id 11111111-1111-4111-8111-111111111111 \
+  --expected-node-key-id-sha256 1111111111111111111111111111111111111111111111111111111111111111 \
+  --expected-after-sequence 0 \
+  --expected-anchor-sha256 0000000000000000000000000000000000000000000000000000000000000000
+```
+
+The NodeId and device-key ID must come from a previously authenticated pairing,
+registration, or owner-retained identity-rotation record. For the genesis page,
+the cursor is zero and the anchor is 64 hexadecimal zeroes. For every later
+page, use `continuation_after_sequence` and `continuation_anchor_sha256` from
+the prior verified receipt. The receipt provides continuation values even when
+`has_more` is false, allowing a later poll to verify events appended afterward.
+
+The verifier accepts only a no-follow regular file of at most 32 MiB. It uses
+strict JSON decoding, verifies the signed canonical structure, then compares
+the signed NodeId, key ID, cursor, and anchor with all four owner-supplied pins.
+On success it prints a concise receipt; on any mismatch it exits without a
+successful receipt. It opens no node configuration or state database, contacts
+no network, and mutates nothing.
+
 ## Signature and chain checks
 
 Before signing a page, the node:
@@ -42,15 +70,21 @@ Before signing a page, the node:
 6. signs that payload with the node device Ed25519 key.
 
 The JSON includes the corresponding node public key and key ID. The library's
-`SignedAuditExportV1::verify` method rejects weak or mismatched keys, malformed
-pages, broken event hashes or links, inconsistent pagination, modified action
-contexts, and noncanonical or forged signatures. Established Ed25519 and
-SHA-256 implementations are used; the project defines no custom cryptography.
+`SignedAuditExportV1::verify` method and the pinned `audit verify` CLI reject
+weak or mismatched keys, malformed pages, broken event hashes or links,
+inconsistent or non-progressing pagination, modified action contexts, and
+noncanonical or forged signatures. Established Ed25519 and SHA-256
+implementations are used; the project defines no custom cryptography.
 
 The embedded key proves which device key signed the page. An owner correlates
 that key with the NodeId and any separately retained identity-rotation bindings.
 An export is not host attestation and does not prove that a root-compromised
 machine was honest when it produced the page.
+
+For a non-final page, the node signature binds the declared full-chain count
+and tail, but an offline verifier cannot independently re-hash events that are
+not present in that page. Verifying every page in order against the prior
+receipt establishes continuity for the events actually received.
 
 ## Redaction boundary
 

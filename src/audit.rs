@@ -4,9 +4,10 @@
 //! The node device key signs a canonical page so an owner can verify origin and
 //! detect changes after export. This is evidence, not remote attestation.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fs::File, io::Read, path::Path};
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -19,6 +20,7 @@ use crate::store::{
 
 const AUDIT_EXPORT_DOMAIN: &[u8] = b"sovereign-node/local-audit-export/v1\0";
 pub const MAX_AUDIT_EXPORT_EVENTS: u32 = 1_000;
+pub const MAX_AUDIT_EXPORT_JSON_BYTES: u64 = 32 * 1_024 * 1_024;
 
 #[derive(Debug, Error)]
 pub enum AuditExportError {
@@ -32,6 +34,14 @@ pub enum AuditExportError {
     Invalid(&'static str),
     #[error("audit export signature is invalid")]
     InvalidSignature,
+    #[error("audit export JSON is malformed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("audit export file could not be read: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("audit export exceeds the bounded JSON input limit")]
+    ResourceLimit,
+    #[error("audit export does not match the pinned {0}")]
+    PinMismatch(&'static str),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -86,6 +96,11 @@ impl AuditExportV1 {
         {
             return Err(AuditExportError::Invalid("event window is inconsistent"));
         }
+        if self.after_sequence == 0 && self.anchor_hash.0 != [0_u8; 32] {
+            return Err(AuditExportError::Invalid(
+                "genesis page anchor is not the zero hash",
+            ));
+        }
 
         let mut previous_hash = self.anchor_hash.0;
         let mut expected_sequence = self
@@ -112,6 +127,7 @@ impl AuditExportV1 {
             .map_or(self.after_sequence, |event| event.sequence);
         if last_sequence > self.chain_event_count
             || self.has_more != (last_sequence < self.chain_event_count)
+            || (self.has_more && self.events.is_empty())
         {
             return Err(AuditExportError::Invalid(
                 "pagination marker is inconsistent",
@@ -167,6 +183,26 @@ impl AuditExportV1 {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AuditVerificationReceiptV1 {
+    pub schema_version: u16,
+    pub verification: &'static str,
+    pub node_id: String,
+    pub node_key_id_sha256: String,
+    pub export_generated_at_unix_ms: u64,
+    pub after_sequence: u64,
+    pub anchor_sha256: String,
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+    pub event_count: u32,
+    pub action_context_count: u32,
+    pub chain_event_count: u64,
+    pub chain_tail_sha256: String,
+    pub has_more: bool,
+    pub continuation_after_sequence: u64,
+    pub continuation_anchor_sha256: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedAuditExportV1 {
@@ -191,6 +227,101 @@ impl SignedAuditExportV1 {
         key.verify_strict(&self.export.signing_bytes()?, &signature)
             .map_err(|_| AuditExportError::InvalidSignature)
     }
+}
+
+/// Verify a strict JSON page against owner-retained identity and chain pins.
+pub fn verify_audit_export_bytes(
+    input: &[u8],
+    expected_node_id: NodeId,
+    expected_node_key_id: Sha256Digest,
+    expected_after_sequence: u64,
+    expected_anchor_hash: Sha256Digest,
+) -> Result<AuditVerificationReceiptV1, AuditExportError> {
+    if input.len() > MAX_AUDIT_EXPORT_JSON_BYTES as usize {
+        return Err(AuditExportError::ResourceLimit);
+    }
+    let signed: SignedAuditExportV1 = serde_json::from_slice(input)?;
+    signed.verify()?;
+    if signed.export.node_id != expected_node_id {
+        return Err(AuditExportError::PinMismatch("NodeId"));
+    }
+    if signed.export.node_key_id != expected_node_key_id {
+        return Err(AuditExportError::PinMismatch("node device key ID"));
+    }
+    if signed.export.after_sequence != expected_after_sequence {
+        return Err(AuditExportError::PinMismatch("page cursor"));
+    }
+    if signed.export.anchor_hash != expected_anchor_hash {
+        return Err(AuditExportError::PinMismatch("page anchor"));
+    }
+
+    let first_sequence = signed.export.events.first().map(|event| event.sequence);
+    let last_event = signed.export.events.last();
+    let last_sequence = last_event.map(|event| event.sequence);
+    let continuation_after_sequence = last_sequence.unwrap_or(signed.export.after_sequence);
+    let continuation_anchor_sha256 = last_event.map_or_else(
+        || hex::encode(signed.export.chain_tail_hash.0),
+        |event| hex::encode(event.event_hash),
+    );
+    Ok(AuditVerificationReceiptV1 {
+        schema_version: 1,
+        verification: "verified",
+        node_id: signed.export.node_id.to_string(),
+        node_key_id_sha256: hex::encode(signed.export.node_key_id.0),
+        export_generated_at_unix_ms: signed.export.generated_at.0,
+        after_sequence: signed.export.after_sequence,
+        anchor_sha256: hex::encode(signed.export.anchor_hash.0),
+        first_sequence,
+        last_sequence,
+        event_count: u32::try_from(signed.export.events.len())
+            .map_err(|_| AuditExportError::ResourceLimit)?,
+        action_context_count: u32::try_from(signed.export.actions.len())
+            .map_err(|_| AuditExportError::ResourceLimit)?,
+        chain_event_count: signed.export.chain_event_count,
+        chain_tail_sha256: hex::encode(signed.export.chain_tail_hash.0),
+        has_more: signed.export.has_more,
+        continuation_after_sequence,
+        continuation_anchor_sha256,
+    })
+}
+
+/// Read and verify one untrusted export file without following a final symlink
+/// or accepting devices, FIFOs, sockets, directories, or unbounded input.
+pub fn verify_audit_export_file(
+    path: &Path,
+    expected_node_id: NodeId,
+    expected_node_key_id: Sha256Digest,
+    expected_after_sequence: u64,
+    expected_anchor_hash: Sha256Digest,
+) -> Result<AuditVerificationReceiptV1, AuditExportError> {
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    let length = metadata.len();
+    if !metadata.is_file() {
+        return Err(AuditExportError::Invalid(
+            "audit export input is not a regular file",
+        ));
+    }
+    if length > MAX_AUDIT_EXPORT_JSON_BYTES {
+        return Err(AuditExportError::ResourceLimit);
+    }
+    let capacity = usize::try_from(length).map_err(|_| AuditExportError::ResourceLimit)?;
+    let mut input = Vec::with_capacity(capacity);
+    file.take(MAX_AUDIT_EXPORT_JSON_BYTES.saturating_add(1))
+        .read_to_end(&mut input)?;
+    verify_audit_export_bytes(
+        &input,
+        expected_node_id,
+        expected_node_key_id,
+        expected_after_sequence,
+        expected_anchor_hash,
+    )
 }
 
 pub fn export_local_audit(
@@ -309,6 +440,65 @@ mod tests {
         assert!(first.export.actions.is_empty());
         assert_eq!(first.export.chain_event_count, 3);
 
+        let first_json = serde_json::to_vec_pretty(&first)?;
+        let receipt = verify_audit_export_bytes(
+            &first_json,
+            identity.node_id(),
+            identity.key_id(),
+            0,
+            Sha256Digest([0_u8; 32]),
+        )?;
+        assert_eq!(receipt.verification, "verified");
+        assert_eq!(receipt.first_sequence, Some(1));
+        assert_eq!(receipt.last_sequence, Some(2));
+        assert_eq!(receipt.event_count, 2);
+        assert_eq!(receipt.continuation_after_sequence, 2);
+        assert_eq!(
+            receipt.continuation_anchor_sha256,
+            hex::encode(first.export.events[1].event_hash)
+        );
+
+        assert!(matches!(
+            verify_audit_export_bytes(
+                &first_json,
+                NodeId(Uuid::new_v4()),
+                identity.key_id(),
+                0,
+                Sha256Digest([0_u8; 32]),
+            ),
+            Err(AuditExportError::PinMismatch("NodeId"))
+        ));
+        assert!(matches!(
+            verify_audit_export_bytes(
+                &first_json,
+                identity.node_id(),
+                Sha256Digest([0x55; 32]),
+                0,
+                Sha256Digest([0_u8; 32]),
+            ),
+            Err(AuditExportError::PinMismatch("node device key ID"))
+        ));
+        assert!(matches!(
+            verify_audit_export_bytes(
+                &first_json,
+                identity.node_id(),
+                identity.key_id(),
+                1,
+                Sha256Digest([0_u8; 32]),
+            ),
+            Err(AuditExportError::PinMismatch("page cursor"))
+        ));
+        assert!(matches!(
+            verify_audit_export_bytes(
+                &first_json,
+                identity.node_id(),
+                identity.key_id(),
+                0,
+                Sha256Digest([0x55; 32]),
+            ),
+            Err(AuditExportError::PinMismatch("page anchor"))
+        ));
+
         let second = export_local_audit(&store, &identity, 2, 2, UnixMillis(10_011))?;
         second.verify()?;
         assert_eq!(second.export.events.len(), 1);
@@ -334,9 +524,108 @@ mod tests {
         wrong_cursor.export.after_sequence = 1;
         assert!(wrong_cursor.verify().is_err());
 
+        let mut wrong_genesis_anchor = first.clone();
+        wrong_genesis_anchor.export.anchor_hash = Sha256Digest([0x55; 32]);
+        assert!(wrong_genesis_anchor.export.validate().is_err());
+
+        let mut empty_progress = first.clone();
+        empty_progress.export.events.clear();
+        assert!(empty_progress.export.validate().is_err());
+
+        let mut forged_json = serde_json::to_value(&first)?;
+        forged_json["export"]["generated_at"] = serde_json::json!(99_999);
+        assert!(
+            verify_audit_export_bytes(
+                &serde_json::to_vec(&forged_json)?,
+                identity.node_id(),
+                identity.key_id(),
+                0,
+                Sha256Digest([0_u8; 32]),
+            )
+            .is_err()
+        );
+        assert!(
+            verify_audit_export_bytes(
+                b"{malformed",
+                identity.node_id(),
+                identity.key_id(),
+                0,
+                Sha256Digest([0_u8; 32]),
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            verify_audit_export_bytes(
+                &vec![b'x'; MAX_AUDIT_EXPORT_JSON_BYTES as usize + 1],
+                identity.node_id(),
+                identity.key_id(),
+                0,
+                Sha256Digest([0_u8; 32]),
+            ),
+            Err(AuditExportError::ResourceLimit)
+        ));
+
         let mut extended = serde_json::to_value(&first)?;
         extended["export"]["events"][0]["untrusted_extra"] = serde_json::json!("misleading");
         assert!(serde_json::from_value::<SignedAuditExportV1>(extended).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn offline_verifier_reads_only_a_bounded_regular_nofollow_file() -> TestResult {
+        let directory = tempfile::TempDir::new()?;
+        let (identity, _) = NodeIdentity::load_or_initialize(
+            &directory.path().join("identity"),
+            "audit-verify-test",
+            UnixMillis(10_000),
+        )?;
+        let store = StateStore::open(directory.path().join("state.sqlite3"))?;
+        let signed = export_local_audit(&store, &identity, 0, 10, UnixMillis(10_001))?;
+        let export_path = directory.path().join("audit.json");
+        std::fs::write(&export_path, serde_json::to_vec_pretty(&signed)?)?;
+
+        let receipt = verify_audit_export_file(
+            &export_path,
+            identity.node_id(),
+            identity.key_id(),
+            0,
+            Sha256Digest([0_u8; 32]),
+        )?;
+        assert_eq!(receipt.event_count, 0);
+        assert_eq!(receipt.first_sequence, None);
+        assert_eq!(receipt.last_sequence, None);
+        assert!(!receipt.has_more);
+        assert_eq!(receipt.continuation_after_sequence, 0);
+        assert_eq!(receipt.continuation_anchor_sha256, hex::encode([0_u8; 32]));
+
+        assert!(
+            verify_audit_export_file(
+                directory.path(),
+                identity.node_id(),
+                identity.key_id(),
+                0,
+                Sha256Digest([0_u8; 32]),
+            )
+            .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let link = directory.path().join("audit-link.json");
+            symlink(&export_path, &link)?;
+            assert!(
+                verify_audit_export_file(
+                    &link,
+                    identity.node_id(),
+                    identity.key_id(),
+                    0,
+                    Sha256Digest([0_u8; 32]),
+                )
+                .is_err()
+            );
+        }
         Ok(())
     }
 
