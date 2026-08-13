@@ -519,7 +519,7 @@ fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>, Tr
 mod tests {
     use std::error::Error;
 
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -531,14 +531,44 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::authz::{AuthorizationEngine, AuthorizationError, Clock};
+    use crate::capabilities::CapabilityExecutor;
+    use crate::config::{
+        HealthConfig, NodeConfig, PolicyConfig, ProcessReportingConfig, RepositoryReportingConfig,
+        ResourceReportingConfig, ServiceReportingConfig,
+    };
+    use crate::identity::{NodeIdentity, key_id};
+    use crate::lifecycle::{LeaseKind, LifecycleLease};
     use crate::pairing::PairingKeyMaterialV1;
-    use crate::protocol::{Capability, PublicKeyBytes, Sha256Digest};
+    use crate::protocol::{
+        ActionArguments, ActionRequestV1, ActionStatus, ActionTarget, AgentId, AuthorityKind,
+        AuthorizationClaimsV1, AuthorizationId, Capability, NodeId, Nonce, PairingId,
+        PublicKeyBytes, ReplayProtectionV1, RequestId, Sha256Digest, SignatureBytes,
+        SignedActionV1, TaskId, UnixMillis, UserAuthorityV1,
+    };
+    use crate::resources::ResourceReporter;
+    use crate::runtime::{NodeRuntime, RuntimeCapacity};
     use crate::store::{
         CredentialRotationOutcome, PairingApproval, PendingPairingChallenge, RevocationOutcome,
         TrustedPeer, sha256,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    #[derive(Debug)]
+    struct ManualClock(u64);
+
+    impl ManualClock {
+        fn new(now: u64) -> Self {
+            Self(now)
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now(&self) -> Result<UnixMillis, AuthorizationError> {
+            Ok(UnixMillis(self.0))
+        }
+    }
 
     #[derive(Debug)]
     struct TestIdentity {
@@ -628,6 +658,18 @@ mod tests {
     ) -> TestResult<TrustedPeer> {
         let owner = SigningKey::generate(&mut OsRng);
         let broker = SigningKey::generate(&mut OsRng);
+        pair_transport_peer_with_keys(store, pki, peer_id, client, challenge_byte, &owner, &broker)
+    }
+
+    fn pair_transport_peer_with_keys(
+        store: &StateStore,
+        pki: &TestPki,
+        peer_id: &str,
+        client: &TestIdentity,
+        challenge_byte: u8,
+        owner: &SigningKey,
+        broker: &SigningKey,
+    ) -> TestResult<TrustedPeer> {
         let certificate_digest: [u8; 32] = Sha256::digest(client.certificate.as_ref()).into();
         let material = PairingKeyMaterialV1 {
             schema_version: 1,
@@ -667,6 +709,59 @@ mod tests {
             &challenge,
         )?;
         Ok(trusted)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signed_system_info_action(
+        node_id: NodeId,
+        pairing_id: PairingId,
+        owner_id: &str,
+        owner: &SigningKey,
+        broker: &SigningKey,
+        issued_at: UnixMillis,
+        request_id: RequestId,
+    ) -> TestResult<SignedActionV1> {
+        let request = ActionRequestV1::new(
+            request_id,
+            TaskId(Uuid::new_v4()),
+            AgentId(Uuid::new_v4()),
+            UserAuthorityV1 {
+                authority_id: AuthorizationId(Uuid::new_v4()),
+                owner_id: owner_id.to_owned(),
+                kind: AuthorityKind::OwnerInteractive,
+                approval_reason: Some("transport reconnect invariant".to_owned()),
+            },
+            node_id,
+            ActionTarget::Node,
+            ActionArguments::SystemInfo,
+            issued_at,
+            issued_at,
+            UnixMillis(issued_at.0 + 60_000),
+            ReplayProtectionV1 {
+                nonce: Nonce(sha256(request_id.as_uuid().as_bytes())),
+                sequence: 1,
+            },
+            AuthorizationClaimsV1 {
+                authorization_id: AuthorizationId(Uuid::new_v4()),
+                pairing_id,
+                trust_epoch: 1,
+                policy_version: 1,
+                permitted_capability: Capability::SystemInfo,
+                permitted_target_digest: Sha256Digest([0; 32]),
+                owner_key_id: key_id(&owner.verifying_key()),
+                broker_key_id: key_id(&broker.verifying_key()),
+            },
+        )?;
+        let owner_signature =
+            SignatureBytes::from_slice(&owner.sign(&request.owner_signing_bytes()?).to_bytes())?;
+        let mut action = SignedActionV1 {
+            request,
+            owner_signature,
+            broker_signature: SignatureBytes::from_slice(&broker.sign(b"placeholder").to_bytes())?,
+        };
+        action.broker_signature =
+            SignatureBytes::from_slice(&broker.sign(&action.broker_signing_bytes()?).to_bytes())?;
+        Ok(action)
     }
 
     fn client_config(
@@ -720,6 +815,58 @@ mod tests {
             .map(|_| ());
         let server = server.await?;
         Ok((client, server))
+    }
+
+    async fn accept_runtime_connection(
+        listener: Arc<TcpListener>,
+        trust: Arc<TransportTrust>,
+        runtime: Arc<NodeRuntime>,
+        store: Arc<StateStore>,
+        request_policy: TransportRequestPolicy,
+    ) -> Result<(), TransportError> {
+        let (tcp, _) = listener.accept().await?;
+        let acceptor = TlsAcceptor::from(trust.tls.clone());
+        let tls = acceptor.accept(tcp).await.map_err(TransportError::Io)?;
+        let session = authenticated_session(&tls, &trust.session_by_leaf)
+            .ok_or(TransportError::UnpairedClient)?;
+        ensure_session_current(&store, &session)?;
+        serve_connection(tls, session, runtime, store, request_policy).await
+    }
+
+    async fn connect_test_client(
+        address: std::net::SocketAddr,
+        config: Arc<ClientConfig>,
+    ) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
+        let tcp = TcpStream::connect(address).await?;
+        Ok(TlsConnector::from(config)
+            .connect(ServerName::try_from("localhost")?, tcp)
+            .await?)
+    }
+
+    async fn send_action_and_close(
+        stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+        action: &SignedActionV1,
+    ) -> TestResult<SignedActionResponseV1> {
+        let encoded = postcard::to_allocvec(action)?;
+        let length = u32::try_from(encoded.len())?;
+        stream.write_all(&length.to_be_bytes()).await?;
+        stream.write_all(&encoded).await?;
+        stream.flush().await?;
+
+        let mut response_length = [0_u8; 4];
+        stream.read_exact(&mut response_length).await?;
+        let response_length = usize::try_from(u32::from_be_bytes(response_length))?;
+        if response_length == 0 || response_length > MAX_WIRE_MESSAGE_BYTES {
+            return Err(std::io::Error::other("invalid response frame length").into());
+        }
+        let mut response = vec![0_u8; response_length];
+        stream.read_exact(&mut response).await?;
+        stream.shutdown().await?;
+        let (response, remainder) = postcard::take_from_bytes(&response)?;
+        if !remainder.is_empty() {
+            return Err(std::io::Error::other("non-canonical response frame").into());
+        }
+        Ok(response)
     }
 
     #[test]
@@ -887,6 +1034,161 @@ mod tests {
             }
         })
         .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_before_frame_does_not_reserve_and_reconnect_executes_once() -> TestResult {
+        let pki = test_pki()?;
+        let directory = tempfile::TempDir::new()?;
+        let data_dir = directory.path().join("node");
+        let now = u64::try_from(current_time_millis()?)?;
+        let (identity, created) = NodeIdentity::load_or_initialize(
+            &data_dir,
+            "transport-reconnect-test",
+            UnixMillis(now),
+        )?;
+        assert!(created);
+        let identity = Arc::new(identity);
+        let store = Arc::new(StateStore::open(data_dir.join("state.sqlite3"))?);
+        let owner = SigningKey::from_bytes(&[0x41; 32]);
+        let broker = SigningKey::from_bytes(&[0x42; 32]);
+        let trusted = pair_transport_peer_with_keys(
+            &store,
+            &pki,
+            "peer-reconnect",
+            &pki.paired_client,
+            4,
+            &owner,
+            &broker,
+        )?;
+
+        let policy = PolicyConfig {
+            enabled_capabilities: vec![Capability::SystemInfo],
+            ..PolicyConfig::default()
+        };
+        let config = Arc::new(NodeConfig {
+            data_dir: data_dir.clone(),
+            policy_version: 1,
+            listen: None,
+            tls: None,
+            policy,
+            file_roots: Default::default(),
+            read_roots: Default::default(),
+            approved_actions: Default::default(),
+            health: HealthConfig::default(),
+            resource_reporting: ResourceReportingConfig::default(),
+            process_reporting: ProcessReportingConfig::default(),
+            service_reporting: ServiceReportingConfig::default(),
+            repository_reporting: RepositoryReportingConfig::default(),
+            updates: None,
+        });
+        config.validate()?;
+        let policy_digest = Sha256Digest(config.policy_digest()?);
+        store.activate_policy(1, policy_digest.0, i64::try_from(now)?)?;
+        let clock = Arc::new(ManualClock::new(now + 10));
+        let authorization = AuthorizationEngine::new(
+            identity.node_id(),
+            store.clone(),
+            clock.clone(),
+            &config.policy,
+            config.policy_version,
+            policy_digest,
+        );
+        let executor = CapabilityExecutor::new(
+            config.clone(),
+            ResourceReporter::new(identity.node_id(), identity.device().clone()),
+        );
+        let runtime = Arc::new(NodeRuntime::new(
+            identity.clone(),
+            authorization,
+            executor,
+            store.clone(),
+            clock,
+            RuntimeCapacity {
+                max_concurrent_actions: 1,
+                queue_capacity: 1,
+            },
+            LifecycleLease::acquire(&data_dir, LeaseKind::Daemon)?,
+        ));
+        let trust = Arc::new(
+            build_transport_trust(&server_identity(&pki), &store)?
+                .ok_or_else(|| std::io::Error::other("transport trust missing"))?,
+        );
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await?);
+        let address = listener.local_addr()?;
+        let request_policy = TransportRequestPolicy {
+            max_frame: config.policy.max_frame_bytes,
+            peer_maximum_per_minute: config.policy.max_requests_per_peer_per_minute,
+            global_maximum_per_minute: config.policy.max_requests_global_per_minute,
+            maximum_clock_rollback_ms: i64::try_from(config.policy.max_clock_rollback_secs)?
+                .saturating_mul(1_000),
+        };
+        let request_id = RequestId(Uuid::new_v4());
+        let action = signed_system_info_action(
+            identity.node_id(),
+            PairingId(trusted.pairing_id),
+            "owner-peer-reconnect",
+            &owner,
+            &broker,
+            UnixMillis(now),
+            request_id,
+        )?;
+        let client_config = client_config(&pki, Some(&pki.paired_client))?;
+
+        let first_server = tokio::spawn(accept_runtime_connection(
+            listener.clone(),
+            trust.clone(),
+            runtime.clone(),
+            store.clone(),
+            request_policy,
+        ));
+        let mut interrupted = connect_test_client(address, client_config.clone()).await?;
+        let encoded = postcard::to_allocvec(&action)?;
+        interrupted
+            .write_all(&u32::try_from(encoded.len())?.to_be_bytes())
+            .await?;
+        interrupted.write_all(&encoded[..encoded.len() / 2]).await?;
+        interrupted.shutdown().await?;
+        let interrupted_result = first_server.await?;
+        assert!(matches!(interrupted_result, Err(TransportError::Io(_))));
+        assert!(store.action_audit_record(request_id.0)?.is_none());
+
+        let second_server = tokio::spawn(accept_runtime_connection(
+            listener.clone(),
+            trust.clone(),
+            runtime.clone(),
+            store.clone(),
+            request_policy,
+        ));
+        let mut reconnected = connect_test_client(address, client_config.clone()).await?;
+        let first_response = send_action_and_close(&mut reconnected, &action).await?;
+        assert_eq!(first_response.response.status, ActionStatus::Succeeded);
+        first_response.response.validate()?;
+        assert_eq!(
+            first_response.response_digest,
+            first_response.response.digest()?
+        );
+        let first_signature =
+            ed25519_dalek::Signature::from_slice(first_response.node_signature.as_bytes())?;
+        identity
+            .verifying_key()
+            .verify_strict(&first_response.response.signing_bytes()?, &first_signature)?;
+        assert!(second_server.await?.is_ok());
+        assert!(store.action_audit_record(request_id.0)?.is_some());
+
+        let third_server = tokio::spawn(accept_runtime_connection(
+            listener,
+            trust,
+            runtime,
+            store,
+            request_policy,
+        ));
+        let mut duplicate_connection = connect_test_client(address, client_config).await?;
+        let duplicate_response = send_action_and_close(&mut duplicate_connection, &action).await?;
+        assert_eq!(duplicate_response.response.status, ActionStatus::Duplicate);
+        duplicate_response.response.validate()?;
+        assert!(third_server.await?.is_ok());
         Ok(())
     }
 

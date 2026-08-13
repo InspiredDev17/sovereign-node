@@ -227,6 +227,10 @@ ordering, epoch sensitivity, and rejection of expired, revoked, duplicate, or
 wrong-node trust records. Coherent-state tests require the configured policy to
 match the durable activated version and digest, reject inactive or mismatched
 bindings, and verify trust, policy, and audit chain in one SQLite snapshot.
+Transport integration tests use real loopback TLS 1.3 sessions to interrupt a
+frame before canonical decoding, prove that no replay or action-audit record was
+created, reconnect with the complete signed envelope, verify the node-signed
+success, and confirm a second reconnect returns a non-executing duplicate.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.

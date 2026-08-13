@@ -186,6 +186,11 @@ authoritative request state.
 - A queued request that expires while disconnected is rejected.
 - Reconnection never resets revocation, replay, queue, or rate-limit state.
 
+The transport test harness exercises this boundary over real TLS 1.3 loopback
+connections: a partial-frame disconnect creates no reservation, the complete
+signed request succeeds after reauthentication, and its next delivery returns
+only a duplicate response.
+
 For an action whose side effect cannot be proven after a crash, the result is
 Indeterminate and requires owner reconciliation. The runtime must not guess and
 execute it again.
