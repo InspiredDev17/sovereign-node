@@ -50,7 +50,12 @@ const OWNER_ACTION_SIGNATURE_DOMAIN: &[u8] = b"sovereign-node/owner-action-signa
 const BROKER_ACTION_SIGNATURE_DOMAIN: &[u8] = b"sovereign-node/broker-action-signature/v1\0";
 const NODE_REGISTRATION_SIGNATURE_DOMAIN: &[u8] =
     b"sovereign-node/node-registration-signature/v1\0";
+const CAPABILITY_MANIFEST_DIGEST_DOMAIN: &[u8] = b"sovereign-node/capability-manifest-digest/v1\0";
+const NODE_IDENTITY_PROOF_SIGNATURE_DOMAIN: &[u8] =
+    b"sovereign-node/node-identity-proof-signature/v2\0";
 const ACTION_RESPONSE_SIGNATURE_DOMAIN: &[u8] = b"sovereign-node/action-response-signature/v1\0";
+
+pub const MAX_IDENTITY_PROOF_TTL_MILLIS: u64 = 5 * 60 * 1_000;
 
 macro_rules! uuid_id {
     ($name:ident) => {
@@ -863,6 +868,7 @@ pub enum KeyAlgorithm {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CryptographicIdentityV1 {
     pub algorithm: KeyAlgorithm,
     pub key_id: Sha256Digest,
@@ -872,6 +878,7 @@ pub struct CryptographicIdentityV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceIdentityV1 {
     /// Owner-selected name; it is not a hardware serial number.
     pub display_name: String,
@@ -897,6 +904,7 @@ pub enum Architecture {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlatformInfoV1 {
     pub os: OperatingSystemFamily,
     pub os_version: String,
@@ -904,6 +912,7 @@ pub struct PlatformInfoV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardwareSummaryV1 {
     pub logical_cpu_count: u16,
     pub physical_cpu_count: Option<u16>,
@@ -914,6 +923,7 @@ pub struct HardwareSummaryV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GpuDescriptionV1 {
     pub index: u16,
     pub vendor: String,
@@ -930,6 +940,7 @@ pub enum GpuMemoryKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SoftwareVersionV1 {
     pub version: String,
     pub build_id: String,
@@ -937,6 +948,7 @@ pub struct SoftwareVersionV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityManifestV1 {
     pub manifest_version: u64,
     /// An explicit set. Empty means the node accepts no remote actions.
@@ -945,6 +957,10 @@ pub struct CapabilityManifestV1 {
 }
 
 impl CapabilityManifestV1 {
+    pub fn digest(&self) -> Result<Sha256Digest, postcard::Error> {
+        digest_postcard(CAPABILITY_MANIFEST_DIGEST_DOMAIN, self)
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.capabilities.len() > MAX_CAPABILITIES {
             return Err(ValidationError::LimitExceeded("capability manifest"));
@@ -960,6 +976,7 @@ impl CapabilityManifestV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeRegistrationV1 {
     pub schema_version: u16,
     pub protocol_version: u16,
@@ -975,9 +992,123 @@ pub struct NodeRegistrationV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedNodeRegistrationV1 {
     pub registration: NodeRegistrationV1,
     /// Proof of possession for `registration.cryptographic_identity.public_key`.
+    pub node_signature: SignatureBytes,
+}
+
+/// Privacy-preserving summary of the currently active peer trust set. The
+/// digest binds exact active records without publishing peer identifiers or keys.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveTrustSummaryV1 {
+    pub active_peer_count: u32,
+    pub maximum_peer_trust_epoch: u64,
+    pub active_trust_set_digest: Sha256Digest,
+}
+
+/// Fresh, requester-bound proof of the node's public identity snapshot. This
+/// authenticates one statement; it grants no action authority and is not host attestation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeIdentityProofV2 {
+    pub schema_version: u16,
+    pub registration: NodeRegistrationV1,
+    pub capability_manifest_digest: Sha256Digest,
+    pub local_policy_digest: Sha256Digest,
+    pub active_trust: ActiveTrustSummaryV1,
+    pub requester_challenge: Nonce,
+    pub issued_at: UnixMillis,
+    pub expires_at: UnixMillis,
+}
+
+impl NodeIdentityProofV2 {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        domain_separated_postcard(NODE_IDENTITY_PROOF_SIGNATURE_DOMAIN, self)
+    }
+
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version != 2 {
+            return Err(ValidationError::UnsupportedSchemaVersion(
+                self.schema_version,
+            ));
+        }
+        self.registration.validate()?;
+        if self.registration.generated_at != self.issued_at {
+            return Err(ValidationError::InvalidValue(
+                "identity proof generation time",
+            ));
+        }
+        let expected_key_id = Sha256Digest(
+            Sha256::digest(self.registration.cryptographic_identity.public_key.0).into(),
+        );
+        if expected_key_id != self.registration.cryptographic_identity.key_id {
+            return Err(ValidationError::InvalidValue("node key ID"));
+        }
+        if self
+            .registration
+            .capability_manifest
+            .digest()
+            .map_err(|_| ValidationError::InvalidValue("capability manifest canonical encoding"))?
+            != self.capability_manifest_digest
+        {
+            return Err(ValidationError::InvalidValue("capability manifest digest"));
+        }
+        if self.local_policy_digest.0 == [0_u8; 32]
+            || self.registration.capability_manifest.manifest_version == 0
+        {
+            return Err(ValidationError::InvalidValue("local policy binding"));
+        }
+        if self.requester_challenge.0 == [0_u8; NONCE_LENGTH]
+            || self.issued_at.0 >= self.expires_at.0
+            || self.expires_at.0.saturating_sub(self.issued_at.0) > MAX_IDENTITY_PROOF_TTL_MILLIS
+        {
+            return Err(ValidationError::InvalidValue(
+                "identity proof freshness bounds",
+            ));
+        }
+        match self.active_trust.active_peer_count {
+            0 if self.registration.trust_status == TrustStatus::Unpaired
+                && self.active_trust.maximum_peer_trust_epoch == 0 => {}
+            count
+                if count > 0
+                    && self.registration.trust_status == TrustStatus::Trusted
+                    && self.active_trust.maximum_peer_trust_epoch > 0 => {}
+            _ => {
+                return Err(ValidationError::InvalidValue("active trust summary"));
+            }
+        }
+        if self.active_trust.active_trust_set_digest.0 == [0_u8; 32] {
+            return Err(ValidationError::InvalidValue("active trust set digest"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_freshness(
+        &self,
+        now: UnixMillis,
+        expected_challenge: Nonce,
+    ) -> Result<(), ValidationError> {
+        self.validate()?;
+        if self.requester_challenge != expected_challenge {
+            return Err(ValidationError::InvalidValue("requester challenge"));
+        }
+        if now.0 < self.issued_at.0 {
+            return Err(ValidationError::NotYetValid);
+        }
+        if now.0 >= self.expires_at.0 {
+            return Err(ValidationError::Expired);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedNodeIdentityProofV2 {
+    pub proof: NodeIdentityProofV2,
     pub node_signature: SignatureBytes,
 }
 

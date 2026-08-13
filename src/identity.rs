@@ -1,9 +1,11 @@
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
+use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -11,17 +13,21 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::protocol::{
-    CapabilityManifestV1, CryptographicIdentityV1, DeviceIdentityV1, KeyAlgorithm, NodeId,
-    NodeRegistrationV1, PROTOCOL_VERSION_V1, PublicKeyBytes, SCHEMA_VERSION_V1, Sha256Digest,
-    SignatureBytes, TrustStatus, UnixMillis,
+    ActiveTrustSummaryV1, CapabilityManifestV1, CryptographicIdentityV1, DeviceIdentityV1,
+    KeyAlgorithm, NodeId, NodeIdentityProofV2, NodeRegistrationV1, Nonce, PROTOCOL_VERSION_V1,
+    PublicKeyBytes, SCHEMA_VERSION_V1, Sha256Digest, SignatureBytes, SignedNodeIdentityProofV2,
+    TrustStatus, UnixMillis, ValidationError,
 };
 use crate::resources::ResourceReporter;
 use crate::security::{
     SecureFileError, create_private_file, ensure_private_directory, read_private_file,
 };
+use crate::store::{StoreError, TrustedPeer};
 
 const IDENTITY_FILENAME: &str = "identity.json";
 const IDENTITY_ROTATION_DOMAIN: &[u8] = b"sovereign-node/device-identity-rotation/v1\0";
+const ACTIVE_TRUST_SET_DOMAIN: &[u8] = b"sovereign-node/active-trust-set/v1\0";
+pub const MAX_IDENTITY_PROOF_JSON_BYTES: u64 = 1_048_576;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +75,78 @@ pub enum IdentityError {
     Io(#[from] std::io::Error),
     #[error("identity signature could not be encoded")]
     SignatureEncoding,
+}
+
+#[derive(Debug, Error)]
+pub enum IdentityProofError {
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("identity proof is invalid: {0}")]
+    Validation(#[from] ValidationError),
+    #[error("identity proof canonical encoding failed: {0}")]
+    Codec(#[from] postcard::Error),
+    #[error("identity proof JSON is malformed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("identity proof file could not be read: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("identity proof exceeds the bounded JSON input limit")]
+    ResourceLimit,
+    #[error("identity proof signature is invalid")]
+    InvalidSignature,
+    #[error("identity proof does not match the pinned {0}")]
+    PinMismatch(&'static str),
+    #[error("active trust snapshot is inconsistent")]
+    InvalidTrustSnapshot,
+    #[error("identity proof input is invalid: {0}")]
+    InvalidInput(&'static str),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct IdentityProofVerificationReceiptV1 {
+    pub schema_version: u16,
+    pub verification: &'static str,
+    pub node_id: String,
+    pub node_key_id_sha256: String,
+    pub challenge_sha256: String,
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub capability_manifest_version: u64,
+    pub capability_manifest_sha256: String,
+    pub local_policy_sha256: String,
+    pub trust_status: TrustStatus,
+    pub active_peer_count: u32,
+    pub maximum_peer_trust_epoch: u64,
+    pub active_trust_set_sha256: String,
+    pub device_rotation_counter: u64,
+}
+
+#[derive(Debug)]
+pub struct IdentityProofRequest<'a> {
+    pub manifest: CapabilityManifestV1,
+    pub local_policy_digest: Sha256Digest,
+    pub active_peers: &'a [TrustedPeer],
+    pub trust_observed_at_unix_ms: i64,
+    pub requester_challenge: Nonce,
+    pub issued_at: UnixMillis,
+    pub expires_at: UnixMillis,
+}
+
+#[derive(Serialize)]
+struct ActiveTrustDigestV1 {
+    schema_version: u16,
+    node_id: NodeId,
+    peers: Vec<ActiveTrustDigestEntryV1>,
+}
+
+#[derive(Serialize)]
+struct ActiveTrustDigestEntryV1 {
+    pairing_id: Uuid,
+    identity_digest: Sha256Digest,
+    capability_manifest_digest: Sha256Digest,
+    trust_epoch: u64,
+    trust_expires_at_unix_ms: Option<i64>,
 }
 
 impl NodeIdentity {
@@ -199,6 +277,47 @@ impl NodeIdentity {
         }
     }
 
+    pub fn fresh_identity_proof(
+        &self,
+        request: IdentityProofRequest<'_>,
+    ) -> Result<SignedNodeIdentityProofV2, IdentityProofError> {
+        let active_trust = active_trust_summary(
+            self.node_id(),
+            request.active_peers,
+            request.trust_observed_at_unix_ms,
+        )?;
+        let trust_status = if active_trust.active_peer_count == 0 {
+            TrustStatus::Unpaired
+        } else {
+            TrustStatus::Trusted
+        };
+        let capability_manifest_digest = request.manifest.digest()?;
+        let proof = NodeIdentityProofV2 {
+            schema_version: 2,
+            registration: self.registration(request.manifest, trust_status, request.issued_at),
+            capability_manifest_digest,
+            local_policy_digest: request.local_policy_digest,
+            active_trust,
+            requester_challenge: request.requester_challenge,
+            issued_at: request.issued_at,
+            expires_at: request.expires_at,
+        };
+        proof.validate()?;
+        let node_signature = self.sign(&proof.signing_bytes()?)?;
+        let signed = SignedNodeIdentityProofV2 {
+            proof,
+            node_signature,
+        };
+        verify_identity_proof(
+            &signed,
+            self.node_id(),
+            self.key_id(),
+            request.requester_challenge,
+            request.issued_at,
+        )?;
+        Ok(signed)
+    }
+
     /// Rotates only the device identity key. It preserves the stable NodeId and installation ID.
     /// The returned binding is signed by both the old and new keys for audit/proof of possession.
     pub fn rotate_locally(
@@ -274,6 +393,164 @@ impl NodeIdentity {
             signing_key: self.signing_key.to_bytes(),
         }
     }
+}
+
+pub fn active_trust_summary(
+    node_id: NodeId,
+    peers: &[TrustedPeer],
+    now_unix_ms: i64,
+) -> Result<ActiveTrustSummaryV1, IdentityProofError> {
+    let mut ordered = peers.to_vec();
+    ordered.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+    if ordered
+        .windows(2)
+        .any(|pair| pair[0].peer_id == pair[1].peer_id)
+        || ordered.iter().any(|peer| {
+            peer.node_id != node_id.to_string()
+                || peer.trust_epoch == 0
+                || !peer.is_currently_trusted(now_unix_ms)
+        })
+    {
+        return Err(IdentityProofError::InvalidTrustSnapshot);
+    }
+    let maximum_peer_trust_epoch = ordered
+        .iter()
+        .map(|peer| peer.trust_epoch)
+        .max()
+        .unwrap_or(0);
+    let active_peer_count =
+        u32::try_from(ordered.len()).map_err(|_| IdentityProofError::ResourceLimit)?;
+    let digest_record = ActiveTrustDigestV1 {
+        schema_version: 1,
+        node_id,
+        peers: ordered
+            .into_iter()
+            .map(|peer| ActiveTrustDigestEntryV1 {
+                pairing_id: peer.pairing_id,
+                identity_digest: Sha256Digest(peer.identity_digest),
+                capability_manifest_digest: Sha256Digest(peer.capability_manifest_digest),
+                trust_epoch: peer.trust_epoch,
+                trust_expires_at_unix_ms: peer.trust_expires_at_unix_ms,
+            })
+            .collect(),
+    };
+    let encoded = postcard::to_allocvec(&digest_record)?;
+    let mut hasher = Sha256::new();
+    hasher.update(ACTIVE_TRUST_SET_DOMAIN);
+    hasher.update(encoded);
+    Ok(ActiveTrustSummaryV1 {
+        active_peer_count,
+        maximum_peer_trust_epoch,
+        active_trust_set_digest: Sha256Digest(hasher.finalize().into()),
+    })
+}
+
+pub fn verify_identity_proof(
+    signed: &SignedNodeIdentityProofV2,
+    expected_node_id: NodeId,
+    expected_node_key_id: Sha256Digest,
+    expected_challenge: Nonce,
+    now: UnixMillis,
+) -> Result<IdentityProofVerificationReceiptV1, IdentityProofError> {
+    signed.proof.validate_freshness(now, expected_challenge)?;
+    if signed.proof.registration.node_id != expected_node_id {
+        return Err(IdentityProofError::PinMismatch("NodeId"));
+    }
+    if signed.proof.registration.cryptographic_identity.key_id != expected_node_key_id {
+        return Err(IdentityProofError::PinMismatch("node device key ID"));
+    }
+    let public_key = signed.proof.registration.cryptographic_identity.public_key;
+    let key = VerifyingKey::from_bytes(&public_key.0)
+        .map_err(|_| IdentityProofError::InvalidSignature)?;
+    if key.is_weak() {
+        return Err(IdentityProofError::InvalidSignature);
+    }
+    let signature = Signature::from_slice(signed.node_signature.as_bytes())
+        .map_err(|_| IdentityProofError::InvalidSignature)?;
+    key.verify_strict(&signed.proof.signing_bytes()?, &signature)
+        .map_err(|_| IdentityProofError::InvalidSignature)?;
+    Ok(IdentityProofVerificationReceiptV1 {
+        schema_version: 1,
+        verification: "verified",
+        node_id: signed.proof.registration.node_id.to_string(),
+        node_key_id_sha256: hex::encode(expected_node_key_id.0),
+        challenge_sha256: hex::encode(Sha256::digest(expected_challenge.0)),
+        issued_at_unix_ms: signed.proof.issued_at.0,
+        expires_at_unix_ms: signed.proof.expires_at.0,
+        capability_manifest_version: signed
+            .proof
+            .registration
+            .capability_manifest
+            .manifest_version,
+        capability_manifest_sha256: hex::encode(signed.proof.capability_manifest_digest.0),
+        local_policy_sha256: hex::encode(signed.proof.local_policy_digest.0),
+        trust_status: signed.proof.registration.trust_status,
+        active_peer_count: signed.proof.active_trust.active_peer_count,
+        maximum_peer_trust_epoch: signed.proof.active_trust.maximum_peer_trust_epoch,
+        active_trust_set_sha256: hex::encode(signed.proof.active_trust.active_trust_set_digest.0),
+        device_rotation_counter: signed
+            .proof
+            .registration
+            .cryptographic_identity
+            .rotation_counter,
+    })
+}
+
+pub fn verify_identity_proof_bytes(
+    input: &[u8],
+    expected_node_id: NodeId,
+    expected_node_key_id: Sha256Digest,
+    expected_challenge: Nonce,
+    now: UnixMillis,
+) -> Result<IdentityProofVerificationReceiptV1, IdentityProofError> {
+    if input.len() > MAX_IDENTITY_PROOF_JSON_BYTES as usize {
+        return Err(IdentityProofError::ResourceLimit);
+    }
+    let signed: SignedNodeIdentityProofV2 = serde_json::from_slice(input)?;
+    verify_identity_proof(
+        &signed,
+        expected_node_id,
+        expected_node_key_id,
+        expected_challenge,
+        now,
+    )
+}
+
+pub fn verify_identity_proof_file(
+    path: &Path,
+    expected_node_id: NodeId,
+    expected_node_key_id: Sha256Digest,
+    expected_challenge: Nonce,
+    now: UnixMillis,
+) -> Result<IdentityProofVerificationReceiptV1, IdentityProofError> {
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(IdentityProofError::InvalidInput(
+            "identity proof input is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_IDENTITY_PROOF_JSON_BYTES {
+        return Err(IdentityProofError::ResourceLimit);
+    }
+    let capacity =
+        usize::try_from(metadata.len()).map_err(|_| IdentityProofError::ResourceLimit)?;
+    let mut input = Vec::with_capacity(capacity);
+    file.take(MAX_IDENTITY_PROOF_JSON_BYTES.saturating_add(1))
+        .read_to_end(&mut input)?;
+    verify_identity_proof_bytes(
+        &input,
+        expected_node_id,
+        expected_node_key_id,
+        expected_challenge,
+        now,
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -352,6 +629,34 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::protocol::Capability;
+    use crate::store::TrustStatus as StoreTrustStatus;
+
+    fn manifest(generated_at: UnixMillis) -> CapabilityManifestV1 {
+        CapabilityManifestV1 {
+            manifest_version: 7,
+            capabilities: vec![Capability::SystemInfo, Capability::ResourceStatus],
+            generated_at,
+        }
+    }
+
+    fn trusted_peer(node_id: NodeId, peer_id: &str, epoch: u64) -> TrustedPeer {
+        TrustedPeer {
+            peer_id: peer_id.to_owned(),
+            pairing_id: Uuid::new_v4(),
+            node_id: node_id.to_string(),
+            device_label: "redacted-in-proof".to_owned(),
+            public_key: vec![0x42; 32],
+            identity_digest: Sha256::digest(format!("identity:{peer_id}")).into(),
+            capability_manifest_digest: Sha256::digest(format!("manifest:{peer_id}")).into(),
+            status: StoreTrustStatus::Active,
+            trust_epoch: epoch,
+            paired_at_unix_ms: 900,
+            trust_expires_at_unix_ms: Some(2_000),
+            last_key_rotation_at_unix_ms: None,
+            revoked_at_unix_ms: None,
+        }
+    }
 
     #[test]
     fn node_identity_is_stable_across_restart() -> Result<(), Box<dyn std::error::Error>> {
@@ -391,6 +696,290 @@ mod tests {
                 .rotate_locally(temp.path(), UnixMillis(2_000), false)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_identity_proof_is_challenge_bound_expiring_and_strict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let (identity, _) =
+            NodeIdentity::load_or_initialize(temp.path(), "test-node", UnixMillis(1_000))?;
+        let challenge = Nonce([0x11; 32]);
+        let signed = identity.fresh_identity_proof(IdentityProofRequest {
+            manifest: manifest(UnixMillis(1_000)),
+            local_policy_digest: Sha256Digest([0x22; 32]),
+            active_peers: &[],
+            trust_observed_at_unix_ms: 1_000,
+            requester_challenge: challenge,
+            issued_at: UnixMillis(1_000),
+            expires_at: UnixMillis(1_100),
+        })?;
+
+        let receipt = verify_identity_proof(
+            &signed,
+            identity.node_id(),
+            identity.key_id(),
+            challenge,
+            UnixMillis(1_050),
+        )?;
+        assert_eq!(receipt.verification, "verified");
+        assert_eq!(receipt.trust_status, TrustStatus::Unpaired);
+        assert_eq!(receipt.active_peer_count, 0);
+        assert_eq!(receipt.capability_manifest_version, 7);
+        assert_eq!(
+            receipt.challenge_sha256,
+            hex::encode(Sha256::digest(challenge.0))
+        );
+
+        assert!(
+            verify_identity_proof(
+                &signed,
+                identity.node_id(),
+                identity.key_id(),
+                Nonce([0x12; 32]),
+                UnixMillis(1_050),
+            )
+            .is_err()
+        );
+        assert!(
+            verify_identity_proof(
+                &signed,
+                identity.node_id(),
+                identity.key_id(),
+                challenge,
+                UnixMillis(1_100),
+            )
+            .is_err()
+        );
+        assert!(
+            verify_identity_proof(
+                &signed,
+                identity.node_id(),
+                identity.key_id(),
+                challenge,
+                UnixMillis(999),
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            verify_identity_proof(
+                &signed,
+                NodeId(Uuid::new_v4()),
+                identity.key_id(),
+                challenge,
+                UnixMillis(1_050),
+            ),
+            Err(IdentityProofError::PinMismatch("NodeId"))
+        ));
+        assert!(matches!(
+            verify_identity_proof(
+                &signed,
+                identity.node_id(),
+                Sha256Digest([0x33; 32]),
+                challenge,
+                UnixMillis(1_050),
+            ),
+            Err(IdentityProofError::PinMismatch("node device key ID"))
+        ));
+
+        let mut forged_policy = signed.clone();
+        forged_policy.proof.local_policy_digest = Sha256Digest([0x44; 32]);
+        assert!(
+            verify_identity_proof(
+                &forged_policy,
+                identity.node_id(),
+                identity.key_id(),
+                challenge,
+                UnixMillis(1_050),
+            )
+            .is_err()
+        );
+
+        let mut forged_manifest = signed.clone();
+        forged_manifest
+            .proof
+            .registration
+            .capability_manifest
+            .capabilities
+            .clear();
+        assert!(
+            verify_identity_proof(
+                &forged_manifest,
+                identity.node_id(),
+                identity.key_id(),
+                challenge,
+                UnixMillis(1_050),
+            )
+            .is_err()
+        );
+
+        let mut wrong_signature = signed.clone();
+        wrong_signature.node_signature = SignatureBytes::from_slice(&[0_u8; 64])?;
+        assert!(
+            verify_identity_proof(
+                &wrong_signature,
+                identity.node_id(),
+                identity.key_id(),
+                challenge,
+                UnixMillis(1_050),
+            )
+            .is_err()
+        );
+
+        let mut extended = serde_json::to_value(&signed)?;
+        extended["proof"]["registration"]["device"]["untrusted_extra"] =
+            serde_json::json!("misleading");
+        assert!(serde_json::from_value::<SignedNodeIdentityProofV2>(extended).is_err());
+
+        assert!(
+            identity
+                .fresh_identity_proof(IdentityProofRequest {
+                    manifest: manifest(UnixMillis(1_000)),
+                    local_policy_digest: Sha256Digest([0x22; 32]),
+                    active_peers: &[],
+                    trust_observed_at_unix_ms: 1_000,
+                    requester_challenge: challenge,
+                    issued_at: UnixMillis(1_000),
+                    expires_at: UnixMillis(
+                        1_000 + crate::protocol::MAX_IDENTITY_PROOF_TTL_MILLIS + 1,
+                    ),
+                })
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_trust_digest_is_ordered_private_and_epoch_sensitive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let (identity, _) =
+            NodeIdentity::load_or_initialize(temp.path(), "test-node", UnixMillis(1_000))?;
+        let node_id = identity.node_id();
+        let alpha = trusted_peer(node_id, "alpha-peer", 2);
+        let bravo = trusted_peer(node_id, "bravo-peer", 5);
+        let first = active_trust_summary(node_id, &[alpha.clone(), bravo.clone()], 1_000)?;
+        let reordered = active_trust_summary(node_id, &[bravo.clone(), alpha.clone()], 1_000)?;
+        assert_eq!(first, reordered);
+        assert_eq!(first.active_peer_count, 2);
+        assert_eq!(first.maximum_peer_trust_epoch, 5);
+
+        let challenge = Nonce([0x61; 32]);
+        let signed = identity.fresh_identity_proof(IdentityProofRequest {
+            manifest: manifest(UnixMillis(1_000)),
+            local_policy_digest: Sha256Digest([0x62; 32]),
+            active_peers: &[alpha.clone(), bravo.clone()],
+            trust_observed_at_unix_ms: 1_000,
+            requester_challenge: challenge,
+            issued_at: UnixMillis(1_000),
+            expires_at: UnixMillis(2_000),
+        })?;
+        let receipt = verify_identity_proof(
+            &signed,
+            node_id,
+            identity.key_id(),
+            challenge,
+            UnixMillis(1_500),
+        )?;
+        assert_eq!(receipt.trust_status, TrustStatus::Trusted);
+        assert_eq!(receipt.active_peer_count, 2);
+        assert_eq!(receipt.maximum_peer_trust_epoch, 5);
+        let json = serde_json::to_string(&signed)?;
+        for excluded in ["alpha-peer", "bravo-peer", "redacted-in-proof"] {
+            assert!(!json.contains(excluded), "identity proof leaked {excluded}");
+        }
+
+        let mut rotated = bravo.clone();
+        rotated.trust_epoch = 6;
+        let changed = active_trust_summary(node_id, &[alpha.clone(), rotated], 1_000)?;
+        assert_ne!(
+            first.active_trust_set_digest,
+            changed.active_trust_set_digest
+        );
+        assert_eq!(changed.maximum_peer_trust_epoch, 6);
+
+        let mut expired = alpha.clone();
+        expired.trust_expires_at_unix_ms = Some(1_000);
+        assert!(active_trust_summary(node_id, &[expired], 1_000).is_err());
+
+        let mut revoked = alpha.clone();
+        revoked.status = StoreTrustStatus::Revoked;
+        assert!(active_trust_summary(node_id, &[revoked], 1_000).is_err());
+
+        let mut wrong_node = alpha.clone();
+        wrong_node.node_id = Uuid::new_v4().to_string();
+        assert!(active_trust_summary(node_id, &[wrong_node], 1_000).is_err());
+        assert!(active_trust_summary(node_id, &[alpha.clone(), alpha], 1_000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn identity_proof_verifier_reads_only_bounded_regular_nofollow_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let (identity, _) = NodeIdentity::load_or_initialize(
+            &temp.path().join("identity"),
+            "test-node",
+            UnixMillis(1_000),
+        )?;
+        let challenge = Nonce([0x51; 32]);
+        let signed = identity.fresh_identity_proof(IdentityProofRequest {
+            manifest: manifest(UnixMillis(1_000)),
+            local_policy_digest: Sha256Digest([0x52; 32]),
+            active_peers: &[],
+            trust_observed_at_unix_ms: 1_000,
+            requester_challenge: challenge,
+            issued_at: UnixMillis(1_000),
+            expires_at: UnixMillis(2_000),
+        })?;
+        let path = temp.path().join("proof.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&signed)?)?;
+        verify_identity_proof_file(
+            &path,
+            identity.node_id(),
+            identity.key_id(),
+            challenge,
+            UnixMillis(1_500),
+        )?;
+        assert!(
+            verify_identity_proof_file(
+                temp.path(),
+                identity.node_id(),
+                identity.key_id(),
+                challenge,
+                UnixMillis(1_500),
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            verify_identity_proof_bytes(
+                &vec![b'x'; MAX_IDENTITY_PROOF_JSON_BYTES as usize + 1],
+                identity.node_id(),
+                identity.key_id(),
+                challenge,
+                UnixMillis(1_500),
+            ),
+            Err(IdentityProofError::ResourceLimit)
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let link = temp.path().join("proof-link.json");
+            symlink(&path, &link)?;
+            assert!(
+                verify_identity_proof_file(
+                    &link,
+                    identity.node_id(),
+                    identity.key_id(),
+                    challenge,
+                    UnixMillis(1_500),
+                )
+                .is_err()
+            );
+        }
         Ok(())
     }
 }

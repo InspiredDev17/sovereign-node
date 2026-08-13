@@ -20,15 +20,15 @@ use sovereign_node::config::{
     HealthConfig, NodeConfig, PolicyConfig, ProcessReportingConfig, RepositoryReportingConfig,
     ResourceReportingConfig, ServiceReportingConfig,
 };
-use sovereign_node::identity::NodeIdentity;
+use sovereign_node::identity::{IdentityProofRequest, NodeIdentity, verify_identity_proof_file};
 use sovereign_node::lifecycle::{LeaseKind, LifecycleLease};
 use sovereign_node::pairing::{
     CredentialRotationProof, CredentialRotationRequest, PairingKeyMaterialV1, PairingManager,
     PairingProof, PairingRecoveryProof, PairingRecoveryRequest, PairingRequest,
 };
 use sovereign_node::protocol::{
-    Capability, CapabilityManifestV1, ComponentHealthV1, PairingId, PublicKeyBytes, Sha256Digest,
-    SignatureBytes, SignedNodeRegistrationV1, TrustStatus, UnixMillis,
+    Capability, CapabilityManifestV1, ComponentHealthV1, NodeId, Nonce, PairingId, PublicKeyBytes,
+    Sha256Digest, SignatureBytes, SignedNodeRegistrationV1, TrustStatus, UnixMillis,
 };
 use sovereign_node::resources::{HealthReporter, ResourceReporter};
 use sovereign_node::runtime::{NodeRuntime, RuntimeCapacity};
@@ -58,6 +58,10 @@ enum Command {
     },
     /// Print a node-signed public registration (never private key material).
     Identity { config: PathBuf },
+    /// Emit a short-lived node identity proof bound to a requester challenge.
+    IdentityProof(IdentityProofArgs),
+    /// Verify a short-lived identity proof against owner-retained pins.
+    IdentityVerify(IdentityVerifyArgs),
     /// Inspect local trust/audit state without starting a listener.
     Status { config: PathBuf },
     /// Export a bounded, redacted, node-signed page of the local audit journal.
@@ -137,6 +141,34 @@ struct AuditVerifyArgs {
     /// Previous page's final event hash, or 64 zeroes for the genesis page.
     #[arg(long)]
     expected_anchor_sha256: String,
+}
+
+#[derive(Debug, Args)]
+struct IdentityProofArgs {
+    #[arg(long)]
+    config: PathBuf,
+    /// Requester-generated 32-byte random challenge in hexadecimal.
+    #[arg(long)]
+    challenge_hex: String,
+    /// Proof lifetime in seconds, hard limited to five minutes.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=300))]
+    ttl_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+struct IdentityVerifyArgs {
+    /// Strict JSON identity proof already present on this machine.
+    #[arg(long)]
+    input: PathBuf,
+    /// Owner-retained stable NodeId expected in the signed proof.
+    #[arg(long)]
+    expected_node_id: Uuid,
+    /// Owner-retained SHA-256 of the expected node device public key.
+    #[arg(long)]
+    expected_node_key_id_sha256: String,
+    /// The exact 32-byte requester challenge originally sent to the node.
+    #[arg(long)]
+    expected_challenge_hex: String,
 }
 
 #[derive(Debug, Args)]
@@ -362,6 +394,8 @@ async fn main() -> Result<()> {
         Command::Init(args) => init(args),
         Command::ConfigExample { data_dir } => config_example(&data_dir),
         Command::Identity { config } => identity(&config),
+        Command::IdentityProof(args) => identity_proof(args),
+        Command::IdentityVerify(args) => identity_verify(args),
         Command::Status { config } => status(&config),
         Command::Audit(command) => audit(command),
         Command::Pair(command) => pair(command),
@@ -563,6 +597,57 @@ fn identity(config_path: &Path) -> Result<()> {
         registration,
         node_signature,
     })
+}
+
+fn identity_proof(args: IdentityProofArgs) -> Result<()> {
+    let config = NodeConfig::load(&args.config)?;
+    let _admin_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::AdminMutation)?;
+    let identity = NodeIdentity::load(&config.data_dir)?;
+    let store = open_store(&config)?;
+    store.verify_audit_chain()?;
+    let issued_at = now()?;
+    let peers = store.currently_trusted_peers(to_i64(issued_at)?)?;
+    let expires_at = UnixMillis(
+        issued_at
+            .0
+            .checked_add(args.ttl_seconds.saturating_mul(1_000))
+            .context("identity proof expiry overflow")?,
+    );
+    let manifest = CapabilityManifestV1 {
+        manifest_version: config.policy_version,
+        capabilities: config.policy.enabled_capabilities.clone(),
+        generated_at: issued_at,
+    };
+    let proof = identity.fresh_identity_proof(IdentityProofRequest {
+        manifest,
+        local_policy_digest: Sha256Digest(config.policy_digest()?),
+        active_peers: &peers,
+        trust_observed_at_unix_ms: to_i64(issued_at)?,
+        requester_challenge: Nonce(fixed_bytes::<32>(
+            &args.challenge_hex,
+            "requester challenge",
+        )?),
+        issued_at,
+        expires_at,
+    })?;
+    print_json(&proof)
+}
+
+fn identity_verify(args: IdentityVerifyArgs) -> Result<()> {
+    let receipt = verify_identity_proof_file(
+        &args.input,
+        NodeId::from_uuid(args.expected_node_id),
+        Sha256Digest(fixed_bytes::<32>(
+            &args.expected_node_key_id_sha256,
+            "expected node key SHA-256",
+        )?),
+        Nonce(fixed_bytes::<32>(
+            &args.expected_challenge_hex,
+            "expected requester challenge",
+        )?),
+        now()?,
+    )?;
+    print_json(&receipt)
 }
 
 fn status(config_path: &Path) -> Result<()> {

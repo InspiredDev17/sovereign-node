@@ -83,6 +83,15 @@ trust generation, and revocation state. Private keys remain local with
 owner-only file permissions or an operating-system keystore when available.
 The store contains no Personal AI Platform secret.
 
+The legacy `identity` command emits a signed informational V1 snapshot. The
+fresh `identity-proof` path additionally binds a requester-generated 32-byte
+challenge, an expiry no more than five minutes after issuance, exact manifest
+and local-policy digests, and a digest of the current active peer-trust set.
+`identity-verify` requires separately retained NodeId and device-key pins plus
+the original challenge; it reads only bounded no-follow JSON and opens neither
+node state nor a network. These proofs authenticate a statement, not a host,
+and never authorize an action.
+
 ### Transport endpoint
 
 The initial remote transport is TLS 1.3 with mutual authentication on an

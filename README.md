@@ -26,6 +26,10 @@ trust.
 ## Security posture
 
 - Stable random `NodeId` and Ed25519 device identity created locally.
+- Challenge-bound identity proof V2 signs the exact capability-manifest and local-policy digests,
+  a privacy-preserving active-trust-set summary, requester nonce, and expiry of at most five
+  minutes. Offline verification requires owner-retained NodeId/key pins and the original nonce;
+  the proof grants no action authority and is not host attestation.
 - Explicit multi-step pairing with local owner approval, proof of both owner and broker keys,
   certificate pinning, expiry, a node-signed trust receipt, revocation, and durable audit records.
 - Pairing and credential rotation validate the submitted X.509 leaf and intermediates against the
