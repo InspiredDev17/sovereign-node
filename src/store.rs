@@ -31,7 +31,7 @@ use crate::lifecycle::{LeaseKind, LifecycleLease};
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const PEER_RATE_WINDOW_MS: i64 = 60_000;
 const ZERO_HASH: Sha256Digest = [0_u8; 32];
 const MAX_ID_BYTES: usize = 255;
@@ -101,6 +101,8 @@ pub enum StoreError {
     ReplayFingerprintMismatch,
     #[error("terminal response metadata conflicts with the immutable stored result")]
     TerminalResponseConflict,
+    #[error("execution-start metadata conflicts with the immutable stored state")]
+    ExecutionStartConflict,
     #[error("credential rotation does not match the currently trusted key")]
     CredentialRotationMismatch,
     #[error("credential rotation challenge was not found")]
@@ -638,26 +640,150 @@ pub struct ReplayReservation {
     pub replay_nonce: Sha256Digest,
     pub agent_id: String,
     pub node_id: String,
+    pub authority_id_digest: Sha256Digest,
+    pub owner_id_digest: Sha256Digest,
     pub capability: String,
     pub target_digest: Sha256Digest,
     pub arguments_digest: Sha256Digest,
     pub authorization_digest: Sha256Digest,
+    pub issued_at_unix_ms: i64,
+    pub not_before_unix_ms: i64,
     pub expires_at_unix_ms: i64,
 }
 
 impl ReplayReservation {
     pub fn fingerprint(&self) -> Result<Sha256Digest, StoreError> {
         self.validate()?;
-        Ok(sha256(&encode(self)?))
+        // Keep the original v1 layout stable across store-schema additions. The signed-envelope
+        // digest already binds authority and timing fields; audit-only metadata must not turn an
+        // exact request reserved by an older release into a false RequestId collision.
+        #[derive(Serialize)]
+        struct ReplayFingerprintV1<'a> {
+            request_id: Uuid,
+            task_id: Uuid,
+            pairing_id: Uuid,
+            trust_epoch: u64,
+            policy_version: u64,
+            policy_digest: Sha256Digest,
+            replay_sequence: u64,
+            replay_nonce: Sha256Digest,
+            agent_id: &'a str,
+            node_id: &'a str,
+            capability: &'a str,
+            target_digest: Sha256Digest,
+            arguments_digest: Sha256Digest,
+            authorization_digest: Sha256Digest,
+            expires_at_unix_ms: i64,
+        }
+        Ok(sha256(&encode(&ReplayFingerprintV1 {
+            request_id: self.request_id,
+            task_id: self.task_id,
+            pairing_id: self.pairing_id,
+            trust_epoch: self.trust_epoch,
+            policy_version: self.policy_version,
+            policy_digest: self.policy_digest,
+            replay_sequence: self.replay_sequence,
+            replay_nonce: self.replay_nonce,
+            agent_id: &self.agent_id,
+            node_id: &self.node_id,
+            capability: &self.capability,
+            target_digest: self.target_digest,
+            arguments_digest: self.arguments_digest,
+            authorization_digest: self.authorization_digest,
+            expires_at_unix_ms: self.expires_at_unix_ms,
+        })?))
     }
 
     fn validate(&self) -> Result<(), StoreError> {
         validate_identifier(&self.agent_id)?;
         validate_identifier(&self.node_id)?;
         validate_bounded_text(&self.capability, MAX_CAPABILITY_BYTES, "capability")?;
+        if self.issued_at_unix_ms > self.not_before_unix_ms
+            || self.not_before_unix_ms >= self.expires_at_unix_ms
+        {
+            return Err(StoreError::InvalidInput(
+                "invalid action authorization time bounds",
+            ));
+        }
         Ok(())
     }
 }
+
+/// Redacted, stable metadata that lets an owner correlate an action lifecycle
+/// without retaining raw targets, arguments, identities, credentials, or signatures.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActionAuditContextV1 {
+    pub schema_version: u16,
+    pub request_id: Uuid,
+    pub task_id: Uuid,
+    pub agent_id_digest: Sha256Digest,
+    pub authority_id_digest: Sha256Digest,
+    pub owner_id_digest: Sha256Digest,
+    pub node_id_digest: Sha256Digest,
+    pub pairing_id_digest: Sha256Digest,
+    pub capability: String,
+    pub target_digest: Sha256Digest,
+    pub arguments_digest: Sha256Digest,
+    pub authorization_digest: Sha256Digest,
+    pub policy_version: u64,
+    pub policy_digest: Sha256Digest,
+    pub issued_at_unix_ms: i64,
+    pub not_before_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+}
+
+impl ActionAuditContextV1 {
+    fn from_reservation(reservation: &ReplayReservation) -> Result<Self, StoreError> {
+        reservation.validate()?;
+        Ok(Self {
+            schema_version: 1,
+            request_id: reservation.request_id,
+            task_id: reservation.task_id,
+            agent_id_digest: sha256(reservation.agent_id.as_bytes()),
+            authority_id_digest: reservation.authority_id_digest,
+            owner_id_digest: reservation.owner_id_digest,
+            node_id_digest: sha256(reservation.node_id.as_bytes()),
+            pairing_id_digest: sha256(reservation.pairing_id.as_bytes()),
+            capability: reservation.capability.clone(),
+            target_digest: reservation.target_digest,
+            arguments_digest: reservation.arguments_digest,
+            authorization_digest: reservation.authorization_digest,
+            policy_version: reservation.policy_version,
+            policy_digest: reservation.policy_digest,
+            issued_at_unix_ms: reservation.issued_at_unix_ms,
+            not_before_unix_ms: reservation.not_before_unix_ms,
+            expires_at_unix_ms: reservation.expires_at_unix_ms,
+        })
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, StoreError> {
+        if self.schema_version != 1 {
+            return Err(StoreError::CorruptData(
+                "action audit context schema is unsupported",
+            ));
+        }
+        validate_bounded_text(&self.capability, MAX_CAPABILITY_BYTES, "capability")?;
+        Ok(sha256(&encode(self)?))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionAuditRecord {
+    pub context: ActionAuditContextV1,
+    pub context_digest: Sha256Digest,
+    pub reserved_at_unix_ms: i64,
+    pub execution_started_at_unix_ms: Option<i64>,
+    pub terminal: Option<TerminalResponseMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionStartOutcome {
+    Recorded,
+    AlreadyRecordedSame,
+}
+
+type ExecutionStartRow = (Vec<u8>, Option<Vec<u8>>, Vec<u8>, Option<i64>, Vec<u8>);
+type ActionAuditRow = (Vec<u8>, i64, Option<i64>, Option<Vec<u8>>, Vec<u8>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TerminalStatus {
@@ -684,6 +810,7 @@ pub struct TerminalResponseMetadata {
 pub enum ReplayOutcome {
     Reserved {
         fingerprint: Sha256Digest,
+        action_context_digest: Sha256Digest,
     },
     DuplicateSame {
         fingerprint: Sha256Digest,
@@ -729,6 +856,7 @@ pub enum AuditKind {
     UpdateStaged,
     ClockRollbackRejected,
     ClockRollbackAcknowledged,
+    ExecutionStarted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2495,6 +2623,8 @@ impl StateStore {
             return Err(StoreError::AuthorizationExpired);
         }
         let fingerprint = reservation.fingerprint()?;
+        let action_context = ActionAuditContextV1::from_reservation(reservation)?;
+        let action_context_digest = action_context.digest()?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -2681,8 +2811,21 @@ impl StateStore {
                     reservation.expires_at_unix_ms
                 ],
             )?;
+            transaction.execute(
+                "INSERT INTO action_audit_contexts
+                    (request_id, context_digest, execution_started_at_unix_ms, record)
+                 VALUES (?1, ?2, NULL, ?3)",
+                params![
+                    reservation.request_id.to_string(),
+                    &action_context_digest[..],
+                    encode(&action_context)?
+                ],
+            )?;
             (
-                ReplayOutcome::Reserved { fingerprint },
+                ReplayOutcome::Reserved {
+                    fingerprint,
+                    action_context_digest,
+                },
                 AuditKind::RequestReserved,
                 AuditOutcome::Accepted,
             )
@@ -2697,13 +2840,158 @@ impl StateStore {
                 request_id: Some(reservation.request_id),
                 actor_digest: Some(sha256(reservation.agent_id.as_bytes())),
                 subject_digest: Some(sha256(reservation.node_id.as_bytes())),
-                context_digest: Some(fingerprint),
+                context_digest: Some(if audit_kind == AuditKind::RequestReserved {
+                    action_context_digest
+                } else {
+                    fingerprint
+                }),
             },
         )?;
         transaction.commit()?;
         drop(connection);
         self.tighten_permissions()?;
         Ok(outcome)
+    }
+
+    /// Durably mark the exact point at which a reserved action may enter a
+    /// capability handler. Failure is fail-closed: callers must not dispatch.
+    pub fn record_execution_started(
+        &self,
+        request_id: Uuid,
+        expected_fingerprint: Sha256Digest,
+        expected_context_digest: Sha256Digest,
+        started_at_unix_ms: i64,
+    ) -> Result<ExecutionStartOutcome, StoreError> {
+        if started_at_unix_ms < 0 {
+            return Err(StoreError::InvalidInput(
+                "execution-start time cannot be negative",
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored: Option<ExecutionStartRow> = transaction
+            .query_row(
+                "SELECT r.request_fingerprint, r.terminal_record,
+                        a.context_digest, a.execution_started_at_unix_ms, a.record
+                 FROM request_replays r
+                 JOIN action_audit_contexts a ON a.request_id = r.request_id
+                 WHERE r.request_id = ?1",
+                [request_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((fingerprint, terminal, context_digest, existing_start, context_record)) = stored
+        else {
+            return Err(StoreError::ReplayNotFound);
+        };
+        if !constant_time_digest_eq(&digest_from_blob(fingerprint)?, &expected_fingerprint) {
+            return Err(StoreError::ReplayFingerprintMismatch);
+        }
+        if terminal.is_some() {
+            return Err(StoreError::ExecutionStartConflict);
+        }
+        let context_digest = digest_from_blob(context_digest)?;
+        if !constant_time_digest_eq(&context_digest, &expected_context_digest) {
+            return Err(StoreError::ExecutionStartConflict);
+        }
+        let context: ActionAuditContextV1 = decode(&context_record)?;
+        if context.request_id != request_id
+            || !constant_time_digest_eq(&context.digest()?, &context_digest)
+        {
+            return Err(StoreError::CorruptData(
+                "action audit context digest is inconsistent",
+            ));
+        }
+        let outcome = if let Some(existing_start) = existing_start {
+            if existing_start != started_at_unix_ms {
+                return Err(StoreError::ExecutionStartConflict);
+            }
+            ExecutionStartOutcome::AlreadyRecordedSame
+        } else {
+            let updated = transaction.execute(
+                "UPDATE action_audit_contexts
+                 SET execution_started_at_unix_ms = ?2
+                 WHERE request_id = ?1 AND execution_started_at_unix_ms IS NULL",
+                params![request_id.to_string(), started_at_unix_ms],
+            )?;
+            if updated != 1 {
+                return Err(StoreError::ExecutionStartConflict);
+            }
+            append_audit_in_transaction(
+                &transaction,
+                AuditEventDraft {
+                    occurred_at_unix_ms: started_at_unix_ms,
+                    kind: AuditKind::ExecutionStarted,
+                    outcome: AuditOutcome::Accepted,
+                    request_id: Some(request_id),
+                    actor_digest: Some(context.agent_id_digest),
+                    subject_digest: Some(context_digest),
+                    context_digest: Some(expected_fingerprint),
+                },
+            )?;
+            ExecutionStartOutcome::Recorded
+        };
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(outcome)
+    }
+
+    pub fn action_audit_record(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Option<ActionAuditRecord>, StoreError> {
+        let connection = self.lock()?;
+        let stored: Option<ActionAuditRow> = connection
+            .query_row(
+                "SELECT a.context_digest, r.reserved_at_unix_ms,
+                        a.execution_started_at_unix_ms, r.terminal_record, a.record
+                 FROM request_replays r
+                 JOIN action_audit_contexts a ON a.request_id = r.request_id
+                 WHERE r.request_id = ?1",
+                [request_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((context_digest, reserved_at, execution_started_at, terminal, context_record)) =
+            stored
+        else {
+            return Ok(None);
+        };
+        let context_digest = digest_from_blob(context_digest)?;
+        let context: ActionAuditContextV1 = decode(&context_record)?;
+        if context.request_id != request_id
+            || !constant_time_digest_eq(&context.digest()?, &context_digest)
+        {
+            return Err(StoreError::CorruptData(
+                "action audit context digest is inconsistent",
+            ));
+        }
+        Ok(Some(ActionAuditRecord {
+            context,
+            context_digest,
+            reserved_at_unix_ms: reserved_at,
+            execution_started_at_unix_ms: execution_started_at,
+            terminal: terminal
+                .map(|record| decode::<TerminalResponseMetadata>(&record))
+                .transpose()?,
+        }))
     }
 
     pub fn replay_outcome(
@@ -3088,6 +3376,14 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          CREATE UNIQUE INDEX IF NOT EXISTS request_replays_nonce_idx
              ON request_replays(pairing_id, trust_epoch, replay_nonce);
 
+         CREATE TABLE IF NOT EXISTS action_audit_contexts (
+             request_id TEXT PRIMARY KEY NOT NULL REFERENCES request_replays(request_id),
+             context_digest BLOB NOT NULL CHECK (length(context_digest) = 32),
+             execution_started_at_unix_ms INTEGER
+                 CHECK (execution_started_at_unix_ms IS NULL OR execution_started_at_unix_ms >= 0),
+             record BLOB NOT NULL
+         ) STRICT;
+
          CREATE TABLE IF NOT EXISTS policy_state (
              singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
              policy_version BLOB NOT NULL CHECK (length(policy_version) = 8),
@@ -3145,7 +3441,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
              VALUES (1, 0, zeroblob(32))
              ON CONFLICT(singleton) DO NOTHING;
-         PRAGMA user_version = 8;",
+         PRAGMA user_version = 9;",
     )?;
     // Pending ceremonies are authorization-free, short-lived bootstrap state.
     // Schema 5 adds the certificate chain needed to revalidate X.509 at local
@@ -3161,6 +3457,8 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     // high-water mark. No executable content is stored in SQLite.
     // Schema 8 adds the durable trusted-clock high-water mark. It is initialized
     // only from a live local observation, never guessed during migration.
+    // Schema 9 adds redacted action contexts and execution-start evidence.
+    // Historical replay rows remain valid without guessed context records.
     transaction.commit()?;
     Ok(())
 }
@@ -3743,10 +4041,14 @@ mod tests {
             replay_nonce: sha256(request_id.as_bytes()),
             agent_id: "agent-green".to_owned(),
             node_id: "node-01".to_owned(),
+            authority_id_digest: sha256(b"owner-approval-01"),
+            owner_id_digest: sha256(b"owner-01"),
             capability: "SystemInfo".to_owned(),
             target_digest: sha256(b"local"),
             arguments_digest: sha256(b"empty-map"),
             authorization_digest: sha256(b"signed-envelope"),
+            issued_at_unix_ms: NOW - 10,
+            not_before_unix_ms: NOW - 10,
             expires_at_unix_ms: i64::MAX,
         })
     }
@@ -4243,6 +4545,44 @@ mod tests {
     }
 
     #[test]
+    fn schema_eight_migration_adds_action_audit_context_without_guessing_history()
+    -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let historical = replay(&store, Uuid::new_v4())?;
+        store.reserve_validated_replay_at(&historical, NOW)?;
+        let before = store.verify_audit_chain()?;
+        drop(store);
+
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch(
+            "DROP TABLE action_audit_contexts;
+             PRAGMA user_version = 8;",
+        )?;
+        drop(legacy);
+
+        let migrated = StateStore::open(&path)?;
+        assert!(
+            migrated
+                .action_audit_record(historical.request_id)?
+                .is_none()
+        );
+        assert!(matches!(
+            migrated.replay_outcome(&historical)?,
+            Some(ReplayOutcome::DuplicateSame { .. })
+        ));
+        assert_eq!(migrated.verify_audit_chain()?, before);
+
+        let mut current = historical;
+        current.request_id = Uuid::new_v4();
+        current.task_id = Uuid::new_v4();
+        current.replay_sequence = 2;
+        current.replay_nonce = sha256(current.request_id.as_bytes());
+        migrated.reserve_validated_replay_at(&current, NOW + 1)?;
+        assert!(migrated.action_audit_record(current.request_id)?.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn global_limit_is_atomic_with_peer_limit() -> Result<(), StoreError> {
         let (_directory, path, store) = test_store()?;
         let (_, first_peer) =
@@ -4341,6 +4681,24 @@ mod tests {
     }
 
     #[test]
+    fn audit_only_fields_do_not_change_the_stable_v1_replay_fingerprint() -> Result<(), StoreError>
+    {
+        let (_directory, _path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        let fingerprint = request.fingerprint()?;
+        let mut audit_metadata_changed = request.clone();
+        audit_metadata_changed.authority_id_digest = sha256(b"different authority label");
+        audit_metadata_changed.owner_id_digest = sha256(b"different owner label");
+        audit_metadata_changed.issued_at_unix_ms = NOW - 20;
+        audit_metadata_changed.not_before_unix_ms = NOW - 5;
+        assert_eq!(audit_metadata_changed.fingerprint()?, fingerprint);
+
+        audit_metadata_changed.authorization_digest = sha256(b"different signed envelope");
+        assert_ne!(audit_metadata_changed.fingerprint()?, fingerprint);
+        Ok(())
+    }
+
+    #[test]
     fn exclusive_daemon_lease_reconciles_open_replay_without_retry() -> Result<(), StoreError> {
         let (directory, path, store) = test_store()?;
         let request = replay(&store, Uuid::new_v4())?;
@@ -4420,6 +4778,182 @@ mod tests {
             store.reserve_validated_replay_at(&request, NOW + 2)?,
             ReplayOutcome::DuplicateSame { terminal: Some(value), .. } if value == terminal
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn action_context_and_execution_start_are_redacted_durable_and_idempotent()
+    -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        let fingerprint = request.fingerprint()?;
+        store.reserve_validated_replay_at(&request, NOW)?;
+
+        let reserved = store
+            .action_audit_record(request.request_id)?
+            .ok_or(StoreError::CorruptData("action audit record is missing"))?;
+        assert_eq!(reserved.context.request_id, request.request_id);
+        assert_eq!(reserved.context.task_id, request.task_id);
+        assert_eq!(reserved.context.capability, "SystemInfo");
+        assert_eq!(reserved.context.target_digest, request.target_digest);
+        assert_eq!(reserved.context.arguments_digest, request.arguments_digest);
+        assert_eq!(
+            reserved.context.authority_id_digest,
+            request.authority_id_digest
+        );
+        assert_eq!(reserved.context.owner_id_digest, request.owner_id_digest);
+        assert_eq!(reserved.execution_started_at_unix_ms, None);
+        assert_eq!(reserved.terminal, None);
+        let encoded_context = encode(&reserved.context)?;
+        for excluded in [b"agent-green".as_slice(), b"node-01", b"owner-01"] {
+            assert!(
+                !encoded_context
+                    .windows(excluded.len())
+                    .any(|value| value == excluded)
+            );
+        }
+
+        assert_eq!(
+            store.record_execution_started(
+                request.request_id,
+                fingerprint,
+                reserved.context_digest,
+                NOW + 1,
+            )?,
+            ExecutionStartOutcome::Recorded
+        );
+        assert_eq!(
+            store.record_execution_started(
+                request.request_id,
+                fingerprint,
+                reserved.context_digest,
+                NOW + 1,
+            )?,
+            ExecutionStartOutcome::AlreadyRecordedSame
+        );
+        assert!(matches!(
+            store.record_execution_started(
+                request.request_id,
+                fingerprint,
+                reserved.context_digest,
+                NOW + 2,
+            ),
+            Err(StoreError::ExecutionStartConflict)
+        ));
+        let started = store
+            .action_audit_record(request.request_id)?
+            .ok_or(StoreError::CorruptData("action audit record is missing"))?;
+        assert_eq!(started.execution_started_at_unix_ms, Some(NOW + 1));
+        assert_eq!(started.context_digest, started.context.digest()?);
+        assert_eq!(
+            store
+                .audit_events_after(0, 100)?
+                .iter()
+                .filter(|event| {
+                    event.kind == AuditKind::ExecutionStarted
+                        && event.request_id == Some(request.request_id)
+                })
+                .count(),
+            1
+        );
+
+        drop(store);
+        let reopened = StateStore::open(path)?;
+        assert_eq!(
+            reopened
+                .action_audit_record(request.request_id)?
+                .and_then(|record| record.execution_started_at_unix_ms),
+            Some(NOW + 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_start_rejects_wrong_fingerprint_and_terminal_requests() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        let fingerprint = request.fingerprint()?;
+        store.reserve_validated_replay_at(&request, NOW)?;
+        let context_digest = store
+            .action_audit_record(request.request_id)?
+            .ok_or(StoreError::CorruptData("action audit record is missing"))?
+            .context_digest;
+        assert!(matches!(
+            store.record_execution_started(
+                request.request_id,
+                sha256(b"wrong"),
+                context_digest,
+                NOW + 1,
+            ),
+            Err(StoreError::ReplayFingerprintMismatch)
+        ));
+        assert!(matches!(
+            store.record_execution_started(
+                request.request_id,
+                fingerprint,
+                sha256(b"wrong context"),
+                NOW + 1,
+            ),
+            Err(StoreError::ExecutionStartConflict)
+        ));
+        let terminal = TerminalResponseMetadata {
+            status: TerminalStatus::Failed,
+            response_digest: sha256(b"not-executed"),
+            redacted_error_digest: Some(sha256(b"pre-dispatch failure")),
+            response_size_bytes: 32,
+            completed_at_unix_ms: NOW + 2,
+        };
+        store.record_terminal_response(request.request_id, fingerprint, &terminal)?;
+        assert!(matches!(
+            store.record_execution_started(
+                request.request_id,
+                fingerprint,
+                context_digest,
+                NOW + 1,
+            ),
+            Err(StoreError::ExecutionStartConflict)
+        ));
+        assert_eq!(
+            store
+                .action_audit_record(request.request_id)?
+                .and_then(|record| record.execution_started_at_unix_ms),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_action_context_blocks_execution_start() -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        let fingerprint = request.fingerprint()?;
+        store.reserve_validated_replay_at(&request, NOW)?;
+        let context_digest = store
+            .action_audit_record(request.request_id)?
+            .ok_or(StoreError::CorruptData("action audit record is missing"))?
+            .context_digest;
+        drop(store);
+
+        let connection = Connection::open(&path)?;
+        connection.execute(
+            "UPDATE action_audit_contexts SET record = X'00' WHERE request_id = ?1",
+            [request.request_id.to_string()],
+        )?;
+        drop(connection);
+
+        let reopened = StateStore::open(path)?;
+        assert!(
+            reopened
+                .record_execution_started(request.request_id, fingerprint, context_digest, NOW + 1,)
+                .is_err()
+        );
+        assert!(
+            !reopened
+                .audit_events_after(0, 100)?
+                .iter()
+                .any(|event| event.kind == AuditKind::ExecutionStarted
+                    && event.request_id == Some(request.request_id))
+        );
         Ok(())
     }
 

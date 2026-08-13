@@ -192,6 +192,56 @@ impl NodeRuntime {
             drop(admission);
             return Ok(signed);
         }
+
+        let started_at_unix_ms = i64::try_from(started_at.0).map_err(|_| RuntimeError::Encoding)?;
+        if self
+            .store
+            .record_execution_started(
+                request_id.0,
+                authorized.replay_fingerprint(),
+                authorized.action_context_digest(),
+                started_at_unix_ms,
+            )
+            .is_err()
+        {
+            // Execution-start audit persistence is a hard pre-dispatch gate. The request remains
+            // spent, no capability handler is called, and terminal recording is best-effort when
+            // the underlying store failure still permits it.
+            let response = self.rejection(
+                request_id,
+                task_id,
+                ActionStatus::Failed,
+                ActionErrorCode::Internal,
+                "execution-start audit persistence failed; action was not executed",
+                false,
+                None,
+            )?;
+            let signed = self.sign_response(response)?;
+            let terminal = TerminalResponseMetadata {
+                status: TerminalStatus::Failed,
+                response_digest: signed.response_digest.0,
+                redacted_error_digest: signed
+                    .response
+                    .error
+                    .as_ref()
+                    .map(|error| Sha256::digest(error.message.as_bytes()).into()),
+                response_size_bytes: u64::try_from(
+                    postcard::to_allocvec(&signed.response)
+                        .map_err(|_| RuntimeError::Encoding)?
+                        .len(),
+                )
+                .unwrap_or(u64::MAX),
+                completed_at_unix_ms: started_at_unix_ms,
+            };
+            let _ = self.store.record_terminal_response(
+                request_id.0,
+                authorized.replay_fingerprint(),
+                &terminal,
+            );
+            drop(running_guard);
+            drop(admission);
+            return Ok(signed);
+        }
         let queue = self.queue_snapshot(true);
         let executed = self
             .executor

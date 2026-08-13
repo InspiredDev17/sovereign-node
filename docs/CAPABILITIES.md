@@ -282,9 +282,16 @@ Results are bounded and redacted. A capability never returns private keys,
 tokens, full environment variables, credential files, or raw authorization
 signatures.
 
-The audit journal records request, task, agent, authority, node, capability,
-logical target, argument digest, policy version, decision, timing, and result
-digest. Sensitive arguments and file contents are not audit payloads.
+The audit journal records RequestId and TaskId, capability, policy version and
+digest, signed timing bounds, result digest, and digests of the agent, owner
+authority, node, pairing, logical target, arguments, and authorization. The
+redacted action context is stored atomically with replay reservation. Exactly
+one immutable execution-start event must persist and revalidate that context
+before capability dispatch; audit failure is a pre-dispatch denial, never a
+fall-through. Terminal metadata is linked to the same request and replay
+fingerprint. Raw logical targets, arguments, approval reasons, signatures,
+response bodies, file contents, credentials, and private material are not audit
+payloads.
 
 ## Adding a capability
 

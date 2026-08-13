@@ -728,6 +728,46 @@ fn forged_authorizations_do_not_consume_the_request_id() -> TestResult {
 }
 
 #[test]
+fn authorized_action_persists_only_redacted_audit_context() -> TestResult {
+    let harness = Harness::new()?;
+    let action = harness.system_info_action(101, 2)?;
+    let request_id = action.request.request_id.0;
+    let task_id = action.request.task_id.0;
+    let agent_digest = sha256(action.request.agent_id.to_string().as_bytes());
+    let authority_digest = sha256(action.request.user_authority.authority_id.0.as_bytes());
+    let owner_digest = sha256(action.request.user_authority.owner_id.as_bytes());
+    let raw_approval_reason = action
+        .request
+        .user_authority
+        .approval_reason
+        .clone()
+        .ok_or_else(|| test_error("approval reason is missing"))?;
+    assert!(matches!(
+        harness
+            .engine()
+            .verify_and_reserve(action, &harness.transport_peer())?,
+        AuthorizationOutcome::Fresh(_)
+    ));
+
+    let record = harness
+        .store
+        .action_audit_record(request_id)?
+        .ok_or_else(|| test_error("action audit context is missing"))?;
+    assert_eq!(record.context.request_id, request_id);
+    assert_eq!(record.context.task_id, task_id);
+    assert_eq!(record.context.agent_id_digest, agent_digest);
+    assert_eq!(record.context.authority_id_digest, authority_digest);
+    assert_eq!(record.context.owner_id_digest, owner_digest);
+    assert_eq!(record.context.capability, "SystemInfo");
+    assert_eq!(record.execution_started_at_unix_ms, None);
+    assert_eq!(record.terminal, None);
+    let debug = format!("{:?}", record.context);
+    assert!(!debug.contains(OWNER_ID));
+    assert!(!debug.contains(&raw_approval_reason));
+    Ok(())
+}
+
+#[test]
 fn material_clock_rollback_denies_authorization_without_consuming_request_id() -> TestResult {
     let harness = Harness::new()?;
     let engine = harness.engine();

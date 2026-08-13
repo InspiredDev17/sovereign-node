@@ -46,6 +46,7 @@ impl Clock for SystemClock {
 pub struct VerifiedAction {
     signed: SignedActionV1,
     replay_fingerprint: [u8; 32],
+    action_context_digest: [u8; 32],
     peer_id: String,
 }
 
@@ -58,6 +59,11 @@ impl VerifiedAction {
     #[must_use]
     pub(crate) const fn replay_fingerprint(&self) -> [u8; 32] {
         self.replay_fingerprint
+    }
+
+    #[must_use]
+    pub(crate) const fn action_context_digest(&self) -> [u8; 32] {
+        self.action_context_digest
     }
 
     #[must_use]
@@ -226,13 +232,15 @@ impl AuthorizationEngine {
             self.max_clock_rollback_millis,
         )?;
         match outcome {
-            ReplayOutcome::Reserved { fingerprint } => {
-                Ok(AuthorizationOutcome::Fresh(Box::new(VerifiedAction {
-                    signed: action,
-                    replay_fingerprint: fingerprint,
-                    peer_id: transport_peer.peer_id.clone(),
-                })))
-            }
+            ReplayOutcome::Reserved {
+                fingerprint,
+                action_context_digest,
+            } => Ok(AuthorizationOutcome::Fresh(Box::new(VerifiedAction {
+                signed: action,
+                replay_fingerprint: fingerprint,
+                action_context_digest,
+                peer_id: transport_peer.peer_id.clone(),
+            }))),
             ReplayOutcome::DuplicateSame { .. } => Ok(AuthorizationOutcome::Duplicate),
             ReplayOutcome::Collision { .. } => Err(AuthorizationError::ReplayCollision),
         }
@@ -353,10 +361,16 @@ fn reservation_for(
         replay_nonce: request.replay_protection.nonce.0,
         agent_id: request.agent_id.to_string(),
         node_id: request.node_id.to_string(),
+        authority_id_digest: sha256(request.user_authority.authority_id.0.as_bytes()),
+        owner_id_digest: sha256(request.user_authority.owner_id.as_bytes()),
         capability: format!("{:?}", request.capability),
         target_digest: target_digest.0,
         arguments_digest: request.arguments_digest.0,
         authorization_digest,
+        issued_at_unix_ms: i64::try_from(request.issued_at.0)
+            .map_err(|_| AuthorizationError::Clock)?,
+        not_before_unix_ms: i64::try_from(request.not_before.0)
+            .map_err(|_| AuthorizationError::Clock)?,
         expires_at_unix_ms: i64::try_from(request.expires_at.0)
             .map_err(|_| AuthorizationError::Clock)?,
     })

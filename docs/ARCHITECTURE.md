@@ -196,6 +196,21 @@ execution start and result, policy changes, and update decisions are written to
 a durable local journal. Entries include identifiers and digests rather than
 raw secrets, file contents, credentials, or sensitive arguments.
 
+For every newly reserved action, schema v9 atomically stores a versioned
+redacted context containing RequestId and TaskId; digests of the agent, owner
+authority, node, pairing, target, arguments, authorization, and active policy;
+the capability name; and signed time bounds. Raw target values, argument
+values, approval reasons, signatures, response bodies, file content, and
+credentials are structurally absent. The runtime then appends exactly one
+immutable `ExecutionStarted` event before calling the capability executor. If
+that write or context verification fails, execution fails closed and the
+handler is never called. Terminal metadata remains linked by RequestId and the
+immutable replay fingerprint.
+
+Migration does not invent context for historical replay rows. Those rows keep
+their replay and terminal semantics, while action-context inspection correctly
+returns absent for pre-v9 history.
+
 The journal is access controlled and may be hash-linked and node-signed for
 damage evidence. It is not claimed to be tamper-proof against an attacker with
 root access who can steal the node key and rewrite local storage. Export to an

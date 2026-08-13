@@ -102,6 +102,7 @@ operation fails closed.
 | Automatic supply-chain compromise | The daemon contains no Internet updater or unattended install path |
 | Agent Green suppression | Node lacks Agent Green control capability and reports only independently obtained signed health state; unverifiable state is Unknown |
 | Audit tampering | Restrictive storage and optional node-signed hash linking provide damage evidence; external owner-controlled export improves survivability |
+| Missing or corrupted pre-dispatch audit | Replay reservation stores a digest-bound redacted action context; the runtime must append one immutable execution-start event before calling any capability handler and fails closed on mismatch or persistence error |
 
 ## Local privilege and filesystem containment
 
@@ -208,6 +209,10 @@ startup root-descriptor pinning, traversal denial, unlisted targets, symlinked
 files and directories, hard links, executables, directories, broad roots,
 hidden and credential-like names, and the continued unavailability of
 FileWrite.
+Action-audit tests cover redacted structured context, digest binding, durable
+restart recovery, exact-once execution-start evidence, wrong-fingerprint and
+terminal-state rejection, tampered-context denial, and schema-v9 migration that
+preserves older replay/audit history without fabricating context.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.

@@ -41,9 +41,11 @@ trust.
 - Every action is signed by the paired broker key **and** the owner authority key. The signed body
   binds request, task, agent, node, capability, target, typed arguments digest, validity window,
   trust generation, and protocol version.
-- Replay reservation and audit-start persistence occur atomically before dispatch. A crash never
-  causes an action to be automatically executed again. A singleton daemon lease safely marks
-  prior open reservations `Indeterminate` on restart and keeps them spent.
+- Replay reservation and its redacted action context persist atomically. A separate immutable
+  execution-start event must persist before dispatch; audit failure cannot fall through to a
+  capability handler. A crash never causes an action to be automatically executed again. A
+  singleton daemon lease safely marks prior open reservations `Indeterminate` on restart and keeps
+  them spent.
 - TLS 1.3 mutual authentication is mandatory when the LAN listener is enabled. Public, wildcard,
   and plaintext listeners are rejected. Atomic durable per-paired-peer and node-global request
   limits are enforced before authorization and replay reservation; reconnecting resets neither.
