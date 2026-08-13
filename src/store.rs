@@ -712,6 +712,7 @@ impl ReplayReservation {
 /// Redacted, stable metadata that lets an owner correlate an action lifecycle
 /// without retaining raw targets, arguments, identities, credentials, or signatures.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionAuditContextV1 {
     pub schema_version: u16,
     pub request_id: Uuid,
@@ -798,6 +799,7 @@ pub enum TerminalStatus {
 /// Immutable metadata for a terminal action response.  The response itself is
 /// returned to the caller by the runtime and is not retained here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalResponseMetadata {
     pub status: TerminalStatus,
     pub response_digest: Sha256Digest,
@@ -878,6 +880,7 @@ pub struct AuditEventDraft {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditEvent {
     pub sequence: u64,
     pub event_id: Uuid,
@@ -892,10 +895,31 @@ pub struct AuditEvent {
     pub event_hash: Sha256Digest,
 }
 
+impl AuditEvent {
+    /// Recompute this event's canonical hash. Page-level callers must also
+    /// verify sequence and previous-hash linkage.
+    pub fn verify_hash(&self) -> Result<(), StoreError> {
+        if constant_time_digest_eq(&audit_event_hash(self)?, &self.event_hash) {
+            Ok(())
+        } else {
+            Err(StoreError::AuditChainInvalid {
+                sequence: self.sequence,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuditChainState {
     pub event_count: u64,
     pub tail_hash: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditReadSnapshot {
+    pub chain: AuditChainState,
+    pub events: Vec<AuditEvent>,
+    pub actions: Vec<ActionAuditRecord>,
 }
 
 #[derive(Debug)]
@@ -2950,48 +2974,7 @@ impl StateStore {
         request_id: Uuid,
     ) -> Result<Option<ActionAuditRecord>, StoreError> {
         let connection = self.lock()?;
-        let stored: Option<ActionAuditRow> = connection
-            .query_row(
-                "SELECT a.context_digest, r.reserved_at_unix_ms,
-                        a.execution_started_at_unix_ms, r.terminal_record, a.record
-                 FROM request_replays r
-                 JOIN action_audit_contexts a ON a.request_id = r.request_id
-                 WHERE r.request_id = ?1",
-                [request_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((context_digest, reserved_at, execution_started_at, terminal, context_record)) =
-            stored
-        else {
-            return Ok(None);
-        };
-        let context_digest = digest_from_blob(context_digest)?;
-        let context: ActionAuditContextV1 = decode(&context_record)?;
-        if context.request_id != request_id
-            || !constant_time_digest_eq(&context.digest()?, &context_digest)
-        {
-            return Err(StoreError::CorruptData(
-                "action audit context digest is inconsistent",
-            ));
-        }
-        Ok(Some(ActionAuditRecord {
-            context,
-            context_digest,
-            reserved_at_unix_ms: reserved_at,
-            execution_started_at_unix_ms: execution_started_at,
-            terminal: terminal
-                .map(|record| decode::<TerminalResponseMetadata>(&record))
-                .transpose()?,
-        }))
+        action_audit_record_in_connection(&connection, request_id)
     }
 
     pub fn replay_outcome(
@@ -3182,75 +3165,50 @@ impl StateStore {
                 "audit query limit is out of range",
             ));
         }
-        let sequence = i64::try_from(sequence)
-            .map_err(|_| StoreError::InvalidInput("audit sequence is too large"))?;
         let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT record FROM audit_events
-             WHERE sequence > ?1 ORDER BY sequence ASC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![sequence, limit], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(decode(&row?)?);
+        audit_events_after_in_connection(&connection, sequence, limit)
+    }
+
+    /// Read one event page, its action contexts, and the verified full-chain
+    /// tail from one SQLite snapshot so concurrent appends cannot mix epochs.
+    pub fn audit_read_snapshot(
+        &self,
+        sequence: u64,
+        limit: u32,
+    ) -> Result<AuditReadSnapshot, StoreError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(StoreError::InvalidInput(
+                "audit query limit is out of range",
+            ));
         }
-        Ok(events)
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // The first read establishes the SQLite snapshot used for all context and tail reads.
+        let events = audit_events_after_in_connection(&transaction, sequence, limit)?;
+        let mut actions = Vec::new();
+        let request_ids = events
+            .iter()
+            .filter_map(|event| event.request_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for request_id in request_ids {
+            if let Some(record) = action_audit_record_in_connection(&transaction, request_id)? {
+                actions.push(record);
+            }
+        }
+        let chain = verify_audit_chain_in_connection(&transaction)?;
+        transaction.commit()?;
+        Ok(AuditReadSnapshot {
+            chain,
+            events,
+            actions,
+        })
     }
 
     /// Verify every link and the durable tail marker.  This is suitable for
     /// startup checks and Agent Green monitoring.
     pub fn verify_audit_chain(&self) -> Result<AuditChainState, StoreError> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT sequence, previous_hash, event_hash, record
-             FROM audit_events ORDER BY sequence ASC",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut expected_sequence = 1_u64;
-        let mut previous_hash = ZERO_HASH;
-        while let Some(row) = rows.next()? {
-            let stored_sequence: i64 = row.get(0)?;
-            let stored_previous = digest_from_blob(row.get(1)?)?;
-            let stored_hash = digest_from_blob(row.get(2)?)?;
-            let record: Vec<u8> = row.get(3)?;
-            let event: AuditEvent = decode(&record)?;
-            let sequence = u64::try_from(stored_sequence)
-                .map_err(|_| StoreError::CorruptData("negative audit sequence"))?;
-            if sequence != expected_sequence
-                || event.sequence != sequence
-                || event.previous_hash != stored_previous
-                || event.event_hash != stored_hash
-                || !constant_time_digest_eq(&stored_previous, &previous_hash)
-                || !constant_time_digest_eq(&audit_event_hash(&event)?, &stored_hash)
-            {
-                return Err(StoreError::AuditChainInvalid { sequence });
-            }
-            previous_hash = stored_hash;
-            expected_sequence = expected_sequence
-                .checked_add(1)
-                .ok_or(StoreError::CorruptData("audit sequence overflow"))?;
-        }
-        drop(rows);
-        drop(statement);
-
-        let (tail_sequence, tail_hash): (i64, Vec<u8>) = connection.query_row(
-            "SELECT tail_sequence, tail_hash FROM audit_chain_tail WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let tail_sequence = u64::try_from(tail_sequence)
-            .map_err(|_| StoreError::CorruptData("negative audit tail sequence"))?;
-        let tail_hash = digest_from_blob(tail_hash)?;
-        let event_count = expected_sequence - 1;
-        if tail_sequence != event_count || !constant_time_digest_eq(&tail_hash, &previous_hash) {
-            return Err(StoreError::AuditChainInvalid {
-                sequence: event_count.saturating_add(1),
-            });
-        }
-        Ok(AuditChainState {
-            event_count,
-            tail_hash,
-        })
+        verify_audit_chain_in_connection(&connection)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
@@ -3260,6 +3218,128 @@ impl StateStore {
     fn tighten_permissions(&self) -> Result<(), StoreError> {
         tighten_private_permissions(&self.path)
     }
+}
+
+fn audit_events_after_in_connection(
+    connection: &Connection,
+    sequence: u64,
+    limit: u32,
+) -> Result<Vec<AuditEvent>, StoreError> {
+    let sequence = i64::try_from(sequence)
+        .map_err(|_| StoreError::InvalidInput("audit sequence is too large"))?;
+    let mut statement = connection.prepare(
+        "SELECT record FROM audit_events
+         WHERE sequence > ?1 ORDER BY sequence ASC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![sequence, limit], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(decode(&row?)?);
+    }
+    Ok(events)
+}
+
+fn action_audit_record_in_connection(
+    connection: &Connection,
+    request_id: Uuid,
+) -> Result<Option<ActionAuditRecord>, StoreError> {
+    let stored: Option<ActionAuditRow> = connection
+        .query_row(
+            "SELECT a.context_digest, r.reserved_at_unix_ms,
+                    a.execution_started_at_unix_ms, r.terminal_record, a.record
+             FROM request_replays r
+             JOIN action_audit_contexts a ON a.request_id = r.request_id
+             WHERE r.request_id = ?1",
+            [request_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((context_digest, reserved_at, execution_started_at, terminal, context_record)) =
+        stored
+    else {
+        return Ok(None);
+    };
+    let context_digest = digest_from_blob(context_digest)?;
+    let context: ActionAuditContextV1 = decode(&context_record)?;
+    if context.request_id != request_id
+        || !constant_time_digest_eq(&context.digest()?, &context_digest)
+    {
+        return Err(StoreError::CorruptData(
+            "action audit context digest is inconsistent",
+        ));
+    }
+    Ok(Some(ActionAuditRecord {
+        context,
+        context_digest,
+        reserved_at_unix_ms: reserved_at,
+        execution_started_at_unix_ms: execution_started_at,
+        terminal: terminal
+            .map(|record| decode::<TerminalResponseMetadata>(&record))
+            .transpose()?,
+    }))
+}
+
+fn verify_audit_chain_in_connection(
+    connection: &Connection,
+) -> Result<AuditChainState, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, previous_hash, event_hash, record
+         FROM audit_events ORDER BY sequence ASC",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut expected_sequence = 1_u64;
+    let mut previous_hash = ZERO_HASH;
+    while let Some(row) = rows.next()? {
+        let stored_sequence: i64 = row.get(0)?;
+        let stored_previous = digest_from_blob(row.get(1)?)?;
+        let stored_hash = digest_from_blob(row.get(2)?)?;
+        let record: Vec<u8> = row.get(3)?;
+        let event: AuditEvent = decode(&record)?;
+        let sequence = u64::try_from(stored_sequence)
+            .map_err(|_| StoreError::CorruptData("negative audit sequence"))?;
+        if sequence != expected_sequence
+            || event.sequence != sequence
+            || event.previous_hash != stored_previous
+            || event.event_hash != stored_hash
+            || !constant_time_digest_eq(&stored_previous, &previous_hash)
+            || !constant_time_digest_eq(&audit_event_hash(&event)?, &stored_hash)
+        {
+            return Err(StoreError::AuditChainInvalid { sequence });
+        }
+        previous_hash = stored_hash;
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData("audit sequence overflow"))?;
+    }
+    drop(rows);
+    drop(statement);
+
+    let (tail_sequence, tail_hash): (i64, Vec<u8>) = connection.query_row(
+        "SELECT tail_sequence, tail_hash FROM audit_chain_tail WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let tail_sequence = u64::try_from(tail_sequence)
+        .map_err(|_| StoreError::CorruptData("negative audit tail sequence"))?;
+    let tail_hash = digest_from_blob(tail_hash)?;
+    let event_count = expected_sequence - 1;
+    if tail_sequence != event_count || !constant_time_digest_eq(&tail_hash, &previous_hash) {
+        return Err(StoreError::AuditChainInvalid {
+            sequence: event_count.saturating_add(1),
+        });
+    }
+    Ok(AuditChainState {
+        event_count,
+        tail_hash,
+    })
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), StoreError> {

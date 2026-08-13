@@ -81,7 +81,8 @@ trust.
 
 See [Architecture](docs/ARCHITECTURE.md), [Pairing](docs/PAIRING.md),
 [Identity](docs/IDENTITY.md), [Transport](docs/TRANSPORT.md),
-[Capabilities](docs/CAPABILITIES.md), and [Threat model](docs/THREAT-MODEL.md).
+[Capabilities](docs/CAPABILITIES.md), [Local Audit Export](docs/AUDIT.md), and
+[Threat model](docs/THREAT-MODEL.md).
 
 ## Build and verify
 

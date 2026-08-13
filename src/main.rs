@@ -11,6 +11,7 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use sovereign_node::audit::{MAX_AUDIT_EXPORT_EVENTS, export_local_audit};
 use sovereign_node::authz::{AuthorizationEngine, Clock, SystemClock};
 use sovereign_node::capabilities::CapabilityExecutor;
 use sovereign_node::config::{
@@ -57,6 +58,9 @@ enum Command {
     Identity { config: PathBuf },
     /// Inspect local trust/audit state without starting a listener.
     Status { config: PathBuf },
+    /// Export a bounded, redacted, node-signed page of the local audit journal.
+    #[command(subcommand)]
+    Audit(AuditCommand),
     /// Owner-local pairing and revocation ceremony.
     #[command(subcommand)]
     Pair(PairCommand),
@@ -92,6 +96,24 @@ enum ClockCommand {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Verify the full chain and print one local-only signed JSON page.
+    Export(AuditExportArgs),
+}
+
+#[derive(Debug, Args)]
+struct AuditExportArgs {
+    #[arg(long)]
+    config: PathBuf,
+    /// Return events strictly after this durable sequence number.
+    #[arg(long, default_value_t = 0)]
+    after_sequence: u64,
+    /// Maximum events in this page. Hard limited to 1000.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_AUDIT_EXPORT_EVENTS)))]
+    limit: u32,
 }
 
 #[derive(Debug, Args)]
@@ -318,12 +340,27 @@ async fn main() -> Result<()> {
         Command::ConfigExample { data_dir } => config_example(&data_dir),
         Command::Identity { config } => identity(&config),
         Command::Status { config } => status(&config),
+        Command::Audit(command) => audit(command),
         Command::Pair(command) => pair(command),
         Command::RotateIdentity { config, confirm } => rotate_identity(&config, confirm),
         Command::Update(command) => update(command),
         Command::Clock(command) => clock(command),
         Command::Serve { config } => serve(&config).await,
     }
+}
+
+fn audit(command: AuditCommand) -> Result<()> {
+    match command {
+        AuditCommand::Export(args) => audit_export(args),
+    }
+}
+
+fn audit_export(args: AuditExportArgs) -> Result<()> {
+    let config = NodeConfig::load(&args.config)?;
+    let identity = NodeIdentity::load(&config.data_dir)?;
+    let store = open_store(&config)?;
+    let export = export_local_audit(&store, &identity, args.after_sequence, args.limit, now()?)?;
+    print_json(&export)
 }
 
 fn update(command: UpdateCommand) -> Result<()> {

@@ -213,6 +213,10 @@ Action-audit tests cover redacted structured context, digest binding, durable
 restart recovery, exact-once execution-start evidence, wrong-fingerprint and
 terminal-state rejection, tampered-context denial, and schema-v9 migration that
 preserves older replay/audit history without fabricating context.
+Local audit-export tests cover strict page bounds, full-chain verification,
+cursor and anchor semantics, domain-separated node signatures, key matching,
+multi-page continuity, action-context linkage, raw-value exclusion, and event
+or payload tamper rejection.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.

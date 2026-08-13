@@ -211,6 +211,13 @@ Migration does not invent context for historical replay rows. Those rows keep
 their replay and terminal semantics, while action-context inspection correctly
 returns absent for pre-v9 history.
 
+The local-only `audit export` CLI verifies the complete chain and emits at most
+1000 events per page plus redacted action contexts for requests in that page.
+It signs a domain-separated canonical payload with the node device key and
+prints JSON to standard output; it never opens a listener, writes an export
+file, or transmits evidence. See `AUDIT.md` for pagination, verification,
+redaction, key-rotation, and root-compromise limitations.
+
 The journal is access controlled and may be hash-linked and node-signed for
 damage evidence. It is not claimed to be tamper-proof against an attacker with
 root access who can steal the node key and rewrite local storage. Export to an
