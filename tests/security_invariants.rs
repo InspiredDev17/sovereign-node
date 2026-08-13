@@ -12,10 +12,10 @@ use rcgen::{
 use sovereign_node::authz::{
     AuthorizationEngine, AuthorizationError, AuthorizationOutcome, Clock, TransportPeer,
 };
-use sovereign_node::capabilities::CapabilityExecutor;
+use sovereign_node::capabilities::{CapabilityError, CapabilityExecutor};
 use sovereign_node::config::{
     HealthConfig, NodeConfig, PolicyConfig, ProcessReportingConfig, ProcessSnapshotConfig,
-    ResourceReportingConfig,
+    ResourceReportingConfig, ServiceReportingConfig, ServiceSnapshotConfig,
 };
 use sovereign_node::identity::{NodeIdentity, key_id};
 use sovereign_node::pairing::{
@@ -34,6 +34,10 @@ use sovereign_node::protocol::{
     TaskId, TrustStatus, UnixMillis, UserAuthorityV1, ValidationError,
 };
 use sovereign_node::resources::{QueueSnapshot, ResourceReporter};
+use sovereign_node::service_status::{
+    ServiceStateV1, ServiceStatusEntryV1, ServiceStatusSnapshotV1, SignedServiceStatusSnapshotV1,
+    service_status_snapshot_signing_bytes,
+};
 use sovereign_node::store::{RevocationOutcome, StateStore, StoreError, StoreLimits, sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -787,6 +791,7 @@ async fn process_status_uses_signed_logical_identity_and_denies_raw_pid() -> Tes
                 max_age_secs: 30,
             }),
         },
+        service_reporting: ServiceReportingConfig::default(),
         updates: None,
     });
     config.validate()?;
@@ -888,6 +893,139 @@ async fn process_status_uses_signed_logical_identity_and_denies_raw_pid() -> Tes
         engine.verify_and_reserve(corrected, &transport)?,
         AuthorizationOutcome::Fresh(_)
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_status_uses_signed_logical_identity_without_manager_control() -> TestResult {
+    let harness = Harness::with_capabilities(&[Capability::ServiceStatus])?;
+    let service_key = SigningKey::from_bytes(&[0x45; 32]);
+    let snapshot = ServiceStatusSnapshotV1 {
+        schema_version: 1,
+        observed_at_unix_ms: NOW,
+        valid_until_unix_ms: NOW + 30_000,
+        services: vec![ServiceStatusEntryV1 {
+            service_id: "model-engine.service".to_owned(),
+            state: ServiceStateV1::Running,
+            detail_code: Some("ready".to_owned()),
+        }],
+    };
+    let payload = serde_json::to_vec(&snapshot)?;
+    let signature = service_key.sign(&service_status_snapshot_signing_bytes(&payload));
+    let signed_snapshot = SignedServiceStatusSnapshotV1 {
+        payload_hex: hex::encode(payload),
+        signature_hex: hex::encode(signature.to_bytes()),
+    };
+    let snapshot_path = harness._directory.path().join("service-status.json");
+    fs::write(&snapshot_path, serde_json::to_vec(&signed_snapshot)?)?;
+    let policy = PolicyConfig {
+        enabled_capabilities: vec![Capability::ServiceStatus],
+        ..PolicyConfig::default()
+    };
+    let config = Arc::new(NodeConfig {
+        data_dir: harness.identity_directory.clone(),
+        policy_version: 1,
+        listen: None,
+        tls: None,
+        policy,
+        file_roots: Default::default(),
+        approved_actions: Default::default(),
+        health: HealthConfig::default(),
+        resource_reporting: ResourceReportingConfig::default(),
+        process_reporting: ProcessReportingConfig::default(),
+        service_reporting: ServiceReportingConfig {
+            snapshot: Some(ServiceSnapshotConfig {
+                snapshot_path,
+                public_key_hex: hex::encode(service_key.verifying_key().to_bytes()),
+                max_age_secs: 30,
+            }),
+        },
+        updates: None,
+    });
+    config.validate()?;
+    let executor = CapabilityExecutor::new(
+        Arc::clone(&config),
+        ResourceReporter::new(
+            harness.identity.node_id(),
+            harness.identity.device().clone(),
+        ),
+    );
+    let engine = harness.engine_for(&[Capability::ServiceStatus]);
+    let transport = harness.transport_peer();
+    let action = signed_action(ActionSpec {
+        request_seed: 177,
+        sequence: 9,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::Service {
+            service_name: "model-engine.service".to_owned(),
+        },
+        arguments: ActionArguments::ServiceStatus,
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    let verified = match engine.verify_and_reserve(action, &transport)? {
+        AuthorizationOutcome::Fresh(verified) => verified,
+        AuthorizationOutcome::Duplicate => return Err("fresh service request duplicated".into()),
+    };
+    let result = executor
+        .execute(
+            &verified,
+            UnixMillis(NOW + 10),
+            QueueSnapshot::default(),
+            TrustStatus::Trusted,
+        )
+        .await?;
+    let ActionResultV1::ServiceStatus(status) = result else {
+        return Err("logical service request returned the wrong result type".into());
+    };
+    assert_eq!(status.state, "running");
+    assert_eq!(status.attributes.len(), 2);
+    assert_eq!(
+        status
+            .attributes
+            .get("logical_service_id")
+            .map(String::as_str),
+        Some("model-engine.service")
+    );
+
+    let unknown = signed_action(ActionSpec {
+        request_seed: 178,
+        sequence: 10,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::Service {
+            service_name: "unknown.service".to_owned(),
+        },
+        arguments: ActionArguments::ServiceStatus,
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    let unknown = match engine.verify_and_reserve(unknown, &transport)? {
+        AuthorizationOutcome::Fresh(verified) => verified,
+        AuthorizationOutcome::Duplicate => return Err("fresh unknown service duplicated".into()),
+    };
+    assert_eq!(
+        executor
+            .execute(
+                &unknown,
+                UnixMillis(NOW + 10),
+                QueueSnapshot::default(),
+                TrustStatus::Trusted,
+            )
+            .await,
+        Err(CapabilityError::TargetNotAllowed)
+    );
     Ok(())
 }
 

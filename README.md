@@ -66,6 +66,9 @@ trust.
 - Optional `ProcessStatus` uses only an owner-defined logical process ID and a fresh signed local
   snapshot from a separate pinned key. Numeric PIDs, enumeration, commands, environments, paths,
   user identities, signals, and lifecycle controls are not exposed.
+- Optional `ServiceStatus` uses only an owner-defined logical service ID and a fresh signed local
+  snapshot from another role-separated key. The node invokes no service manager and exposes no
+  unit files, commands, credentials, logs, configuration, enumeration, or lifecycle controls.
 
 See [Architecture](docs/ARCHITECTURE.md), [Pairing](docs/PAIRING.md),
 [Identity](docs/IDENTITY.md), [Transport](docs/TRANSPORT.md),
@@ -111,13 +114,16 @@ this policy must increment its owner-controlled `policy_version` once before ser
 | `GpuStatus` / `EngineStatus` / `ModelStatus` | Optional, disabled by default | Requires the signed local resource adapter; aggregate or exact logical target only |
 | `AgentGreenHealth` / `ActionBrokerHealth` | Optional, disabled by default | Requires its component-specific signed health adapter; never control or attestation |
 | `ProcessStatus` | Optional, disabled by default | Requires a signed logical-process snapshot; raw PID targets are always denied |
-| Service/repository status | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
+| `ServiceStatus` | Optional, disabled by default | Requires a signed logical-service snapshot; observation only, with no service-manager access |
+| `RepositoryStatus` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
 
 The producer format and fail-closed freshness rules are documented in
 [Signed local health snapshots](docs/HEALTH-SNAPSHOTS.md) and
 [Signed local resource snapshots](docs/RESOURCE-SNAPSHOTS.md).
 The logical-process format is documented in
 [Signed local process-status snapshots](docs/PROCESS-STATUS-SNAPSHOTS.md).
+The logical-service format is documented in
+[Signed local service-status snapshots](docs/SERVICE-STATUS-SNAPSHOTS.md).
 
 ## Offline and updates
 

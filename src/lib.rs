@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod resources;
 pub mod runtime;
 mod security;
+pub mod service_status;
 pub mod store;
 pub mod transport;
 pub mod update;

@@ -15,6 +15,7 @@ use sovereign_node::authz::{AuthorizationEngine, Clock, SystemClock};
 use sovereign_node::capabilities::CapabilityExecutor;
 use sovereign_node::config::{
     HealthConfig, NodeConfig, PolicyConfig, ProcessReportingConfig, ResourceReportingConfig,
+    ServiceReportingConfig,
 };
 use sovereign_node::identity::NodeIdentity;
 use sovereign_node::lifecycle::{LeaseKind, LifecycleLease};
@@ -448,6 +449,7 @@ fn config_example(data_dir: &Path) -> Result<()> {
         health: HealthConfig::default(),
         resource_reporting: ResourceReportingConfig::default(),
         process_reporting: ProcessReportingConfig::default(),
+        service_reporting: ServiceReportingConfig::default(),
         updates: None,
     };
     config.validate()?;

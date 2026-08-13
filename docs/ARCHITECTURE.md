@@ -166,6 +166,11 @@ requests name only an owner-defined `ManagedProcess` identifier. A numeric PID
 is never authorization identity, and the node neither enumerates processes nor
 returns command lines, environments, paths, users, or control handles.
 
+ServiceStatus uses another role-separated signed-snapshot contract and accepts
+only owner-defined logical service identifiers. The node does not invoke a
+service manager, enumerate services, or disclose unit files, configuration,
+credentials, logs, commands, environments, process IDs, or control handles.
+
 Agent Green remains independent. Its health is `Healthy`, `Degraded`,
 `Unhealthy`, `Unavailable`, or `Unknown` and must come from a configured,
 component-bound signed local health contract. Process presence alone is not

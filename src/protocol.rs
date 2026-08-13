@@ -343,7 +343,7 @@ impl ActionTarget {
                 validate_local_identifier(process_id, "logical process id")
             }
             Self::Service { service_name } => {
-                validate_required_string(service_name, MAX_ID_BYTES, "service name")
+                validate_local_identifier(service_name, "logical service id")
             }
             Self::ApprovedAction { action_id } => {
                 validate_required_string(action_id, MAX_ID_BYTES, "approved action id")
@@ -1678,6 +1678,24 @@ mod tests {
         let legacy = ActionTarget::Process { process_id: 42 };
         assert!(legacy.validate().is_ok());
         assert!(!Capability::ProcessStatus.matches_target(&legacy));
+    }
+
+    #[test]
+    fn logical_service_target_rejects_paths_and_free_form_names() {
+        let logical = ActionTarget::Service {
+            service_name: "model-engine.service".to_owned(),
+        };
+        assert!(logical.validate().is_ok());
+        assert!(Capability::ServiceStatus.matches_target(&logical));
+        for invalid in ["private/path", "model engine", "../service", ""] {
+            assert!(
+                ActionTarget::Service {
+                    service_name: invalid.to_owned(),
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 
     #[test]

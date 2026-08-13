@@ -154,13 +154,18 @@ ask for child-process enumeration.
 
 ### ServiceStatus
 
-Queries a configured allowlist of service names through a read-only
-platform-specific adapter. Results use a small state vocabulary plus timestamp
-and reason code. It does not return unit files, environment values, credentials,
-or an unrestricted service-manager interface.
+v0.1 optionally returns bounded status for an exact owner-defined logical
+service identifier through the signed local snapshot contract in
+`SERVICE-STATUS-SNAPSHOTS.md`. Enabling it requires its own pinned,
+role-separated producer key and fresh no-follow snapshot. Results contain only
+the logical ID, a small state vocabulary, snapshot observation time, and an
+optional sanitized detail code.
 
-Starting, stopping, enabling, disabling, or editing a service is outside this
-capability.
+It does not call a platform service manager, enumerate services, return unit or
+plist files, environments, credentials, process IDs, logs, dependencies, or
+configuration, or expose an unrestricted manager interface. Installing,
+starting, stopping, restarting, reloading, enabling, disabling, or editing a
+service is outside this capability.
 
 ### ExecuteApprovedAction
 

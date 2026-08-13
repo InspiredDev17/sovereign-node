@@ -48,6 +48,15 @@ max_action_runtime_secs = 30
 # public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # max_age_secs = 30
 
+[service_reporting]
+# Optional and disabled by default. Enabling ServiceStatus requires this signed, fresh logical
+# snapshot and a higher policy_version. The payload cannot contain service-manager paths,
+# commands, environments, credentials, PIDs, logs, configuration, or control instructions.
+# [service_reporting.snapshot]
+# snapshot_path = "/run/sovereign-services/status.json"
+# public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# max_age_secs = 30
+
 # Reserved future policy shape. v0.1 rejects advertising FileRead/FileWrite.
 # The root must not contain or be contained by data_dir.
 # [file_roots]

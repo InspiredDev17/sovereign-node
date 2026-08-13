@@ -21,6 +21,7 @@ use crate::protocol::{
     InferenceEngineStatusV1, LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
 };
 use crate::resources::{HealthReporter, QueueSnapshot, ResourceReporter, ResourceSnapshotReporter};
+use crate::service_status::{ServiceStatusError, ServiceStatusReporter};
 
 #[derive(Debug, Eq, Error, PartialEq)]
 pub enum CapabilityError {
@@ -60,6 +61,7 @@ pub struct CapabilityExecutor {
     resources: ResourceReporter,
     external_resources: ResourceSnapshotReporter,
     process_status: ProcessStatusReporter,
+    service_status: ServiceStatusReporter,
     health: HealthReporter,
 }
 
@@ -69,11 +71,13 @@ impl CapabilityExecutor {
         let health = HealthReporter::new(&config.health);
         let external_resources = ResourceSnapshotReporter::new(&config.resource_reporting);
         let process_status = ProcessStatusReporter::new(config.process_reporting.snapshot.as_ref());
+        let service_status = ServiceStatusReporter::new(config.service_reporting.snapshot.as_ref());
         Self {
             config,
             resources,
             external_resources,
             process_status,
+            service_status,
             health,
         }
     }
@@ -135,6 +139,14 @@ impl CapabilityExecutor {
                     ProcessStatusError::SnapshotUnavailable => CapabilityError::Execution,
                     ProcessStatusError::TargetNotFound => CapabilityError::TargetNotAllowed,
                 }),
+            (ActionTarget::Service { service_name }, ActionArguments::ServiceStatus) => self
+                .service_status
+                .status(now, service_name)
+                .map(ActionResultV1::ServiceStatus)
+                .map_err(|error| match error {
+                    ServiceStatusError::SnapshotUnavailable => CapabilityError::Execution,
+                    ServiceStatusError::TargetNotFound => CapabilityError::TargetNotAllowed,
+                }),
             (
                 ActionTarget::ApprovedAction { action_id },
                 ActionArguments::ExecuteApprovedAction { parameters },
@@ -172,8 +184,7 @@ impl CapabilityExecutor {
             (ActionTarget::ActionBroker, ActionArguments::ActionBrokerHealth) => Ok(
                 ActionResultV1::ActionBrokerHealth(self.health.action_broker(now)),
             ),
-            (ActionTarget::Service { .. }, ActionArguments::ServiceStatus)
-            | (ActionTarget::Repository { .. }, ActionArguments::RepositoryStatus { .. }) => {
+            (ActionTarget::Repository { .. }, ActionArguments::RepositoryStatus { .. }) => {
                 Err(CapabilityError::Unsupported)
             }
             _ => Err(CapabilityError::ArgumentMismatch),
