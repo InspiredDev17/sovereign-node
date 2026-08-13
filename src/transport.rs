@@ -658,9 +658,19 @@ mod tests {
     ) -> TestResult<TrustedPeer> {
         let owner = SigningKey::generate(&mut OsRng);
         let broker = SigningKey::generate(&mut OsRng);
-        pair_transport_peer_with_keys(store, pki, peer_id, client, challenge_byte, &owner, &broker)
+        pair_transport_peer_with_keys(
+            store,
+            pki,
+            peer_id,
+            client,
+            challenge_byte,
+            &owner,
+            &broker,
+            None,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pair_transport_peer_with_keys(
         store: &StateStore,
         pki: &TestPki,
@@ -669,8 +679,13 @@ mod tests {
         challenge_byte: u8,
         owner: &SigningKey,
         broker: &SigningKey,
+        trust_expires_at_unix_ms: Option<i64>,
     ) -> TestResult<TrustedPeer> {
         let certificate_digest: [u8; 32] = Sha256::digest(client.certificate.as_ref()).into();
+        let trust_expires_at = trust_expires_at_unix_ms
+            .map(u64::try_from)
+            .transpose()?
+            .map(UnixMillis);
         let material = PairingKeyMaterialV1 {
             schema_version: 1,
             owner_id: format!("owner-{peer_id}"),
@@ -679,7 +694,7 @@ mod tests {
             client_ca_der: pki.ca.as_ref().to_vec(),
             client_certificate_sha256: Sha256Digest(certificate_digest),
             allowed_capabilities: vec![Capability::SystemInfo],
-            trust_expires_at: None,
+            trust_expires_at,
         };
         let encoded = postcard::to_allocvec(&material)?;
         let now = current_time_millis()?;
@@ -704,7 +719,7 @@ mod tests {
                 owner_authority_digest: sha256(b"owner"),
                 capability_manifest_digest: sha256(b"manifest"),
                 approved_at_unix_ms: now + 1,
-                trust_expires_at_unix_ms: None,
+                trust_expires_at_unix_ms,
             },
             &challenge,
         )?;
@@ -1088,6 +1103,7 @@ mod tests {
             4,
             &owner,
             &broker,
+            None,
         )?;
 
         let policy = PolicyConfig {
@@ -1439,6 +1455,114 @@ mod tests {
             new_session.peer.certificate_sha256,
             rotated_material.client_certificate_sha256
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trust_expiry_closes_existing_session_and_denies_reconnect() -> TestResult {
+        let pki = test_pki()?;
+        let directory = tempfile::TempDir::new()?;
+        let store = Arc::new(StateStore::open(directory.path().join("state.sqlite3"))?);
+        let owner = SigningKey::generate(&mut OsRng);
+        let broker = SigningKey::generate(&mut OsRng);
+        let expires_at = current_time_millis()?.saturating_add(2_000);
+        let trusted = pair_transport_peer_with_keys(
+            &store,
+            &pki,
+            "peer-expiring",
+            &pki.paired_client,
+            6,
+            &owner,
+            &broker,
+            Some(expires_at),
+        )?;
+        let trust = Arc::new(
+            build_transport_trust(&server_identity(&pki), &store)?
+                .ok_or_else(|| std::io::Error::other("transport trust missing"))?,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let acceptor = TlsAcceptor::from(trust.tls.clone());
+        let server_store = store.clone();
+        let (session_ready, session_established) = tokio::sync::oneshot::channel();
+        let established_server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.map_err(TransportError::Io)?;
+            let mut tls = acceptor.accept(tcp).await.map_err(TransportError::Io)?;
+            let session = authenticated_session(&tls, &trust.session_by_leaf)
+                .ok_or(TransportError::UnpairedClient)?;
+            session_ready
+                .send(())
+                .map_err(|()| TransportError::RuntimeTask)?;
+            read_frame_with_trust(&mut tls, &server_store, &session, 1024).await
+        });
+
+        let tcp = TcpStream::connect(address).await?;
+        let connector = TlsConnector::from(client_config(&pki, Some(&pki.paired_client))?);
+        let mut client = connector
+            .connect(ServerName::try_from("localhost")?, tcp)
+            .await?;
+        session_established.await?;
+        let server_result =
+            tokio::time::timeout(Duration::from_secs(5), established_server).await??;
+        assert!(matches!(
+            server_result,
+            Err(TransportError::SessionTrustChanged)
+        ));
+        assert!(
+            store
+                .currently_trusted_peer(&trusted.peer_id, current_time_millis()?)?
+                .is_none()
+        );
+        assert!(build_transport_trust(&server_identity(&pki), &store)?.is_none());
+        let mut byte = [0_u8; 1];
+        let client_read =
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await?;
+        assert!(matches!(client_read, Ok(0) | Err(_)));
+
+        let cached = Arc::new(tls13_server_config(
+            vec![pki.server.certificate.clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pki.server.private_key.clone())),
+            {
+                let mut roots = RootCertStore::empty();
+                roots.add(pki.ca.clone())?;
+                roots
+            },
+        )?);
+        let reconnect_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let reconnect_address = reconnect_listener.local_addr()?;
+        let reconnect_acceptor = TlsAcceptor::from(cached);
+        let reconnect_store = store.clone();
+        let reconnect_session = TransportSession {
+            peer: TransportPeer {
+                peer_id: trusted.peer_id.clone(),
+                certificate_sha256: Sha256Digest(
+                    Sha256::digest(pki.paired_client.certificate.as_ref()).into(),
+                ),
+                trust_epoch: trusted.trust_epoch,
+            },
+        };
+        let reconnect = tokio::spawn(async move {
+            let (tcp, _) = reconnect_listener
+                .accept()
+                .await
+                .map_err(TransportError::Io)?;
+            let tls = reconnect_acceptor
+                .accept(tcp)
+                .await
+                .map_err(TransportError::Io)?;
+            ensure_session_current(&reconnect_store, &reconnect_session)?;
+            drop(tls);
+            Ok::<_, TransportError>(())
+        });
+        let reconnect_tcp = TcpStream::connect(reconnect_address).await?;
+        let reconnect_client = TlsConnector::from(client_config(&pki, Some(&pki.paired_client))?)
+            .connect(ServerName::try_from("localhost")?, reconnect_tcp)
+            .await;
+        assert!(reconnect_client.is_ok());
+        assert!(matches!(
+            reconnect.await?,
+            Err(TransportError::SessionTrustChanged)
+        ));
         Ok(())
     }
 

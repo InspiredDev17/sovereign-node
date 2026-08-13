@@ -243,6 +243,9 @@ action-audit state is created.
 Credential-rotation transport tests additionally prove an established old TLS
 session closes after the durable epoch change, the prior leaf cannot recover a
 paired session, and only the replacement leaf binds to the incremented epoch.
+Trust-expiry transport tests prove an authenticated idle session closes at its
+lease deadline, refreshed trust excludes it, and cached TLS roots cannot bypass
+the per-session current-trust gate on reconnect.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.

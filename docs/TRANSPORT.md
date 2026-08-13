@@ -210,6 +210,12 @@ across an atomic trust-epoch and leaf-pin change. The old session closes within
 the trust-check interval, reconnecting with the prior leaf resolves to no paired
 session, and only the replacement leaf resolves to the incremented epoch.
 
+Trust-lease tests authenticate before an owner-approved lease expires, hold the
+session idle across the exact deadline, and require closure at the next trust
+check. The expired peer disappears from refreshed TLS trust, and even a
+successful handshake against cached certificate roots fails the current-trust
+gate before a session can process frames.
+
 For an action whose side effect cannot be proven after a crash, the result is
 Indeterminate and requires owner reconciliation. The runtime must not guess and
 execute it again.
