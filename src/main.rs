@@ -20,7 +20,9 @@ use sovereign_node::config::{
     HealthConfig, NodeConfig, PolicyConfig, ProcessReportingConfig, RepositoryReportingConfig,
     ResourceReportingConfig, ServiceReportingConfig,
 };
-use sovereign_node::identity::{IdentityProofRequest, NodeIdentity, verify_identity_proof_file};
+use sovereign_node::identity::{
+    IdentityProofRequest, NodeIdentity, require_active_policy, verify_identity_proof_file,
+};
 use sovereign_node::lifecycle::{LeaseKind, LifecycleLease};
 use sovereign_node::pairing::{
     CredentialRotationProof, CredentialRotationRequest, PairingKeyMaterialV1, PairingManager,
@@ -604,9 +606,14 @@ fn identity_proof(args: IdentityProofArgs) -> Result<()> {
     let _admin_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::AdminMutation)?;
     let identity = NodeIdentity::load(&config.data_dir)?;
     let store = open_store(&config)?;
-    store.verify_audit_chain()?;
     let issued_at = now()?;
-    let peers = store.currently_trusted_peers(to_i64(issued_at)?)?;
+    let snapshot = store.identity_proof_state_snapshot(to_i64(issued_at)?)?;
+    let configured_policy_digest = Sha256Digest(config.policy_digest()?);
+    require_active_policy(
+        snapshot.active_policy,
+        config.policy_version,
+        configured_policy_digest,
+    )?;
     let expires_at = UnixMillis(
         issued_at
             .0
@@ -620,8 +627,8 @@ fn identity_proof(args: IdentityProofArgs) -> Result<()> {
     };
     let proof = identity.fresh_identity_proof(IdentityProofRequest {
         manifest,
-        local_policy_digest: Sha256Digest(config.policy_digest()?),
-        active_peers: &peers,
+        local_policy_digest: configured_policy_digest,
+        active_peers: &snapshot.trusted_peers,
         trust_observed_at_unix_ms: to_i64(issued_at)?,
         requester_challenge: Nonce(fixed_bytes::<32>(
             &args.challenge_hex,

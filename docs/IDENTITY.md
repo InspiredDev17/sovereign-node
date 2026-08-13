@@ -43,6 +43,14 @@ manifest, epoch, pairing, or expiry changes while excluding raw peer IDs, keys,
 and labels. Proof creation briefly holds the local admin-mutation lease so the
 trust set cannot change during its snapshot.
 
+The same SQLite read snapshot verifies the complete audit chain and reads the
+durable active policy binding. `identity-proof` fails closed when policy has
+never been activated, or when the selected config reuses an active version with
+a different digest, advances beyond the active version, or rolls back below it.
+The operator must first start the daemon with the intended valid configuration
+so normal monotonic policy activation succeeds. Proof generation itself never
+activates or changes policy.
+
 The v0.1 rotation CLI is narrower than the target ceremony: it requires local
 confirmation, serializes against every pairing/revocation mutation, refuses to
 run while the daemon or any trusted peer is active, preserves NodeId, writes a
@@ -145,6 +153,8 @@ A captured proof can still be presented during its signed validity window if a
 requester reuses the same challenge. Freshness therefore depends on a new
 requester nonce and local tracking of which nonce was issued. V2 does not claim
 TPM-backed attestation or prove that a root-compromised host reported honestly.
+It is also a point-in-time snapshot: later policy, trust, or revocation changes
+require a newly challenged proof.
 
 ## Trust status
 

@@ -224,7 +224,9 @@ Identity-proof tests cover requester nonce binding, short expiry, future and
 expired rejection, strict nested JSON, exact NodeId/key pins, manifest and
 policy mutation, forged signatures, bounded no-follow input, stable trust-set
 ordering, epoch sensitivity, and rejection of expired, revoked, duplicate, or
-wrong-node trust records.
+wrong-node trust records. Coherent-state tests require the configured policy to
+match the durable activated version and digest, reject inactive or mismatched
+bindings, and verify trust, policy, and audit chain in one SQLite snapshot.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.
@@ -239,6 +241,7 @@ They assert that denied requests produce no capability side effect.
 | Host clock rollback | A durable high-water mark rejects material backwards movement at startup, admission, and replay reservation; only a stopped-daemon, owner-confirmed, audited local acknowledgement can lower it |
 | Wrong node | A correctly signed action for another NodeId is rejected |
 | Replayed identity statement | V1 remains informational; V2 requires a fresh requester nonce, short expiry, strict signature verification, and owner-retained NodeId/key pins |
+| Alternate identity-proof config | Proof generation refuses inactive, rolled-back, advanced-but-unactivated, or same-version-remapped policy and reads trust/policy/audit from one SQLite snapshot |
 | Capability mismatch | Unknown, disabled, wrong-version, wrong-target, or wrong-policy capabilities are rejected |
 | Disconnect | Loss before reservation has no effect; loss after reservation cannot cause automatic retry |
 | Reconnect | Peer reauthenticates, trust is rechecked, and queued expired or revoked actions remain denied |

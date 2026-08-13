@@ -22,7 +22,7 @@ use crate::resources::ResourceReporter;
 use crate::security::{
     SecureFileError, create_private_file, ensure_private_directory, read_private_file,
 };
-use crate::store::{StoreError, TrustedPeer};
+use crate::store::{ActivePolicyBinding, StoreError, TrustedPeer};
 
 const IDENTITY_FILENAME: &str = "identity.json";
 const IDENTITY_ROTATION_DOMAIN: &[u8] = b"sovereign-node/device-identity-rotation/v1\0";
@@ -101,6 +101,10 @@ pub enum IdentityProofError {
     InvalidTrustSnapshot,
     #[error("identity proof input is invalid: {0}")]
     InvalidInput(&'static str),
+    #[error("identity proof requires a durably activated local policy")]
+    PolicyInactive,
+    #[error("configured policy does not match the durable active policy")]
+    PolicyMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -443,6 +447,18 @@ pub fn active_trust_summary(
         maximum_peer_trust_epoch,
         active_trust_set_digest: Sha256Digest(hasher.finalize().into()),
     })
+}
+
+pub fn require_active_policy(
+    active: Option<ActivePolicyBinding>,
+    expected_version: u64,
+    expected_digest: Sha256Digest,
+) -> Result<(), IdentityProofError> {
+    let active = active.ok_or(IdentityProofError::PolicyInactive)?;
+    if active.version != expected_version || active.digest != expected_digest.0 {
+        return Err(IdentityProofError::PolicyMismatch);
+    }
+    Ok(())
 }
 
 pub fn verify_identity_proof(
@@ -848,6 +864,48 @@ mod tests {
                 .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn identity_proof_requires_exact_durable_active_policy() {
+        let digest = Sha256Digest([0x71; 32]);
+        assert!(matches!(
+            require_active_policy(None, 7, digest),
+            Err(IdentityProofError::PolicyInactive)
+        ));
+        assert!(matches!(
+            require_active_policy(
+                Some(ActivePolicyBinding {
+                    version: 6,
+                    digest: digest.0,
+                }),
+                7,
+                digest,
+            ),
+            Err(IdentityProofError::PolicyMismatch)
+        ));
+        assert!(matches!(
+            require_active_policy(
+                Some(ActivePolicyBinding {
+                    version: 7,
+                    digest: [0x72; 32],
+                }),
+                7,
+                digest,
+            ),
+            Err(IdentityProofError::PolicyMismatch)
+        ));
+        assert!(
+            require_active_policy(
+                Some(ActivePolicyBinding {
+                    version: 7,
+                    digest: digest.0,
+                }),
+                7,
+                digest,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

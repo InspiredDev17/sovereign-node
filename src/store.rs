@@ -922,6 +922,19 @@ pub struct AuditReadSnapshot {
     pub actions: Vec<ActionAuditRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActivePolicyBinding {
+    pub version: u64,
+    pub digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityProofStateSnapshot {
+    pub trusted_peers: Vec<TrustedPeer>,
+    pub active_policy: Option<ActivePolicyBinding>,
+    pub audit_chain: AuditChainState,
+}
+
 #[derive(Debug)]
 pub struct StateStore {
     connection: Mutex<Connection>,
@@ -2089,22 +2102,27 @@ impl StateStore {
         now_unix_ms: i64,
     ) -> Result<Vec<TrustedPeer>, StoreError> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT record FROM trusted_peers
-             WHERE trust_status = 1
-               AND (trust_expires_at_unix_ms IS NULL OR trust_expires_at_unix_ms > ?1)
-             ORDER BY peer_id ASC",
-        )?;
-        let rows = statement.query_map([now_unix_ms], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut peers = Vec::new();
-        for row in rows {
-            let peer: TrustedPeer = decode(&row?)?;
-            if !peer.is_currently_trusted(now_unix_ms) {
-                return Err(StoreError::CorruptData("trust index disagrees with record"));
-            }
-            peers.push(peer);
-        }
-        Ok(peers)
+        currently_trusted_peers_in_connection(&connection, now_unix_ms)
+    }
+
+    /// Read the active peers, durable policy binding, and verified audit tail
+    /// from one SQLite snapshot for a challenge-bound identity proof.
+    pub fn identity_proof_state_snapshot(
+        &self,
+        now_unix_ms: i64,
+    ) -> Result<IdentityProofStateSnapshot, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // The first trust read establishes the coherent SQLite snapshot.
+        let trusted_peers = currently_trusted_peers_in_connection(&transaction, now_unix_ms)?;
+        let active_policy = active_policy_binding_in_connection(&transaction)?;
+        let audit_chain = verify_audit_chain_in_connection(&transaction)?;
+        transaction.commit()?;
+        Ok(IdentityProofStateSnapshot {
+            trusted_peers,
+            active_policy,
+            audit_chain,
+        })
     }
 
     pub fn revoke_peer(
@@ -3220,6 +3238,56 @@ impl StateStore {
     }
 }
 
+fn currently_trusted_peers_in_connection(
+    connection: &Connection,
+    now_unix_ms: i64,
+) -> Result<Vec<TrustedPeer>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT record FROM trusted_peers
+         WHERE trust_status = 1
+           AND (trust_expires_at_unix_ms IS NULL OR trust_expires_at_unix_ms > ?1)
+         ORDER BY peer_id ASC",
+    )?;
+    let rows = statement.query_map([now_unix_ms], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut peers = Vec::new();
+    for row in rows {
+        let peer: TrustedPeer = decode(&row?)?;
+        if !peer.is_currently_trusted(now_unix_ms) {
+            return Err(StoreError::CorruptData("trust index disagrees with record"));
+        }
+        peers.push(peer);
+    }
+    Ok(peers)
+}
+
+fn active_policy_binding_in_connection(
+    connection: &Connection,
+) -> Result<Option<ActivePolicyBinding>, StoreError> {
+    let stored: Option<(Vec<u8>, Vec<u8>)> = connection
+        .query_row(
+            "SELECT policy_version, policy_digest FROM policy_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    stored
+        .map(|(version, digest)| {
+            let version = u64::from_be_bytes(
+                version
+                    .try_into()
+                    .map_err(|_| StoreError::CorruptData("policy version has invalid length"))?,
+            );
+            if version == 0 {
+                return Err(StoreError::CorruptData("policy version is zero"));
+            }
+            Ok(ActivePolicyBinding {
+                version,
+                digest: digest_from_blob(digest)?,
+            })
+        })
+        .transpose()
+}
+
 fn audit_events_after_in_connection(
     connection: &Connection,
     sequence: u64,
@@ -4131,6 +4199,32 @@ mod tests {
             not_before_unix_ms: NOW - 10,
             expires_at_unix_ms: i64::MAX,
         })
+    }
+
+    #[test]
+    fn identity_proof_snapshot_binds_trust_policy_and_verified_audit_tail() -> Result<(), StoreError>
+    {
+        let (_directory, _path, store) = test_store()?;
+        let empty = store.identity_proof_state_snapshot(NOW)?;
+        assert!(empty.trusted_peers.is_empty());
+        assert_eq!(empty.active_policy, None);
+        assert_eq!(empty.audit_chain.event_count, 0);
+
+        let (_, peer) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let policy_digest = sha256(b"identity-proof-policy");
+        store.activate_policy(9, policy_digest, NOW + 1)?;
+        let snapshot = store.identity_proof_state_snapshot(NOW + 2)?;
+        assert_eq!(snapshot.trusted_peers, vec![peer]);
+        assert_eq!(
+            snapshot.active_policy,
+            Some(ActivePolicyBinding {
+                version: 9,
+                digest: policy_digest,
+            })
+        );
+        assert!(snapshot.audit_chain.event_count >= 3);
+        assert_eq!(snapshot.audit_chain, store.verify_audit_chain()?);
+        Ok(())
     }
 
     fn pair_peer(

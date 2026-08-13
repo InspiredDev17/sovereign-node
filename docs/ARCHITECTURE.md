@@ -92,6 +92,14 @@ the original challenge; it reads only bounded no-follow JSON and opens neither
 node state nor a network. These proofs authenticate a statement, not a host,
 and never authorize an action.
 
+Proof creation reads active peers, the durable activated policy binding, and a
+verified audit-chain tail from one SQLite snapshot. It refuses to sign if no
+policy has been activated or if the supplied configuration's policy version or
+digest differs from that durable binding. This prevents an alternate config
+file from producing a valid-looking proof for policy the runtime has never
+accepted. The snapshot is point-in-time evidence; a later policy activation or
+trust mutation requires a new challenge and proof.
+
 ### Transport endpoint
 
 The initial remote transport is TLS 1.3 with mutual authentication on an
