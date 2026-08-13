@@ -21,10 +21,10 @@ use sovereign_node::pairing::{
     PairingProof, PairingRecoveryProof, PairingRecoveryRequest, PairingRequest,
 };
 use sovereign_node::protocol::{
-    Capability, CapabilityManifestV1, PairingId, PublicKeyBytes, Sha256Digest, SignatureBytes,
-    SignedNodeRegistrationV1, TrustStatus, UnixMillis,
+    Capability, CapabilityManifestV1, ComponentHealthV1, PairingId, PublicKeyBytes, Sha256Digest,
+    SignatureBytes, SignedNodeRegistrationV1, TrustStatus, UnixMillis,
 };
-use sovereign_node::resources::ResourceReporter;
+use sovereign_node::resources::{HealthReporter, ResourceReporter};
 use sovereign_node::runtime::{NodeRuntime, RuntimeCapacity};
 use sovereign_node::store::{
     AuditEventDraft, AuditKind, AuditOutcome, RevocationOutcome, StateStore, sha256,
@@ -280,7 +280,8 @@ struct StatusOutput {
     audit_tail_sha256: String,
     listener: Option<String>,
     default_remote_execution: &'static str,
-    agent_green_health: &'static str,
+    agent_green_health: ComponentHealthV1,
+    action_broker_health: ComponentHealthV1,
     staged_update_version: Option<String>,
     staged_update_release_counter: Option<u64>,
     update_installation: &'static str,
@@ -418,8 +419,10 @@ fn status(config_path: &Path) -> Result<()> {
     let identity = NodeIdentity::load(&config.data_dir)?;
     let store = open_store(&config)?;
     let audit = store.verify_audit_chain()?;
-    let peers = store.currently_trusted_peers(to_i64(now()?)?)?;
+    let observed_at = now()?;
+    let peers = store.currently_trusted_peers(to_i64(observed_at)?)?;
     let staged_update = store.latest_staged_update()?;
+    let health = HealthReporter::new(&config.health);
     print_json(&StatusOutput {
         node_id: identity.node_id().to_string(),
         identity_fingerprint_sha256: identity.fingerprint(),
@@ -428,7 +431,8 @@ fn status(config_path: &Path) -> Result<()> {
         audit_tail_sha256: hex::encode(audit.tail_hash),
         listener: config.listen.map(|address| address.to_string()),
         default_remote_execution: "deny unless exact owner+broker authorization verifies",
-        agent_green_health: "unknown until an explicit authenticated read-only adapter is configured",
+        agent_green_health: health.agent_green(observed_at),
+        action_broker_health: health.action_broker(observed_at),
         staged_update_version: staged_update
             .as_ref()
             .map(|record| record.software_version.clone()),

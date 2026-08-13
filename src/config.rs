@@ -101,10 +101,20 @@ pub struct ApprovedActionConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HealthConfig {
-    /// Optional owner-maintained, sanitized health snapshot. It is never treated as attestation.
-    pub agent_green_snapshot: Option<PathBuf>,
-    /// Optional local Action Broker health endpoint identifier. Network polling is not implicit.
-    pub action_broker_label: Option<String>,
+    /// Optional signed, sanitized Agent Green health snapshot. Never treated as attestation.
+    pub agent_green: Option<HealthSnapshotConfig>,
+    /// Optional signed, sanitized Action Broker health snapshot. Network polling is never implicit.
+    pub action_broker: Option<HealthSnapshotConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthSnapshotConfig {
+    pub snapshot_path: PathBuf,
+    /// Pinned Ed25519 public key for this health producer, encoded as 64 hex characters.
+    pub public_key_hex: String,
+    /// Maximum producer-declared validity window and observation age.
+    pub max_age_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -228,9 +238,29 @@ impl NodeConfig {
                 "v1 requires an exact owner signature for every remote action".to_owned(),
             ));
         }
-        if self.health.agent_green_snapshot.is_some() || self.health.action_broker_label.is_some() {
+        let agent_green_health_key = self
+            .health
+            .agent_green
+            .as_ref()
+            .map(|adapter| validate_health_adapter("health.agent_green", adapter))
+            .transpose()?;
+        let action_broker_health_key = self
+            .health
+            .action_broker
+            .as_ref()
+            .map(|adapter| validate_health_adapter("health.action_broker", adapter))
+            .transpose()?;
+        if agent_green_health_key.is_some() && agent_green_health_key == action_broker_health_key {
             return Err(ConfigError::Invalid(
-                "health adapters are not implemented in v0.1; status remains Unknown".to_owned(),
+                "Agent Green and Action Broker health keys must be role-separated".to_owned(),
+            ));
+        }
+        if let (Some(agent_green), Some(action_broker)) =
+            (&self.health.agent_green, &self.health.action_broker)
+            && agent_green.snapshot_path == action_broker.snapshot_path
+        {
+            return Err(ConfigError::Invalid(
+                "Agent Green and Action Broker health snapshots must use separate paths".to_owned(),
             ));
         }
         if let Some(updates) = &self.updates {
@@ -311,11 +341,20 @@ impl NodeConfig {
                     "file root {root_id} overlaps TLS credential material"
                 )));
             }
-            if let Some(agent_green) = &self.health.agent_green_snapshot
-                && path_contains_or_is_contained(root, agent_green)?
+            if let Some(agent_green) = &self.health.agent_green
+                && agent_green.snapshot_path.exists()
+                && path_contains_or_is_contained(root, &agent_green.snapshot_path)?
             {
                 return Err(ConfigError::Invalid(format!(
                     "file root {root_id} overlaps Agent Green health material"
+                )));
+            }
+            if let Some(action_broker) = &self.health.action_broker
+                && action_broker.snapshot_path.exists()
+                && path_contains_or_is_contained(root, &action_broker.snapshot_path)?
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "file root {root_id} overlaps Action Broker health material"
                 )));
             }
         }
@@ -372,6 +411,10 @@ impl NodeConfig {
 }
 
 fn parse_update_key(name: &str, value: &str) -> Result<VerifyingKey, ConfigError> {
+    parse_ed25519_key(name, value)
+}
+
+fn parse_ed25519_key(name: &str, value: &str) -> Result<VerifyingKey, ConfigError> {
     let bytes = hex::decode(value)
         .map_err(|_| ConfigError::Invalid(format!("{name} must be hexadecimal")))?;
     let bytes: [u8; 32] = bytes
@@ -384,6 +427,20 @@ fn parse_update_key(name: &str, value: &str) -> Result<VerifyingKey, ConfigError
             "{name} is a weak Ed25519 key"
         )));
     }
+    Ok(key)
+}
+
+fn validate_health_adapter(
+    name: &str,
+    adapter: &HealthSnapshotConfig,
+) -> Result<VerifyingKey, ConfigError> {
+    require_absolute(&format!("{name}.snapshot_path"), &adapter.snapshot_path)?;
+    if adapter.max_age_secs == 0 || adapter.max_age_secs > 86_400 {
+        return Err(ConfigError::Invalid(format!(
+            "{name}.max_age_secs must be between 1 and 86400"
+        )));
+    }
+    let key = parse_ed25519_key(&format!("{name}.public_key_hex"), &adapter.public_key_hex)?;
     Ok(key)
 }
 
@@ -563,6 +620,44 @@ mod tests {
             owner_approval_public_key_hex: hex::encode(owner.verifying_key().as_bytes()),
             max_artifact_bytes: 0,
         });
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn health_snapshot_keys_are_bounded_and_role_separated() {
+        let agent_green = SigningKey::from_bytes(&[0x61; 32]);
+        let action_broker = SigningKey::from_bytes(&[0x62; 32]);
+        let mut config = minimal_config();
+        config.health = HealthConfig {
+            agent_green: Some(HealthSnapshotConfig {
+                snapshot_path: PathBuf::from("/run/agentgreen/health.json"),
+                public_key_hex: hex::encode(agent_green.verifying_key().to_bytes()),
+                max_age_secs: 60,
+            }),
+            action_broker: Some(HealthSnapshotConfig {
+                snapshot_path: PathBuf::from("/run/sovereign-action-broker/health.json"),
+                public_key_hex: hex::encode(action_broker.verifying_key().to_bytes()),
+                max_age_secs: 30,
+            }),
+        };
+        assert!(config.validate().is_ok());
+
+        if let Some(adapter) = &mut config.health.action_broker {
+            adapter.public_key_hex =
+                hex::encode(agent_green.verifying_key().to_bytes()).to_uppercase();
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        if let Some(adapter) = &mut config.health.action_broker {
+            adapter.public_key_hex = hex::encode(action_broker.verifying_key().to_bytes());
+            adapter.snapshot_path = PathBuf::from("/run/agentgreen/health.json");
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        if let Some(adapter) = &mut config.health.action_broker {
+            adapter.snapshot_path = PathBuf::from("/run/sovereign-action-broker/health.json");
+            adapter.max_age_secs = 0;
+        }
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 }

@@ -50,7 +50,16 @@ max_action_runtime_secs = 30
 # timeout_secs = 10
 
 [health]
-# Reserved future policy shape; uncommenting either field is rejected in v0.1. Agent Green has no
-# assumed endpoint. A future adapter must be authenticated, read-only, sanitized, and non-attesting.
-# agent_green_snapshot = "/run/agentgreen/sanitized-health.json"
-# action_broker_label = "local-action-broker"
+# Both adapters are optional and disabled by default. They only read a bounded, signed, sanitized
+# local snapshot; they never contact, configure, or control either component. Missing, stale,
+# malformed, symlinked, or incorrectly signed snapshots report Unknown.
+#
+# [health.agent_green]
+# snapshot_path = "/run/agentgreen/sovereign-node-health.json"
+# public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# max_age_secs = 60
+#
+# [health.action_broker]
+# snapshot_path = "/run/sovereign-action-broker/health.json"
+# public_key_hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+# max_age_secs = 30

@@ -154,9 +154,10 @@ engine availability, loaded models, queue state, Agent Green health, and Action
 Broker health. Unsupported or unverifiable values are reported as unknown, not
 as healthy or zero.
 
-Agent Green remains independent. Its health is only Healthy, Unhealthy, or
-Unknown and must come from a configured local health contract. Process presence
-alone is not proof of health.
+Agent Green remains independent. Its health is `Healthy`, `Degraded`,
+`Unhealthy`, `Unavailable`, or `Unknown` and must come from a configured,
+component-bound signed local health contract. Process presence alone is not
+proof of health.
 
 ### Audit journal
 

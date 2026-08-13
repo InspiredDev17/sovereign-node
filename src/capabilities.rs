@@ -20,7 +20,7 @@ use crate::protocol::{
     ApprovedActionResultV1, EntityStatusV1, FileReadResultV1, FileWriteMode, FileWriteResultV1,
     Sha256Digest, TrustStatus, UnixMillis,
 };
-use crate::resources::{QueueSnapshot, ResourceReporter, unknown_health};
+use crate::resources::{HealthReporter, QueueSnapshot, ResourceReporter};
 
 #[derive(Debug, Error)]
 pub enum CapabilityError {
@@ -58,12 +58,18 @@ impl CapabilityError {
 pub struct CapabilityExecutor {
     config: Arc<NodeConfig>,
     resources: ResourceReporter,
+    health: HealthReporter,
 }
 
 impl CapabilityExecutor {
     #[must_use]
     pub fn new(config: Arc<NodeConfig>, resources: ResourceReporter) -> Self {
-        Self { config, resources }
+        let health = HealthReporter::new(&config.health);
+        Self {
+            config,
+            resources,
+            health,
+        }
     }
 
     pub async fn execute(
@@ -82,8 +88,8 @@ impl CapabilityExecutor {
                 Ok(ActionResultV1::ResourceStatus(self.resources.report(
                     now,
                     queue,
-                    unknown_health(now, "Agent Green"),
-                    unknown_health(now, "Action Broker"),
+                    self.health.agent_green(now),
+                    self.health.action_broker(now),
                 )))
             }
             (

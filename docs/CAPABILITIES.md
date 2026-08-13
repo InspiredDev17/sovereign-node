@@ -207,6 +207,13 @@ configured local health adapters. Each health value is:
 - Unknown: unsupported, stale, unreachable, unauthenticated, malformed, or
   otherwise unverifiable.
 
+The v0.1 adapter reads a bounded local file without following the final
+symlink, verifies a component-specific pinned Ed25519 key over the exact JSON
+payload bytes, enforces the producer's observation and expiration times, and
+accepts only a bounded machine-readable detail code. Agent Green and Action
+Broker keys must be distinct. See [HEALTH-SNAPSHOTS.md](HEALTH-SNAPSHOTS.md)
+for the producer contract.
+
 Agent Green is an independent security monitor. Sovereign Node may observe its
 health but cannot start, stop, disable, configure, update, or claim to replace
 it. Process presence by itself never yields Healthy.
