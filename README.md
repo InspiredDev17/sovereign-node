@@ -34,6 +34,10 @@ trust.
 - Peer credential rotation requires current owner/broker proofs, replacement owner/broker proofs,
   explicit local confirmation, an atomic epoch change, and a node-signed rotation receipt. The
   production library exposes no raw credential-mutation API.
+- A revoked peer can be recovered only through the separate owner-local `recovery-request` /
+  `recovery-approve` ceremony. Replacement owner and broker keys must prove possession, local
+  `--confirm` is mandatory, the trust epoch increases, and the original revocation remains in
+  immutable recovery history. Active peers and remote callers cannot start this transition.
 - Every action is signed by the paired broker key **and** the owner authority key. The signed body
   binds request, task, agent, node, capability, target, typed arguments digest, validity window,
   trust generation, and protocol version.

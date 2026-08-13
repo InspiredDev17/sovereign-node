@@ -44,16 +44,27 @@ consumes the challenge, audits only digests, and returns a node-signed rotation
 receipt. The production library does not expose the old raw credential-mutation
 primitive.
 
+Recovery re-pairing is implemented as a separate two-step owner-local ceremony
+for an existing peer that is already durably revoked. `pair recovery-request`
+displays and node-signs the old identity, old trust epoch, exact revocation
+digest, replacement owner/broker/transport fingerprints, capability scope,
+challenge, and expiry. `pair recovery-approve` requires strict Ed25519 proofs
+from the replacement owner and replacement broker plus local `--confirm`. The
+single SQLite transaction rechecks the exact revocation, increments the trust
+epoch, installs the replacement material, consumes the invitation, appends a
+digest-only audit event, and stores an immutable recovery record embedding the
+prior revocation. It never deletes replay or audit history. Neither possession
+of the revoked keys nor a remote request can complete recovery.
+
 The remainder of this document is the target pairing contract. v0.1 does not
-yet provide a GUI prompt, a client-generated challenge, or recovery re-pairing
-under the same peer ID. Pending invitations
+yet provide a GUI prompt or a client-generated challenge. Pending invitations
 survive a daemon restart only until their original expiration and are not action
 authority. The TLS verifier reloads owner-approved client trust and established
 sessions recheck their exact leaf and trust epoch every 250 milliseconds.
-All v0.1 pairing and revocation state changes share a non-blocking owner-only
-admin mutation lease, preventing concurrent approval/revocation/identity-rotation
-races. The daemon uses a separate lease, so local revocation remains available
-while it is running.
+All v0.1 pairing, rotation, recovery, and revocation state changes share a
+non-blocking owner-only admin mutation lease, preventing concurrent
+approval/revocation/identity-rotation races. The daemon uses a separate lease,
+so local revocation remains available while it is running.
 
 An upgrade from a pre-certificate-validation state schema invalidates pending
 pairing and rotation invitations because those records do not contain the
@@ -84,7 +95,7 @@ credentials, or other unnecessary hardware identifiers.
 - The node identity store is initialized and readable only by the daemon
   account and owner administrator.
 - The node is Unpaired, or the owner has explicitly started a replacement
-  pairing after revocation.
+  recovery ceremony after revocation.
 - The local clock and cryptographic random number generator are available.
 - No remote action endpoint is enabled for an unpaired peer.
 
@@ -133,7 +144,7 @@ The runtime remains Unpaired and cannot execute remote actions.
 | PairingPending | Reject | Local approval plus all cryptographic proofs |
 | Paired | Apply normal authorization checks | Local revocation or quarantine |
 | Quarantined | Reject | Local owner investigation and explicit recovery |
-| Revoked | Reject | Fresh local re-pairing with a higher trust generation |
+| Revoked | Reject | Owner-local recovery with replacement proofs and a higher trust generation |
 
 In the target design PairingPending expires automatically and unsuccessful proof
 attempts consume it. v0.1 enforces the expiration but retains a failed invitation
@@ -185,8 +196,27 @@ transaction fails.
 For Action Broker rotation, the current broker, replacement broker, and owner
 sign the rotation transcript. For owner-key rotation, the current owner and
 replacement owner sign it. If a current private key is lost or suspected
-compromised, the recovery path is local revocation followed by a fresh pairing;
-there is no remote proof-of-possession bypass.
+compromised, the recovery path begins with local revocation; v0.1 then uses the
+dedicated recovery ceremony described below and provides no remote
+proof-of-possession bypass.
+
+## Recovery re-pairing
+
+Recovery is not routine rotation and cannot be used while a peer is active. It
+begins only after an explicit durable revocation. The short-lived transcript
+binds the stable NodeId and node key, pairing and peer IDs, device label, old
+identity digest, old trust epoch, the complete revocation-record digest,
+replacement material and transport digests, challenge, and expiry. The node
+signs this transcript before displaying it.
+
+The replacement owner and replacement broker sign the same bytes. After local
+`--confirm`, approval atomically verifies that the peer remains revoked under
+the exact bound state, advances the epoch, installs the replacement keys and
+leaf pin, clears only the current revocation marker needed for active trust,
+and stores the full prior revocation in append-only recovery history. Old
+authorization envelopes and TLS sessions remain invalid because their keys,
+leaf pin, and epoch no longer match. A second revocation creates a new current
+revocation without rewriting earlier recovery evidence.
 
 Node device-key rotation creates a signed continuity statement from the old key
 to the new key and still requires local owner approval. If the old key is
@@ -203,10 +233,13 @@ The node records:
 - local approval or denial;
 - trust-store commit outcome and trust generation;
 - revocation and quarantine;
-- credential-rotation challenge, denial, commit, and old/new identity digests.
+- credential-rotation challenge, denial, commit, and old/new identity digests;
+  and
+- recovery challenge, denial, atomic commit, old/new identity digests, and the
+  immutable prior revocation record.
 
-The ceremony additionally returns node-signed pairing and rotation receipts to
-the local operator. v0.1 does not persist receipt bodies or a distinct
+The ceremony additionally returns node-signed pairing, rotation, and recovery
+receipts to the local operator. v0.1 does not persist receipt bodies or a distinct
 session-termination audit event; trust-change and rotation events provide the
 durable correlation point.
 
@@ -218,7 +251,8 @@ window.
 
 - A network disconnect does not approve or complete pairing.
 - Reconnect requires a live, unconsumed invitation and a fresh channel.
-- A node restart consumes or invalidates every PairingPending invitation.
+- A node restart does not extend an invitation; pending pairing, rotation, and
+  recovery challenges remain usable only until their original signed expiry.
 - Duplicate enrollment messages are rejected.
 - Unsupported protocol or identity versions are rejected.
 - A mismatched NodeId, transcript, fingerprint, or signature is rejected and

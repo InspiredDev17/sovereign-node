@@ -19,12 +19,14 @@ use crate::protocol::{
 };
 use crate::store::{
     CredentialRotationApproval, CredentialRotationOutcome, PairingApproval,
-    PendingCredentialRotation, PendingPairingChallenge, RevocationOutcome, StateStore, StoreError,
+    PairingRecoveryApproval, PairingRecoveryOutcome, PendingCredentialRotation,
+    PendingPairingChallenge, PendingPairingRecovery, RevocationOutcome, StateStore, StoreError,
     TrustedPeer, sha256,
 };
 
 const PAIRING_PROOF_DOMAIN: &[u8] = b"sovereign-node/pairing-proof/v1\0";
 const CREDENTIAL_ROTATION_PROOF_DOMAIN: &[u8] = b"sovereign-node/credential-rotation-proof/v1\0";
+const PAIRING_RECOVERY_PROOF_DOMAIN: &[u8] = b"sovereign-node/pairing-recovery-proof/v1\0";
 const TRUST_RECEIPT_DOMAIN: &[u8] = b"sovereign-node/trust-receipt/v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,6 +91,7 @@ pub struct PairingProof {
 pub enum TrustReceiptKind {
     InitialPairing,
     CredentialRotation,
+    RecoveryPairing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -134,11 +137,21 @@ pub struct SignedTrustReceiptV1 {
 
 impl SignedTrustReceiptV1 {
     pub fn verify(&self) -> Result<(), PairingError> {
+        let transition_shape_is_valid = match self.receipt.kind {
+            TrustReceiptKind::InitialPairing => {
+                self.receipt.previous_peer_identity_digest.is_none()
+            }
+            TrustReceiptKind::CredentialRotation | TrustReceiptKind::RecoveryPairing => self
+                .receipt
+                .previous_peer_identity_digest
+                .is_some_and(|previous| previous != self.receipt.peer_identity_digest),
+        };
         if self.receipt.schema_version != 1
             || self.receipt.trust_epoch == 0
             || self.receipt.pairing_id.0.is_nil()
             || self.receipt.node_id.is_empty()
             || self.receipt.peer_id.is_empty()
+            || !transition_shape_is_valid
             || self
                 .receipt
                 .trust_expires_at
@@ -202,6 +215,52 @@ pub struct CredentialRotationProof {
     pub challenge_secret: [u8; 32],
     pub current_owner_signature: SignatureBytes,
     pub current_broker_signature: SignatureBytes,
+    pub next_owner_signature: SignatureBytes,
+    pub next_broker_signature: SignatureBytes,
+    pub approved_at: UnixMillis,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairingRecoveryRequest {
+    pub peer_id: String,
+    pub key_material: PairingKeyMaterialV1,
+    pub client_certificate_chain_der: Vec<Vec<u8>>,
+    pub ttl_millis: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PairingRecoveryDisplay {
+    pub recovery_id: Uuid,
+    pub pairing_id: PairingId,
+    pub node_id: String,
+    pub node_identity_fingerprint: String,
+    pub node_public_key_hex: String,
+    pub node_signature_hex: String,
+    pub operating_system: &'static str,
+    pub architecture: &'static str,
+    pub software_version: &'static str,
+    pub peer_id: String,
+    pub device_label: String,
+    pub revoked_trust_epoch: u64,
+    pub revoked_identity_fingerprint: String,
+    pub revoked_owner_key_fingerprint: String,
+    pub revoked_broker_key_fingerprint: String,
+    pub revoked_client_certificate_fingerprint: String,
+    pub next_owner_key_fingerprint: String,
+    pub next_broker_key_fingerprint: String,
+    pub next_client_certificate_fingerprint: String,
+    pub revocation_digest: String,
+    pub challenge_hex: String,
+    pub proof_payload_hex: String,
+    pub expires_at: UnixMillis,
+    pub allowed_capabilities: Vec<Capability>,
+    pub trust_expires_at: Option<UnixMillis>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairingRecoveryProof {
+    pub recovery_id: Uuid,
+    pub challenge_secret: [u8; 32],
     pub next_owner_signature: SignatureBytes,
     pub next_broker_signature: SignatureBytes,
     pub approved_at: UnixMillis,
@@ -648,6 +707,248 @@ impl PairingManager {
         })
     }
 
+    /// Starts a separate recovery ceremony for a peer that is already durably
+    /// revoked. Old keys are not accepted as recovery authority; the exact
+    /// revocation, old epoch, replacement material, and local node identity are
+    /// bound into a short-lived node-signed transcript.
+    pub fn begin_pairing_recovery(
+        &self,
+        request: PairingRecoveryRequest,
+        now: UnixMillis,
+    ) -> Result<PairingRecoveryDisplay, PairingError> {
+        if !(60_000..=900_000).contains(&request.ttl_millis) {
+            return Err(PairingError::Invalid(
+                "recovery TTL must be between one and fifteen minutes".to_owned(),
+            ));
+        }
+        validate_key_material(&request.key_material)?;
+        validate_client_certificate_binding(
+            &request.key_material,
+            &request.client_certificate_chain_der,
+            now,
+        )?;
+        if request
+            .key_material
+            .allowed_capabilities
+            .iter()
+            .any(|capability| !self.local_capabilities.contains(capability))
+        {
+            return Err(PairingError::Invalid(
+                "requested capability is not locally advertised".to_owned(),
+            ));
+        }
+        if request
+            .key_material
+            .trust_expires_at
+            .is_some_and(|expiry| expiry.0 <= now.0)
+        {
+            return Err(PairingError::Invalid(
+                "trust lease is already expired".to_owned(),
+            ));
+        }
+        let (revoked, revocation) = self
+            .store
+            .revoked_peer_for_recovery(&request.peer_id)?
+            .ok_or(StoreError::PairingNotFound)?;
+        if revoked.node_id != self.identity.node_id().to_string() {
+            return Err(PairingError::Invalid(
+                "revoked peer belongs to a different node".to_owned(),
+            ));
+        }
+        let revoked_material = decode_key_material(&revoked.public_key)?;
+        let next_encoded =
+            postcard::to_allocvec(&request.key_material).map_err(|_| PairingError::Encoding)?;
+        if next_encoded == revoked.public_key {
+            return Err(PairingError::Invalid(
+                "recovery credential must differ from the revoked credential".to_owned(),
+            ));
+        }
+        let expires_at = now
+            .0
+            .checked_add(request.ttl_millis)
+            .ok_or(PairingError::TimeRange)
+            .map(UnixMillis)?;
+        let recovery_id = Uuid::new_v4();
+        let mut challenge_secret = [0_u8; 32];
+        OsRng.fill_bytes(&mut challenge_secret);
+        let revocation_digest =
+            sha256(&postcard::to_allocvec(&revocation).map_err(|_| PairingError::Encoding)?);
+        let pending = PendingPairingRecovery::new(
+            recovery_id,
+            &revoked,
+            revocation_digest,
+            next_encoded,
+            request.client_certificate_chain_der.clone(),
+            self.identity.key_id().0,
+            &challenge_secret,
+            request.key_material.client_certificate_sha256.0,
+            millis_to_i64(now)?,
+            millis_to_i64(expires_at)?,
+        )?;
+        self.store.put_pending_pairing_recovery(&pending)?;
+        let proof_payload =
+            pairing_recovery_proof_bytes(&pending, &challenge_secret, &request.key_material)?;
+        let node_signature = self
+            .identity
+            .sign(&proof_payload)
+            .map_err(|_| PairingError::Encoding)?;
+        Ok(PairingRecoveryDisplay {
+            recovery_id,
+            pairing_id: PairingId(revoked.pairing_id),
+            node_id: revoked.node_id,
+            node_identity_fingerprint: self.identity.fingerprint(),
+            node_public_key_hex: hex::encode(self.identity.public_key().0),
+            node_signature_hex: hex::encode(node_signature.as_bytes()),
+            operating_system: std::env::consts::OS,
+            architecture: std::env::consts::ARCH,
+            software_version: env!("CARGO_PKG_VERSION"),
+            peer_id: revoked.peer_id,
+            device_label: revoked.device_label,
+            revoked_trust_epoch: revoked.trust_epoch,
+            revoked_identity_fingerprint: hex::encode(revoked.identity_digest),
+            revoked_owner_key_fingerprint: hex::encode(
+                key_id_from_bytes(revoked_material.owner_public_key)?.0,
+            ),
+            revoked_broker_key_fingerprint: hex::encode(
+                key_id_from_bytes(revoked_material.broker_public_key)?.0,
+            ),
+            revoked_client_certificate_fingerprint: hex::encode(
+                revoked_material.client_certificate_sha256.0,
+            ),
+            next_owner_key_fingerprint: hex::encode(
+                key_id_from_bytes(request.key_material.owner_public_key)?.0,
+            ),
+            next_broker_key_fingerprint: hex::encode(
+                key_id_from_bytes(request.key_material.broker_public_key)?.0,
+            ),
+            next_client_certificate_fingerprint: hex::encode(
+                request.key_material.client_certificate_sha256.0,
+            ),
+            revocation_digest: hex::encode(revocation_digest),
+            challenge_hex: hex::encode(challenge_secret),
+            proof_payload_hex: hex::encode(proof_payload),
+            expires_at,
+            allowed_capabilities: request.key_material.allowed_capabilities,
+            trust_expires_at: request.key_material.trust_expires_at,
+        })
+    }
+
+    /// Completes recovery only from the local administrative path after the
+    /// replacement owner and broker have signed the exact recovery transcript.
+    pub fn approve_pairing_recovery_local(
+        &self,
+        proof: &PairingRecoveryProof,
+        owner_confirmed: bool,
+    ) -> Result<PairingApprovalResult, PairingError> {
+        if !owner_confirmed {
+            return Err(PairingError::OwnerConfirmationRequired);
+        }
+        let approved_at = millis_to_i64(proof.approved_at)?;
+        let pending = self
+            .store
+            .pending_pairing_recovery(proof.recovery_id)?
+            .ok_or(StoreError::RecoveryNotFound)?;
+        if pending.node_identity_digest != self.identity.key_id().0 {
+            self.store.audit_pairing_recovery_rejection(
+                proof.recovery_id,
+                approved_at,
+                b"node-identity-changed",
+            )?;
+            return Err(PairingError::InvalidProof);
+        }
+        let (revoked, revocation) = self
+            .store
+            .revoked_peer_for_recovery(&pending.peer_id)?
+            .ok_or(StoreError::RecoveryMismatch)?;
+        let revocation_digest =
+            sha256(&postcard::to_allocvec(&revocation).map_err(|_| PairingError::Encoding)?);
+        if revoked.pairing_id != pending.pairing_id
+            || revoked.identity_digest != pending.revoked_identity_digest
+            || revoked.trust_epoch != pending.revoked_trust_epoch
+            || revocation_digest != pending.revocation_digest
+        {
+            self.store.audit_pairing_recovery_rejection(
+                proof.recovery_id,
+                approved_at,
+                b"revocation-state-changed",
+            )?;
+            return Err(PairingError::InvalidProof);
+        }
+        let next_material = decode_key_material(&pending.new_public_key)?;
+        if pending.transport_binding_digest != next_material.client_certificate_sha256.0 {
+            self.store.audit_pairing_recovery_rejection(
+                proof.recovery_id,
+                approved_at,
+                b"transport-binding-changed",
+            )?;
+            return Err(PairingError::InvalidProof);
+        }
+        if let Err(error) = validate_client_certificate_binding(
+            &next_material,
+            &pending.client_certificate_chain_der,
+            proof.approved_at,
+        ) {
+            self.store.audit_pairing_recovery_rejection(
+                proof.recovery_id,
+                approved_at,
+                b"client-certificate-invalid",
+            )?;
+            return Err(error);
+        }
+        let payload =
+            pairing_recovery_proof_bytes(&pending, &proof.challenge_secret, &next_material)?;
+        for (key, signature, reason) in [
+            (
+                next_material.owner_public_key,
+                &proof.next_owner_signature,
+                b"next-owner".as_slice(),
+            ),
+            (
+                next_material.broker_public_key,
+                &proof.next_broker_signature,
+                b"next-broker".as_slice(),
+            ),
+        ] {
+            if verify(key, &payload, signature).is_err() {
+                self.store.audit_pairing_recovery_rejection(
+                    proof.recovery_id,
+                    approved_at,
+                    reason,
+                )?;
+                return Err(PairingError::InvalidProof);
+            }
+        }
+        let manifest_digest: [u8; 32] = Sha256::digest(
+            postcard::to_allocvec(&next_material.allowed_capabilities)
+                .map_err(|_| PairingError::Encoding)?,
+        )
+        .into();
+        let outcome: PairingRecoveryOutcome = self.store.approve_pairing_recovery(
+            &PairingRecoveryApproval {
+                recovery_id: proof.recovery_id,
+                owner_authority_digest: key_id_from_bytes(next_material.owner_public_key)?.0,
+                capability_manifest_digest: manifest_digest,
+                approved_at_unix_ms: approved_at,
+                trust_expires_at_unix_ms: next_material
+                    .trust_expires_at
+                    .map(millis_to_i64)
+                    .transpose()?,
+            },
+            &proof.challenge_secret,
+        )?;
+        let receipt = self.sign_receipt(
+            TrustReceiptKind::RecoveryPairing,
+            &outcome.trusted_peer,
+            &next_material,
+            Some(Sha256Digest(outcome.recovery.previous_identity_digest)),
+            proof.approved_at,
+        )?;
+        Ok(PairingApprovalResult {
+            trusted_peer: outcome.trusted_peer,
+            receipt,
+        })
+    }
+
     fn sign_receipt(
         &self,
         kind: TrustReceiptKind,
@@ -1045,6 +1346,48 @@ fn credential_rotation_proof_bytes(
         current_material_digest: Sha256::digest(current_bytes).into(),
         next_material_digest: Sha256::digest(next_bytes).into(),
         next_transport_binding_digest: next_material.client_certificate_sha256.0,
+        node_identity_digest: pending.node_identity_digest,
+        expires_at_unix_ms: pending.expires_at_unix_ms,
+    })
+    .map_err(|_| PairingError::Encoding)
+}
+
+fn pairing_recovery_proof_bytes(
+    pending: &PendingPairingRecovery,
+    challenge_secret: &[u8; 32],
+    next_material: &PairingKeyMaterialV1,
+) -> Result<Vec<u8>, PairingError> {
+    #[derive(Serialize)]
+    struct PairingRecoveryTranscript<'a> {
+        domain: &'a [u8],
+        recovery_id: Uuid,
+        pairing_id: Uuid,
+        node_id: &'a str,
+        peer_id: &'a str,
+        device_label: &'a str,
+        revoked_identity_digest: [u8; 32],
+        revoked_trust_epoch: u64,
+        revocation_digest: [u8; 32],
+        challenge_secret: &'a [u8; 32],
+        next_material_digest: [u8; 32],
+        next_transport_binding_digest: [u8; 32],
+        node_identity_digest: [u8; 32],
+        expires_at_unix_ms: i64,
+    }
+    let next_bytes = postcard::to_allocvec(next_material).map_err(|_| PairingError::Encoding)?;
+    postcard::to_allocvec(&PairingRecoveryTranscript {
+        domain: PAIRING_RECOVERY_PROOF_DOMAIN,
+        recovery_id: pending.recovery_id,
+        pairing_id: pending.pairing_id,
+        node_id: &pending.node_id,
+        peer_id: &pending.peer_id,
+        device_label: &pending.device_label,
+        revoked_identity_digest: pending.revoked_identity_digest,
+        revoked_trust_epoch: pending.revoked_trust_epoch,
+        revocation_digest: pending.revocation_digest,
+        challenge_secret,
+        next_material_digest: Sha256::digest(next_bytes).into(),
+        next_transport_binding_digest: pending.transport_binding_digest,
         node_identity_digest: pending.node_identity_digest,
         expires_at_unix_ms: pending.expires_at_unix_ms,
     })

@@ -170,7 +170,10 @@ duplicates across reopen/reconnect, forged/expired/wrong-node/capability/version
 denials, traversal rejection before reservation, bounded replay exhaustion,
 restart identity stability, node-signed pairing receipts, and credential epoch
 rotation requiring current and replacement owner/broker proofs plus local
-confirmation. Session closure,
+confirmation. It also covers revoked-peer recovery requiring replacement
+owner/broker proofs and local confirmation, forged/expired recovery denial,
+epoch advancement, old-credential invalidation, preserved revocation history,
+repeat revocation, and restart durability. Session closure,
 TLS 1.3 handshake, exact-leaf matching, and live pairing/revocation/rotation
 reload are covered with real loopback sockets and ephemeral test certificates.
 Certificate enrollment tests cover exact fingerprint mismatch, malformed DER,
@@ -201,6 +204,7 @@ They assert that denied requests produce no capability side effect.
 | Unauthorized file access | Parent traversal, absolute escape, symlink, sensitive store, device, and disallowed root are rejected without content disclosure |
 | Node restart | NodeId, trust generation, revocation, replay reservation, and audit state persist; incomplete side effects become Indeterminate, not retried |
 | Credential rotation | All current and replacement owner/broker proofs plus local confirmation are required; old sessions and authorizations stop working after the atomic durable epoch change, and the node signs the receipt |
+| Pairing recovery | Only an explicitly revoked peer can enter recovery; replacement owner/broker proofs and local confirmation advance the epoch without erasing the prior revocation, replay, or audit history |
 
 Additional tests cover malformed canonical encodings, TLS peer mismatch,
 pairing-window expiry, duplicate enrollment, corrupt state, untrustworthy time,

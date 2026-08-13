@@ -167,6 +167,13 @@ assumed. The node is revoked or quarantined and requires a fresh local pairing.
 Keeping the same NodeId is an owner recovery decision recorded in the audit; it
 does not preserve old remote authorizations.
 
+Peer credential recovery is separate from node device-key recovery. For a
+durably revoked peer, v0.1 can retain the same pairing relationship ID only
+through the owner-local recovery ceremony: replacement owner and broker keys
+prove possession, the node signs the exact revocation-bound transcript, the
+trust epoch increases, and immutable recovery history retains the prior
+revocation. No remote action or revoked key can authorize that transition.
+
 Backups of identity state must be encrypted and owner controlled. Restoring a
 backup never rolls trust generation, revocation records, replay state, or audit
 state backward. If consistency cannot be proven, the node fails closed and

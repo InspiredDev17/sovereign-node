@@ -31,7 +31,7 @@ use crate::lifecycle::{LeaseKind, LifecycleLease};
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const PEER_RATE_WINDOW_MS: i64 = 60_000;
 const ZERO_HASH: Sha256Digest = [0_u8; 32];
 const MAX_ID_BYTES: usize = 255;
@@ -108,6 +108,12 @@ pub enum StoreError {
     CredentialRotationExpired,
     #[error("credential rotation challenge proof did not match")]
     CredentialRotationChallengeMismatch,
+    #[error("pairing recovery challenge was not found")]
+    RecoveryNotFound,
+    #[error("pairing recovery challenge has expired")]
+    RecoveryExpired,
+    #[error("pairing recovery state or proof did not match")]
+    RecoveryMismatch,
     #[error("audit chain is invalid at sequence {sequence}")]
     AuditChainInvalid { sequence: u64 },
     #[error("policy version rollback was rejected")]
@@ -354,6 +360,129 @@ pub struct CredentialRotationApproval {
     pub trust_expires_at_unix_ms: Option<i64>,
 }
 
+/// A short-lived local recovery ceremony for an explicitly revoked peer.
+/// The original revocation and trust generation are immutable transcript inputs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingPairingRecovery {
+    pub recovery_id: Uuid,
+    pub pairing_id: Uuid,
+    pub node_id: String,
+    pub peer_id: String,
+    pub device_label: String,
+    pub revoked_identity_digest: Sha256Digest,
+    pub revoked_trust_epoch: u64,
+    pub revocation_digest: Sha256Digest,
+    pub new_public_key: Vec<u8>,
+    pub client_certificate_chain_der: Vec<Vec<u8>>,
+    pub new_identity_digest: Sha256Digest,
+    pub node_identity_digest: Sha256Digest,
+    pub challenge_digest: Sha256Digest,
+    pub transport_binding_digest: Sha256Digest,
+    pub requested_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+}
+
+impl PendingPairingRecovery {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        recovery_id: Uuid,
+        revoked_peer: &TrustedPeer,
+        revocation_digest: Sha256Digest,
+        new_public_key: Vec<u8>,
+        client_certificate_chain_der: Vec<Vec<u8>>,
+        node_identity_digest: Sha256Digest,
+        challenge_secret: &[u8],
+        transport_binding_digest: Sha256Digest,
+        requested_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<Self, StoreError> {
+        if challenge_secret.len() < MIN_PAIRING_CHALLENGE_BYTES {
+            return Err(StoreError::InvalidInput(
+                "pairing recovery challenge must contain at least 128 bits",
+            ));
+        }
+        let value = Self {
+            recovery_id,
+            pairing_id: revoked_peer.pairing_id,
+            node_id: revoked_peer.node_id.clone(),
+            peer_id: revoked_peer.peer_id.clone(),
+            device_label: revoked_peer.device_label.clone(),
+            revoked_identity_digest: revoked_peer.identity_digest,
+            revoked_trust_epoch: revoked_peer.trust_epoch,
+            revocation_digest,
+            new_identity_digest: peer_identity_digest(&revoked_peer.peer_id, &new_public_key),
+            new_public_key,
+            client_certificate_chain_der,
+            node_identity_digest,
+            challenge_digest: sha256(challenge_secret),
+            transport_binding_digest,
+            requested_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        validate_identifier(&self.node_id)?;
+        validate_identifier(&self.peer_id)?;
+        validate_bounded_text(&self.device_label, MAX_LABEL_BYTES, "device label")?;
+        if self.recovery_id.is_nil() || self.pairing_id.is_nil() || self.revoked_trust_epoch == 0 {
+            return Err(StoreError::InvalidInput(
+                "pairing recovery identifiers and epoch must be non-zero",
+            ));
+        }
+        if self.new_public_key.is_empty() || self.new_public_key.len() > MAX_PUBLIC_KEY_BYTES {
+            return Err(StoreError::InvalidInput("invalid peer public key length"));
+        }
+        validate_certificate_chain(&self.client_certificate_chain_der)?;
+        if !constant_time_digest_eq(
+            &self.new_identity_digest,
+            &peer_identity_digest(&self.peer_id, &self.new_public_key),
+        ) {
+            return Err(StoreError::CorruptData(
+                "pairing recovery identity digest is inconsistent",
+            ));
+        }
+        if self.expires_at_unix_ms <= self.requested_at_unix_ms {
+            return Err(StoreError::InvalidInput(
+                "pairing recovery expiry must follow creation time",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PairingRecoveryApproval {
+    pub recovery_id: Uuid,
+    pub owner_authority_digest: Sha256Digest,
+    pub capability_manifest_digest: Sha256Digest,
+    pub approved_at_unix_ms: i64,
+    pub trust_expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PairingRecoveryRecord {
+    pub recovery_id: Uuid,
+    pub pairing_id: Uuid,
+    pub peer_id: String,
+    pub previous_identity_digest: Sha256Digest,
+    pub next_identity_digest: Sha256Digest,
+    pub previous_trust_epoch: u64,
+    pub next_trust_epoch: u64,
+    pub revocation: RevocationRecord,
+    pub owner_authority_digest: Sha256Digest,
+    pub capability_manifest_digest: Sha256Digest,
+    pub recovered_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairingRecoveryOutcome {
+    pub trusted_peer: TrustedPeer,
+    pub recovery: PairingRecoveryRecord,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TrustStatus {
     Active,
@@ -509,6 +638,9 @@ pub enum AuditKind {
     // audit chains across schema migrations.
     CredentialRotationChallengeCreated,
     CredentialRotationRejected,
+    PairingRecoveryChallengeCreated,
+    PairingRecoveryRejected,
+    PairingRecovered,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -968,6 +1100,182 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn revoked_peer_for_recovery(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<(TrustedPeer, RevocationRecord)>, StoreError> {
+        validate_identifier(peer_id)?;
+        let connection = self.lock()?;
+        let peer_record: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT record FROM trusted_peers WHERE peer_id = ?1 AND trust_status = 2",
+                [peer_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(peer_record) = peer_record else {
+            return Ok(None);
+        };
+        let peer: TrustedPeer = decode(&peer_record)?;
+        let revocation = revocation_in_connection(&connection, peer_id)?.ok_or(
+            StoreError::CorruptData("revoked peer lacks revocation record"),
+        )?;
+        if peer.status != TrustStatus::Revoked
+            || peer.pairing_id != revocation.pairing_id
+            || peer.revoked_at_unix_ms != Some(revocation.revoked_at_unix_ms)
+        {
+            return Err(StoreError::CorruptData(
+                "revoked peer and revocation record disagree",
+            ));
+        }
+        Ok(Some((peer, revocation)))
+    }
+
+    pub fn put_pending_pairing_recovery(
+        &self,
+        recovery: &PendingPairingRecovery,
+    ) -> Result<(), StoreError> {
+        recovery.validate()?;
+        let record = encode(recovery)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM pending_pairing_recoveries WHERE expires_at_unix_ms <= ?1",
+            [recovery.requested_at_unix_ms],
+        )?;
+        let existing: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_pairing_recoveries WHERE recovery_id = ?1",
+                [recovery.recovery_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let existing: PendingPairingRecovery = decode(&existing)?;
+            if existing == *recovery {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::InvalidInput(
+                "recovery identifier already binds different challenge data",
+            ));
+        }
+        let peer_record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM trusted_peers
+                 WHERE peer_id = ?1 AND pairing_id = ?2 AND trust_status = 2",
+                params![recovery.peer_id, recovery.pairing_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(peer_record) = peer_record else {
+            return Err(StoreError::RecoveryMismatch);
+        };
+        let peer: TrustedPeer = decode(&peer_record)?;
+        let revocation = revocation_in_transaction(&transaction, &recovery.peer_id)?
+            .ok_or(StoreError::RecoveryMismatch)?;
+        let revocation_digest = sha256(&encode(&revocation)?);
+        if peer.status != TrustStatus::Revoked
+            || peer.node_id != recovery.node_id
+            || peer.pairing_id != recovery.pairing_id
+            || peer.identity_digest != recovery.revoked_identity_digest
+            || peer.trust_epoch != recovery.revoked_trust_epoch
+            || peer.revoked_at_unix_ms != Some(revocation.revoked_at_unix_ms)
+            || !constant_time_digest_eq(&revocation_digest, &recovery.revocation_digest)
+        {
+            return Err(StoreError::RecoveryMismatch);
+        }
+        let other_for_peer: Option<String> = transaction
+            .query_row(
+                "SELECT recovery_id FROM pending_pairing_recoveries WHERE peer_id = ?1",
+                [&recovery.peer_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if other_for_peer.is_some() {
+            return Err(StoreError::InvalidInput(
+                "peer already has a pending recovery ceremony",
+            ));
+        }
+        enforce_count_limit(
+            &transaction,
+            "SELECT COUNT(*) FROM pending_pairing_recoveries",
+            self.limits.max_pending_pairings,
+            "pending pairing recovery capacity",
+        )?;
+        transaction.execute(
+            "INSERT INTO pending_pairing_recoveries
+                (recovery_id, peer_id, pairing_id, expires_at_unix_ms, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                recovery.recovery_id.to_string(),
+                recovery.peer_id,
+                recovery.pairing_id.to_string(),
+                recovery.expires_at_unix_ms,
+                record
+            ],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: recovery.requested_at_unix_ms,
+                kind: AuditKind::PairingRecoveryChallengeCreated,
+                outcome: AuditOutcome::Observed,
+                request_id: None,
+                actor_digest: None,
+                subject_digest: Some(recovery.revoked_identity_digest),
+                context_digest: Some(recovery.new_identity_digest),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()
+    }
+
+    pub fn pending_pairing_recovery(
+        &self,
+        recovery_id: Uuid,
+    ) -> Result<Option<PendingPairingRecovery>, StoreError> {
+        let connection = self.lock()?;
+        let record: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT record FROM pending_pairing_recoveries WHERE recovery_id = ?1",
+                [recovery_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        record.map(|bytes| decode(&bytes)).transpose()
+    }
+
+    pub fn audit_pairing_recovery_rejection(
+        &self,
+        recovery_id: Uuid,
+        occurred_at_unix_ms: i64,
+        reason: &[u8],
+    ) -> Result<(), StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_pairing_recoveries WHERE recovery_id = ?1",
+                [recovery_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(record) = record else {
+            return Err(StoreError::RecoveryNotFound);
+        };
+        let pending: PendingPairingRecovery = decode(&record)?;
+        append_pairing_recovery_rejection_audit(
+            &transaction,
+            &pending,
+            occurred_at_unix_ms,
+            reason,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn audit_pairing_rejection(
         &self,
         pairing_id: Uuid,
@@ -1323,6 +1631,208 @@ impl StateStore {
 
     pub fn is_peer_revoked(&self, peer_id: &str) -> Result<bool, StoreError> {
         Ok(self.revocation_for_peer(peer_id)?.is_some())
+    }
+
+    /// Commit an owner-present recovery after both replacement authorities
+    /// prove possession. The transaction serializes revocation state, epoch
+    /// advancement, credential replacement, and immutable recovery history.
+    pub(crate) fn approve_pairing_recovery(
+        &self,
+        approval: &PairingRecoveryApproval,
+        presented_challenge: &[u8],
+    ) -> Result<PairingRecoveryOutcome, StoreError> {
+        if approval
+            .trust_expires_at_unix_ms
+            .is_some_and(|expiry| expiry <= approval.approved_at_unix_ms)
+        {
+            return Err(StoreError::InvalidInput(
+                "trust expiry must follow recovery approval",
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending_record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM pending_pairing_recoveries WHERE recovery_id = ?1",
+                [approval.recovery_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(pending_record) = pending_record else {
+            return Err(StoreError::RecoveryNotFound);
+        };
+        let pending: PendingPairingRecovery = decode(&pending_record)?;
+        if pending.expires_at_unix_ms <= approval.approved_at_unix_ms {
+            transaction.execute(
+                "DELETE FROM pending_pairing_recoveries WHERE recovery_id = ?1",
+                [approval.recovery_id.to_string()],
+            )?;
+            append_pairing_recovery_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"expired",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::RecoveryExpired);
+        }
+        if !constant_time_digest_eq(&pending.challenge_digest, &sha256(presented_challenge)) {
+            append_pairing_recovery_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"challenge-mismatch",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::RecoveryMismatch);
+        }
+        let peer_record: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT record FROM trusted_peers
+                 WHERE peer_id = ?1 AND pairing_id = ?2 AND trust_status = 2",
+                params![pending.peer_id, pending.pairing_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(peer_record) = peer_record else {
+            append_pairing_recovery_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"peer-not-revoked",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::RecoveryMismatch);
+        };
+        let mut peer: TrustedPeer = decode(&peer_record)?;
+        let revocation = revocation_in_transaction(&transaction, &pending.peer_id)?.ok_or(
+            StoreError::CorruptData("revoked peer lacks revocation record"),
+        )?;
+        let revocation_digest = sha256(&encode(&revocation)?);
+        if peer.status != TrustStatus::Revoked
+            || peer.node_id != pending.node_id
+            || peer.pairing_id != pending.pairing_id
+            || peer.identity_digest != pending.revoked_identity_digest
+            || peer.trust_epoch != pending.revoked_trust_epoch
+            || peer.revoked_at_unix_ms != Some(revocation.revoked_at_unix_ms)
+            || revocation.pairing_id != pending.pairing_id
+            || !constant_time_digest_eq(&revocation_digest, &pending.revocation_digest)
+            || peer.public_key == pending.new_public_key
+        {
+            append_pairing_recovery_rejection_audit(
+                &transaction,
+                &pending,
+                approval.approved_at_unix_ms,
+                b"revocation-state-changed",
+            )?;
+            transaction.commit()?;
+            return Err(StoreError::RecoveryMismatch);
+        }
+        let previous_identity_digest = peer.identity_digest;
+        let previous_trust_epoch = peer.trust_epoch;
+        let next_trust_epoch = previous_trust_epoch
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData("credential epoch overflow"))?;
+        peer.public_key.clone_from(&pending.new_public_key);
+        peer.identity_digest = pending.new_identity_digest;
+        peer.capability_manifest_digest = approval.capability_manifest_digest;
+        peer.status = TrustStatus::Active;
+        peer.trust_epoch = next_trust_epoch;
+        peer.trust_expires_at_unix_ms = approval.trust_expires_at_unix_ms;
+        peer.last_key_rotation_at_unix_ms = Some(approval.approved_at_unix_ms);
+        peer.revoked_at_unix_ms = None;
+
+        let recovery = PairingRecoveryRecord {
+            recovery_id: pending.recovery_id,
+            pairing_id: pending.pairing_id,
+            peer_id: pending.peer_id.clone(),
+            previous_identity_digest,
+            next_identity_digest: peer.identity_digest,
+            previous_trust_epoch,
+            next_trust_epoch,
+            revocation,
+            owner_authority_digest: approval.owner_authority_digest,
+            capability_manifest_digest: approval.capability_manifest_digest,
+            recovered_at_unix_ms: approval.approved_at_unix_ms,
+        };
+        let updated = transaction.execute(
+            "UPDATE trusted_peers
+             SET trust_status = 1, trust_expires_at_unix_ms = ?2, record = ?3
+             WHERE peer_id = ?1 AND trust_status = 2",
+            params![peer.peer_id, peer.trust_expires_at_unix_ms, encode(&peer)?],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::CorruptData(
+                "pairing recovery did not update exactly one revoked peer",
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO pairing_recoveries
+                (recovery_id, peer_id, pairing_id, recovered_at_unix_ms, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                recovery.recovery_id.to_string(),
+                recovery.peer_id,
+                recovery.pairing_id.to_string(),
+                recovery.recovered_at_unix_ms,
+                encode(&recovery)?
+            ],
+        )?;
+        let removed_revocation = transaction.execute(
+            "DELETE FROM revocations WHERE peer_id = ?1",
+            [&peer.peer_id],
+        )?;
+        if removed_revocation != 1 {
+            return Err(StoreError::CorruptData(
+                "pairing recovery did not consume exactly one revocation",
+            ));
+        }
+        let removed_pending = transaction.execute(
+            "DELETE FROM pending_pairing_recoveries WHERE recovery_id = ?1",
+            [pending.recovery_id.to_string()],
+        )?;
+        if removed_pending != 1 {
+            return Err(StoreError::CorruptData(
+                "pairing recovery did not consume exactly one challenge",
+            ));
+        }
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: approval.approved_at_unix_ms,
+                kind: AuditKind::PairingRecovered,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: Some(approval.owner_authority_digest),
+                subject_digest: Some(peer.identity_digest),
+                context_digest: Some(previous_identity_digest),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(PairingRecoveryOutcome {
+            trusted_peer: peer,
+            recovery,
+        })
+    }
+
+    pub fn pairing_recoveries_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<PairingRecoveryRecord>, StoreError> {
+        validate_identifier(peer_id)?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT record FROM pairing_recoveries
+             WHERE peer_id = ?1 ORDER BY recovered_at_unix_ms ASC, recovery_id ASC",
+        )?;
+        let rows = statement.query_map([peer_id], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut recoveries = Vec::new();
+        for row in rows {
+            recoveries.push(decode(&row?)?);
+        }
+        Ok(recoveries)
     }
 
     /// Commit a locally approved credential-rotation challenge. Signature and
@@ -2074,6 +2584,30 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          CREATE INDEX IF NOT EXISTS pending_credential_rotations_peer_idx
              ON pending_credential_rotations(peer_id);
 
+         CREATE TABLE IF NOT EXISTS pending_pairing_recoveries (
+             recovery_id TEXT PRIMARY KEY NOT NULL,
+             peer_id TEXT NOT NULL,
+             pairing_id TEXT NOT NULL,
+             expires_at_unix_ms INTEGER NOT NULL,
+             record BLOB NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS pending_pairing_recoveries_expiry_idx
+             ON pending_pairing_recoveries(expires_at_unix_ms);
+         CREATE UNIQUE INDEX IF NOT EXISTS pending_pairing_recoveries_peer_idx
+             ON pending_pairing_recoveries(peer_id);
+
+         CREATE TABLE IF NOT EXISTS pairing_recoveries (
+             recovery_id TEXT PRIMARY KEY NOT NULL,
+             peer_id TEXT NOT NULL,
+             pairing_id TEXT NOT NULL,
+             recovered_at_unix_ms INTEGER NOT NULL,
+             record BLOB NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS pairing_recoveries_peer_idx
+             ON pairing_recoveries(peer_id, recovered_at_unix_ms);
+         CREATE INDEX IF NOT EXISTS pairing_recoveries_pairing_idx
+             ON pairing_recoveries(pairing_id, recovered_at_unix_ms);
+
          CREATE TABLE IF NOT EXISTS pairings (
              pairing_id TEXT PRIMARY KEY NOT NULL,
              peer_id TEXT NOT NULL UNIQUE,
@@ -2150,7 +2684,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
              VALUES (1, 0, zeroblob(32))
              ON CONFLICT(singleton) DO NOTHING;
-         PRAGMA user_version = 5;",
+         PRAGMA user_version = 6;",
     )?;
     // Pending ceremonies are authorization-free, short-lived bootstrap state.
     // Schema 5 adds the certificate chain needed to revalidate X.509 at local
@@ -2160,6 +2694,8 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         transaction.execute("DELETE FROM pending_pairings", [])?;
         transaction.execute("DELETE FROM pending_credential_rotations", [])?;
     }
+    // Schema 6 adds recovery-only tables. Existing trust, revocations, replay,
+    // policy state, and audit records remain byte-for-byte unchanged.
     transaction.commit()?;
     Ok(())
 }
@@ -2196,6 +2732,27 @@ fn append_credential_rotation_rejection_audit(
         AuditEventDraft {
             occurred_at_unix_ms,
             kind: AuditKind::CredentialRotationRejected,
+            outcome: AuditOutcome::Rejected,
+            request_id: None,
+            actor_digest: None,
+            subject_digest: Some(pending.new_identity_digest),
+            context_digest: Some(sha256(reason)),
+        },
+    )?;
+    Ok(())
+}
+
+fn append_pairing_recovery_rejection_audit(
+    transaction: &Transaction<'_>,
+    pending: &PendingPairingRecovery,
+    occurred_at_unix_ms: i64,
+    reason: &[u8],
+) -> Result<(), StoreError> {
+    append_audit_in_transaction(
+        transaction,
+        AuditEventDraft {
+            occurred_at_unix_ms,
+            kind: AuditKind::PairingRecoveryRejected,
             outcome: AuditOutcome::Rejected,
             request_id: None,
             actor_digest: None,
@@ -2881,6 +3438,42 @@ mod tests {
             Some(trusted.pairing_id)
         );
         assert_eq!(migrated.verify_audit_chain()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_five_migration_adds_recovery_tables_without_rewriting_trust() -> Result<(), StoreError>
+    {
+        let (_directory, path, store) = test_store()?;
+        let (_, trusted) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let before = store.verify_audit_chain()?;
+        drop(store);
+
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch(
+            "DROP TABLE pending_pairing_recoveries;
+             DROP TABLE pairing_recoveries;
+             PRAGMA user_version = 5;",
+        )?;
+        drop(legacy);
+
+        let migrated = StateStore::open(path)?;
+        assert_eq!(
+            migrated
+                .peer_record(&trusted.peer_id)?
+                .map(|peer| peer.pairing_id),
+            Some(trusted.pairing_id)
+        );
+        assert_eq!(migrated.verify_audit_chain()?, before);
+        let connection = migrated.lock()?;
+        for table in ["pending_pairing_recoveries", "pairing_recoveries"] {
+            let exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )?;
+            assert_eq!(exists, 1);
+        }
         Ok(())
     }
 

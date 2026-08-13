@@ -18,7 +18,7 @@ use sovereign_node::identity::NodeIdentity;
 use sovereign_node::lifecycle::{LeaseKind, LifecycleLease};
 use sovereign_node::pairing::{
     CredentialRotationProof, CredentialRotationRequest, PairingKeyMaterialV1, PairingManager,
-    PairingProof, PairingRequest,
+    PairingProof, PairingRecoveryProof, PairingRecoveryRequest, PairingRequest,
 };
 use sovereign_node::protocol::{
     Capability, CapabilityManifestV1, PairingId, PublicKeyBytes, Sha256Digest, SignatureBytes,
@@ -84,6 +84,10 @@ enum PairCommand {
     RotationRequest(PairRotationRequestArgs),
     /// Verify current/new role proofs and atomically rotate after local confirmation.
     RotationApprove(PairRotationApproveArgs),
+    /// Start local recovery for an explicitly revoked peer using replacement credentials.
+    RecoveryRequest(PairRecoveryRequestArgs),
+    /// Verify replacement role proofs and atomically recover after local confirmation.
+    RecoveryApprove(PairRecoveryApproveArgs),
     /// Durably revoke a peer after local confirmation.
     Revoke(PairRevokeArgs),
 }
@@ -185,6 +189,49 @@ struct PairRotationApproveArgs {
     next_owner_signature_hex: String,
     #[arg(long)]
     next_broker_signature_hex: String,
+    #[arg(long)]
+    confirm: bool,
+}
+
+#[derive(Debug, Args)]
+struct PairRecoveryRequestArgs {
+    #[arg(long)]
+    config: PathBuf,
+    /// Existing peer ID whose durable state is already revoked.
+    #[arg(long)]
+    peer_id: String,
+    #[arg(long)]
+    owner_id: String,
+    #[arg(long)]
+    owner_public_key_hex: String,
+    #[arg(long)]
+    broker_public_key_hex: String,
+    #[arg(long)]
+    client_ca_pem: PathBuf,
+    /// PEM chain with the replacement client leaf first, followed by intermediates.
+    #[arg(long)]
+    client_certificate_pem: PathBuf,
+    #[arg(long = "capability", required = true)]
+    capabilities: Vec<String>,
+    #[arg(long, default_value_t = 300)]
+    ttl_seconds: u64,
+    #[arg(long)]
+    trust_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct PairRecoveryApproveArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    recovery_id: Uuid,
+    #[arg(long)]
+    challenge_hex: String,
+    #[arg(long)]
+    next_owner_signature_hex: String,
+    #[arg(long)]
+    next_broker_signature_hex: String,
+    /// Confirms local physical owner approval; this command is not exposed over LAN transport.
     #[arg(long)]
     confirm: bool,
 }
@@ -315,6 +362,8 @@ fn pair(command: PairCommand) -> Result<()> {
         PairCommand::Approve(args) => pair_approve(args),
         PairCommand::RotationRequest(args) => pair_rotation_request(args),
         PairCommand::RotationApprove(args) => pair_rotation_approve(args),
+        PairCommand::RecoveryRequest(args) => pair_recovery_request(args),
+        PairCommand::RecoveryApprove(args) => pair_recovery_approve(args),
         PairCommand::Revoke(args) => pair_revoke(args),
     }
 }
@@ -456,6 +505,76 @@ fn pair_rotation_approve(args: PairRotationApproveArgs) -> Result<()> {
             challenge_secret: fixed_bytes::<32>(&args.challenge_hex, "challenge")?,
             current_owner_signature: signature(&args.current_owner_signature_hex)?,
             current_broker_signature: signature(&args.current_broker_signature_hex)?,
+            next_owner_signature: signature(&args.next_owner_signature_hex)?,
+            next_broker_signature: signature(&args.next_broker_signature_hex)?,
+            approved_at: now()?,
+        },
+        args.confirm,
+    )?;
+    print_json(&result)
+}
+
+fn pair_recovery_request(args: PairRecoveryRequestArgs) -> Result<()> {
+    let (config, identity, store, _admin_lease) = pairing_context(&args.config)?;
+    let now = now()?;
+    let trust_expires_at = args
+        .trust_ttl_seconds
+        .map(|seconds| {
+            seconds
+                .checked_mul(1_000)
+                .and_then(|millis| now.0.checked_add(millis))
+                .map(UnixMillis)
+                .ok_or_else(|| anyhow!("trust TTL is too large"))
+        })
+        .transpose()?;
+    let client_certificate_chain_der = pem_certificate_chain(&args.client_certificate_pem)?;
+    let key_material = PairingKeyMaterialV1 {
+        schema_version: 1,
+        owner_id: args.owner_id,
+        owner_public_key: public_key(&args.owner_public_key_hex)?,
+        broker_public_key: public_key(&args.broker_public_key_hex)?,
+        client_ca_der: first_pem_certificate(&args.client_ca_pem)?,
+        client_certificate_sha256: Sha256Digest(
+            Sha256::digest(&client_certificate_chain_der[0]).into(),
+        ),
+        allowed_capabilities: args
+            .capabilities
+            .iter()
+            .map(|value| parse_capability(value))
+            .collect::<Result<Vec<_>>>()?,
+        trust_expires_at,
+    };
+    let manager = PairingManager::new(
+        identity,
+        store,
+        config.policy.enabled_capabilities.iter().copied(),
+    );
+    let display = manager.begin_pairing_recovery(
+        PairingRecoveryRequest {
+            peer_id: args.peer_id,
+            key_material,
+            client_certificate_chain_der,
+            ttl_millis: args
+                .ttl_seconds
+                .checked_mul(1_000)
+                .ok_or_else(|| anyhow!("recovery TTL is too large"))?,
+        },
+        now,
+    )?;
+    print_json(&display)
+}
+
+fn pair_recovery_approve(args: PairRecoveryApproveArgs) -> Result<()> {
+    let (config, identity, store, _admin_lease) = pairing_context(&args.config)?;
+    let manager = PairingManager::new(
+        identity,
+        store,
+        config.policy.enabled_capabilities.iter().copied(),
+    );
+    let result = manager.approve_pairing_recovery_local(
+        &PairingRecoveryProof {
+            recovery_id: args.recovery_id,
+            challenge_secret: fixed_bytes::<32>(&args.challenge_hex, "challenge")?,
             next_owner_signature: signature(&args.next_owner_signature_hex)?,
             next_broker_signature: signature(&args.next_broker_signature_hex)?,
             approved_at: now()?,

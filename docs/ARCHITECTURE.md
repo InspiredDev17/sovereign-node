@@ -60,14 +60,20 @@ v0.1 acquires an owner-only, non-blocking singleton daemon lease before opening
 the runtime. Only while holding that lease may startup reconcile nonterminal
 reservations from a prior process to `Indeterminate`. Reconciliation never
 dispatches or resumes the action. A separate short-lived admin mutation lease
-serializes pairing, peer credential rotation, revocation, and device-key
-rotation without preventing live revocation checks in the daemon. Pairing and
-peer rotation use node-signed transcripts and return node-signed receipts;
+serializes pairing, peer credential rotation, recovery re-pairing, revocation,
+and device-key rotation without preventing live revocation checks in the
+daemon. Pairing, peer rotation, and recovery use node-signed transcripts and
+return node-signed receipts;
 credential rotation additionally requires proofs from both current roles and
 both replacement roles before its atomic trust-epoch change.
-Both ceremonies validate the bounded client-certificate chain, CA constraints,
+All three ceremonies validate the bounded client-certificate chain, CA constraints,
 clientAuth purpose, validity window, and exact leaf digest at creation and
 again at approval using established rustls WebPKI verification.
+
+Recovery is a separate transition available only for a durably revoked peer.
+It requires replacement owner/broker proofs plus local confirmation, binds the
+old revocation and epoch, increments that epoch atomically, and preserves the
+old revocation in immutable recovery history. It is never a LAN action.
 
 ### Identity and trust store
 

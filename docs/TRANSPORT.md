@@ -103,8 +103,10 @@ intermediates remain short-lived ceremony evidence.
 
 Revoking a paired credential invalidates its trust record and closes existing
 sessions. Rotation increments the trust generation and closes sessions bound to
-the prior generation. TLS session resumption must not outlive the credential or
-generation that created it.
+the prior generation. Owner-local recovery likewise installs a replacement leaf
+pin and increments the generation only after durable revocation-bound approval;
+the revoked leaf never becomes valid again. TLS session resumption must not
+outlive the credential or generation that created it.
 
 ## Application authentication
 

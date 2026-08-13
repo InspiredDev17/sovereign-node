@@ -15,8 +15,8 @@ use sovereign_node::config::PolicyConfig;
 use sovereign_node::identity::{NodeIdentity, key_id};
 use sovereign_node::pairing::{
     CredentialRotationDisplay, CredentialRotationProof, CredentialRotationRequest, PairingDisplay,
-    PairingError, PairingKeyMaterialV1, PairingManager, PairingProof, PairingRequest,
-    TrustReceiptKind,
+    PairingError, PairingKeyMaterialV1, PairingManager, PairingProof, PairingRecoveryDisplay,
+    PairingRecoveryProof, PairingRecoveryRequest, PairingRequest, TrustReceiptKind,
 };
 use sovereign_node::protocol::{
     ActionArguments, ActionErrorCode, ActionRequestV1, ActionTarget, AgentId, AuthorityKind,
@@ -350,6 +350,23 @@ fn rotation_proof_for(
         challenge_secret,
         current_owner_signature: signature_bytes(&current_owner.sign(&payload))?,
         current_broker_signature: signature_bytes(&current_broker.sign(&payload))?,
+        next_owner_signature: signature_bytes(&next_owner.sign(&payload))?,
+        next_broker_signature: signature_bytes(&next_broker.sign(&payload))?,
+        approved_at,
+    })
+}
+
+fn recovery_proof_for(
+    display: &PairingRecoveryDisplay,
+    next_owner: &SigningKey,
+    next_broker: &SigningKey,
+    approved_at: UnixMillis,
+) -> TestResult<PairingRecoveryProof> {
+    let challenge_secret = decode_fixed::<32>(&display.challenge_hex)?;
+    let payload = hex::decode(&display.proof_payload_hex)?;
+    Ok(PairingRecoveryProof {
+        recovery_id: display.recovery_id,
+        challenge_secret,
         next_owner_signature: signature_bytes(&next_owner.sign(&payload))?,
         next_broker_signature: signature_bytes(&next_broker.sign(&payload))?,
         approved_at,
@@ -1225,6 +1242,225 @@ fn credential_rotation_expiry_is_consumed_without_changing_trust() -> TestResult
             .trust_epoch,
         1
     );
+    Ok(())
+}
+
+#[test]
+fn revoked_pairing_recovery_requires_new_proofs_and_preserves_history() -> TestResult {
+    let harness = Harness::new()?;
+    let manager = PairingManager::new(
+        Arc::clone(&harness.identity),
+        Arc::clone(&harness.store),
+        [
+            Capability::SystemInfo,
+            Capability::ResourceStatus,
+            Capability::FileRead,
+        ],
+    );
+    let next_owner = SigningKey::from_bytes(&[0x45; 32]);
+    let next_broker = SigningKey::from_bytes(&[0x46; 32]);
+    let (next_material, next_chain) = key_material(
+        &next_owner,
+        &next_broker,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    )?;
+    let request = || PairingRecoveryRequest {
+        peer_id: PEER_ID.to_owned(),
+        key_material: next_material.clone(),
+        client_certificate_chain_der: next_chain.clone(),
+        ttl_millis: 60_000,
+    };
+    let old_identity_digest = harness
+        .store
+        .peer_record(PEER_ID)?
+        .ok_or_else(|| test_error("paired peer record was missing"))?
+        .identity_digest;
+
+    assert!(matches!(
+        manager.begin_pairing_recovery(request(), UnixMillis(NOW + 20)),
+        Err(PairingError::Store(StoreError::PairingNotFound))
+    ));
+    let revocation = match manager.revoke_local(
+        PEER_ID,
+        "replace compromised credentials",
+        UnixMillis(NOW + 21),
+        true,
+    )? {
+        RevocationOutcome::Revoked(record) => record,
+        RevocationOutcome::AlreadyRevoked(_) | RevocationOutcome::NotFound => {
+            return Err(test_error("unexpected revocation outcome"));
+        }
+    };
+    assert!(harness.store.is_peer_revoked(PEER_ID)?);
+
+    let display = manager.begin_pairing_recovery(request(), UnixMillis(NOW + 22))?;
+    assert_eq!(display.pairing_id, harness.pairing_id);
+    assert_eq!(display.revoked_trust_epoch, 1);
+    assert_eq!(
+        display.revoked_identity_fingerprint,
+        hex::encode(old_identity_digest)
+    );
+    sovereign_node::pairing::verify_node_proof(
+        PublicKeyBytes(decode_fixed::<32>(&display.node_public_key_hex)?),
+        &hex::decode(&display.proof_payload_hex)?,
+        &SignatureBytes::from_slice(&hex::decode(&display.node_signature_hex)?)?,
+    )?;
+    let proof = recovery_proof_for(&display, &next_owner, &next_broker, UnixMillis(NOW + 23))?;
+    assert!(matches!(
+        manager.approve_pairing_recovery_local(&proof, false),
+        Err(PairingError::OwnerConfirmationRequired)
+    ));
+
+    let attacker = SigningKey::from_bytes(&[0x47; 32]);
+    let payload = hex::decode(&display.proof_payload_hex)?;
+    let attacker_signature = signature_bytes(&attacker.sign(&payload))?;
+    let mut forged_owner = proof.clone();
+    forged_owner.next_owner_signature = attacker_signature.clone();
+    assert!(matches!(
+        manager.approve_pairing_recovery_local(&forged_owner, true),
+        Err(PairingError::InvalidProof)
+    ));
+    let mut forged_broker = proof.clone();
+    forged_broker.next_broker_signature = attacker_signature;
+    assert!(matches!(
+        manager.approve_pairing_recovery_local(&forged_broker, true),
+        Err(PairingError::InvalidProof)
+    ));
+    assert!(harness.store.is_peer_revoked(PEER_ID)?);
+    assert_eq!(
+        harness
+            .store
+            .peer_record(PEER_ID)?
+            .ok_or_else(|| test_error("revoked peer record was missing"))?
+            .trust_epoch,
+        1
+    );
+
+    let approved = manager.approve_pairing_recovery_local(&proof, true)?;
+    assert_eq!(approved.trusted_peer.trust_epoch, 2);
+    assert_eq!(
+        approved.receipt.receipt.kind,
+        TrustReceiptKind::RecoveryPairing
+    );
+    assert_eq!(approved.receipt.receipt.pairing_id, harness.pairing_id);
+    assert_eq!(approved.receipt.receipt.trust_epoch, 2);
+    assert_eq!(
+        approved.receipt.receipt.previous_peer_identity_digest,
+        Some(Sha256Digest(old_identity_digest))
+    );
+    approved.receipt.verify()?;
+    assert!(!harness.store.is_peer_revoked(PEER_ID)?);
+    assert!(matches!(
+        manager.approve_pairing_recovery_local(&proof, true),
+        Err(PairingError::Store(StoreError::RecoveryNotFound))
+    ));
+
+    let history = harness.store.pairing_recoveries_for_peer(PEER_ID)?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].revocation, revocation);
+    assert_eq!(history[0].previous_trust_epoch, 1);
+    assert_eq!(history[0].next_trust_epoch, 2);
+
+    harness.clock.set(NOW + 30);
+    let old_action = harness.system_info_action(800, 70)?;
+    assert!(
+        harness
+            .engine()
+            .verify_and_reserve(old_action, &harness.transport_peer())
+            .is_err()
+    );
+    let next_transport = TransportPeer {
+        peer_id: PEER_ID.to_owned(),
+        certificate_sha256: next_material.client_certificate_sha256,
+        trust_epoch: 2,
+    };
+    let next_action = signed_action(ActionSpec {
+        request_seed: 801,
+        sequence: 71,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 2,
+        owner_id: OWNER_ID,
+        target: ActionTarget::Node,
+        arguments: ActionArguments::SystemInfo,
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &next_owner,
+        broker_key: &next_broker,
+    })?;
+    assert!(matches!(
+        harness
+            .engine()
+            .verify_and_reserve(next_action, &next_transport)?,
+        AuthorizationOutcome::Fresh(_)
+    ));
+
+    assert!(matches!(
+        manager.revoke_local(
+            PEER_ID,
+            "second explicit revocation",
+            UnixMillis(NOW + 31),
+            true,
+        )?,
+        RevocationOutcome::Revoked(_)
+    ));
+    let reopened = StateStore::open(&harness.database_path)?;
+    assert!(reopened.is_peer_revoked(PEER_ID)?);
+    assert_eq!(reopened.pairing_recoveries_for_peer(PEER_ID)?, history);
+    reopened.verify_audit_chain()?;
+    Ok(())
+}
+
+#[test]
+fn pairing_recovery_expiry_is_consumed_and_cannot_restore_trust() -> TestResult {
+    let harness = Harness::new()?;
+    let manager = PairingManager::new(
+        Arc::clone(&harness.identity),
+        Arc::clone(&harness.store),
+        [
+            Capability::SystemInfo,
+            Capability::ResourceStatus,
+            Capability::FileRead,
+        ],
+    );
+    assert!(matches!(
+        manager.revoke_local(PEER_ID, "credential loss", UnixMillis(NOW + 20), true,)?,
+        RevocationOutcome::Revoked(_)
+    ));
+    let next_owner = SigningKey::from_bytes(&[0x48; 32]);
+    let next_broker = SigningKey::from_bytes(&[0x49; 32]);
+    let (next_material, next_chain) = key_material(
+        &next_owner,
+        &next_broker,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    )?;
+    let display = manager.begin_pairing_recovery(
+        PairingRecoveryRequest {
+            peer_id: PEER_ID.to_owned(),
+            key_material: next_material,
+            client_certificate_chain_der: next_chain,
+            ttl_millis: 60_000,
+        },
+        UnixMillis(NOW + 21),
+    )?;
+    let proof = recovery_proof_for(&display, &next_owner, &next_broker, display.expires_at)?;
+    assert!(matches!(
+        manager.approve_pairing_recovery_local(&proof, true),
+        Err(PairingError::Store(StoreError::RecoveryExpired))
+    ));
+    assert!(matches!(
+        manager.approve_pairing_recovery_local(&proof, true),
+        Err(PairingError::Store(StoreError::RecoveryNotFound))
+    ));
+    assert!(harness.store.is_peer_revoked(PEER_ID)?);
+    assert!(
+        harness
+            .store
+            .pairing_recoveries_for_peer(PEER_ID)?
+            .is_empty()
+    );
+    harness.store.verify_audit_chain()?;
     Ok(())
 }
 
