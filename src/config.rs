@@ -35,6 +35,9 @@ pub struct NodeConfig {
     pub approved_actions: BTreeMap<String, ApprovedActionConfig>,
     #[serde(default)]
     pub health: HealthConfig,
+    /// Optional signed local accelerator/model measurements. Absence remains Unknown.
+    #[serde(default)]
+    pub resource_reporting: ResourceReportingConfig,
     /// Optional pinned offline-update authorities. Absence disables staging.
     #[serde(default)]
     pub updates: Option<UpdateConfig>,
@@ -112,6 +115,22 @@ pub struct HealthConfig {
 pub struct HealthSnapshotConfig {
     pub snapshot_path: PathBuf,
     /// Pinned Ed25519 public key for this health producer, encoded as 64 hex characters.
+    pub public_key_hex: String,
+    /// Maximum producer-declared validity window and observation age.
+    pub max_age_secs: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResourceReportingConfig {
+    pub snapshot: Option<ResourceSnapshotConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceSnapshotConfig {
+    pub snapshot_path: PathBuf,
+    /// Pinned Ed25519 public key for the local measurement producer.
     pub public_key_hex: String,
     /// Maximum producer-declared validity window and observation age.
     pub max_age_secs: u64,
@@ -250,6 +269,12 @@ impl NodeConfig {
             .as_ref()
             .map(|adapter| validate_health_adapter("health.action_broker", adapter))
             .transpose()?;
+        let resource_snapshot_key = self
+            .resource_reporting
+            .snapshot
+            .as_ref()
+            .map(|adapter| validate_resource_adapter("resource_reporting.snapshot", adapter))
+            .transpose()?;
         if agent_green_health_key.is_some() && agent_green_health_key == action_broker_health_key {
             return Err(ConfigError::Invalid(
                 "Agent Green and Action Broker health keys must be role-separated".to_owned(),
@@ -261,6 +286,28 @@ impl NodeConfig {
         {
             return Err(ConfigError::Invalid(
                 "Agent Green and Action Broker health snapshots must use separate paths".to_owned(),
+            ));
+        }
+        if resource_snapshot_key.is_some()
+            && (resource_snapshot_key == agent_green_health_key
+                || resource_snapshot_key == action_broker_health_key)
+        {
+            return Err(ConfigError::Invalid(
+                "resource, Agent Green, and Action Broker snapshot keys must be role-separated"
+                    .to_owned(),
+            ));
+        }
+        if let Some(resource) = &self.resource_reporting.snapshot
+            && [
+                self.health.agent_green.as_ref(),
+                self.health.action_broker.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|health| health.snapshot_path == resource.snapshot_path)
+        {
+            return Err(ConfigError::Invalid(
+                "resource and health snapshots must use separate paths".to_owned(),
             ));
         }
         if let Some(updates) = &self.updates {
@@ -280,6 +327,19 @@ impl NodeConfig {
             if release_key == owner_key {
                 return Err(ConfigError::Invalid(
                     "update release and owner-approval keys must be role-separated".to_owned(),
+                ));
+            }
+            if [
+                agent_green_health_key.as_ref(),
+                action_broker_health_key.as_ref(),
+                resource_snapshot_key.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|snapshot_key| snapshot_key == &release_key || snapshot_key == &owner_key)
+            {
+                return Err(ConfigError::Invalid(
+                    "snapshot and update authority keys must be role-separated".to_owned(),
                 ));
             }
         }
@@ -355,6 +415,14 @@ impl NodeConfig {
             {
                 return Err(ConfigError::Invalid(format!(
                     "file root {root_id} overlaps Action Broker health material"
+                )));
+            }
+            if let Some(resource) = &self.resource_reporting.snapshot
+                && resource.snapshot_path.exists()
+                && path_contains_or_is_contained(root, &resource.snapshot_path)?
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "file root {root_id} overlaps resource snapshot material"
                 )));
             }
         }
@@ -442,6 +510,19 @@ fn validate_health_adapter(
     }
     let key = parse_ed25519_key(&format!("{name}.public_key_hex"), &adapter.public_key_hex)?;
     Ok(key)
+}
+
+fn validate_resource_adapter(
+    name: &str,
+    adapter: &ResourceSnapshotConfig,
+) -> Result<VerifyingKey, ConfigError> {
+    require_absolute(&format!("{name}.snapshot_path"), &adapter.snapshot_path)?;
+    if adapter.max_age_secs == 0 || adapter.max_age_secs > 86_400 {
+        return Err(ConfigError::Invalid(format!(
+            "{name}.max_age_secs must be between 1 and 86400"
+        )));
+    }
+    parse_ed25519_key(&format!("{name}.public_key_hex"), &adapter.public_key_hex)
 }
 
 fn require_absolute(name: &str, value: &Path) -> Result<(), ConfigError> {
@@ -536,6 +617,7 @@ mod tests {
             file_roots: BTreeMap::new(),
             approved_actions: BTreeMap::new(),
             health: HealthConfig::default(),
+            resource_reporting: ResourceReportingConfig::default(),
             updates: None,
         }
     }
@@ -658,6 +740,53 @@ mod tests {
             adapter.snapshot_path = PathBuf::from("/run/sovereign-action-broker/health.json");
             adapter.max_age_secs = 0;
         }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn resource_snapshot_is_role_separated_and_bounded() {
+        let health_key = SigningKey::from_bytes(&[0x63; 32]);
+        let resource_key = SigningKey::from_bytes(&[0x64; 32]);
+        let mut config = minimal_config();
+        config.health.agent_green = Some(HealthSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/agentgreen/health.json"),
+            public_key_hex: hex::encode(health_key.verifying_key().to_bytes()),
+            max_age_secs: 60,
+        });
+        config.resource_reporting.snapshot = Some(ResourceSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/sovereign-resources/snapshot.json"),
+            public_key_hex: hex::encode(resource_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        assert!(config.validate().is_ok());
+
+        if let Some(resource) = &mut config.resource_reporting.snapshot {
+            resource.public_key_hex =
+                hex::encode(health_key.verifying_key().to_bytes()).to_uppercase();
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        if let Some(resource) = &mut config.resource_reporting.snapshot {
+            resource.public_key_hex = hex::encode(resource_key.verifying_key().to_bytes());
+            resource.snapshot_path = PathBuf::from("/run/agentgreen/health.json");
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        if let Some(resource) = &mut config.resource_reporting.snapshot {
+            resource.snapshot_path = PathBuf::from("/run/sovereign-resources/snapshot.json");
+            resource.max_age_secs = 86_401;
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        let update_owner = SigningKey::from_bytes(&[0x65; 32]);
+        if let Some(resource) = &mut config.resource_reporting.snapshot {
+            resource.max_age_secs = 30;
+        }
+        config.updates = Some(UpdateConfig {
+            release_public_key_hex: hex::encode(resource_key.verifying_key().to_bytes()),
+            owner_approval_public_key_hex: hex::encode(update_owner.verifying_key().to_bytes()),
+            max_artifact_bytes: 1_024,
+        });
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 }

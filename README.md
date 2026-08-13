@@ -92,14 +92,15 @@ revocation commands are owner-local operations; run `sovereign-node --help` for 
 | Capability | Default | Boundary |
 | --- | --- | --- |
 | `SystemInfo` | Enabled | Minimized OS, architecture, version, and logical CPU data |
-| `ResourceStatus` | Enabled | Aggregate CPU/RAM/disk, live bounded queue state, and signed local health snapshots when configured |
+| `ResourceStatus` | Enabled | CPU/RAM/disk/load, live bounded queue state, and optional signed accelerator, model, and health snapshots |
 | `FileRead` / `FileWrite` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
 | `ExecuteApprovedAction` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
 | Process/service/GPU/engine/model/repository status | Disabled | Explicit adapter/allowlist required |
 | Agent Green / Action Broker health | Optional within `ResourceStatus` | Fresh Ed25519-signed local snapshots only; never control or attestation |
 
 The producer format and fail-closed freshness rules are documented in
-[Signed local health snapshots](docs/HEALTH-SNAPSHOTS.md).
+[Signed local health snapshots](docs/HEALTH-SNAPSHOTS.md) and
+[Signed local resource snapshots](docs/RESOURCE-SNAPSHOTS.md).
 
 ## Offline and updates
 

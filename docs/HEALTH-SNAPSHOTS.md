@@ -50,10 +50,10 @@ other free-form data.
 The producer signs this byte sequence with standard Ed25519:
 
 ```text
-ASCII("sovereign-node/local-health-snapshot/v1\\0") || exact_payload_json_bytes
+ASCII("sovereign-node/local-health-snapshot/v1\0") || exact_payload_json_bytes
 ```
 
-The `\\0` is one zero byte, not two printable characters. The producer then
+The `\0` denotes one zero byte, not two printable characters. The producer then
 hex-encodes the original payload bytes and the 64-byte signature into the
 outer JSON. JSON property order and whitespace in the payload are not
 canonicalized; the signature covers the exact payload bytes carried by

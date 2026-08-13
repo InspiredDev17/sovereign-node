@@ -154,6 +154,12 @@ engine availability, loaded models, queue state, Agent Green health, and Action
 Broker health. Unsupported or unverifiable values are reported as unknown, not
 as healthy or zero.
 
+CPU, RAM, disk, one-minute load, and queue measurements come from bounded local
+runtime adapters. GPU, unified-memory, thermal, inference-engine, and loaded
+model measurements may come from the optional component-specific signed local
+resource snapshot contract. An empty GPU or model list means that no verified
+entries are available; it is not proof that the machine has no GPU or models.
+
 Agent Green remains independent. Its health is `Healthy`, `Degraded`,
 `Unhealthy`, `Unavailable`, or `Unknown` and must come from a configured,
 component-bound signed local health contract. Process presence alone is not

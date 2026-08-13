@@ -78,6 +78,7 @@ package inventories.
 Read-only bounded measurements for:
 
 - CPU utilization and logical capacity;
+- one-minute system load when the operating system exposes it;
 - used, available, and total RAM;
 - used, available, and total disk for explicitly configured volumes;
 - GPU utilization when supported;
@@ -88,6 +89,15 @@ Read-only bounded measurements for:
 
 Unsupported and stale measurements are Unknown. The executor applies sampling
 deadlines and does not invoke unbounded vendor utilities.
+
+GPU, unified-memory, thermal, inference-engine, and loaded-model measurements
+may be supplied through the optional signed local resource snapshot described
+in [RESOURCE-SNAPSHOTS.md](RESOURCE-SNAPSHOTS.md). The node verifies the exact
+payload, freshness window, role-specific key, unique logical identifiers,
+memory bounds, temperatures, and protocol collection limits before accepting
+the snapshot. A failure rejects the entire optional snapshot and returns only
+the safe unknown/empty representation. Empty GPU or model lists mean no
+verified entries, not verified absence.
 
 ### FileRead
 

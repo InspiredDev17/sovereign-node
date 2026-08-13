@@ -63,3 +63,11 @@ max_action_runtime_secs = 30
 # snapshot_path = "/run/sovereign-action-broker/health.json"
 # public_key_hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 # max_age_secs = 30
+
+[resource_reporting]
+# Optional signed accelerator/model measurements. The producer key and path must be distinct from
+# both health adapters and every update authority. Missing or unverifiable data remains Unknown.
+# [resource_reporting.snapshot]
+# snapshot_path = "/run/sovereign-resources/snapshot.json"
+# public_key_hex = "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+# max_age_secs = 30

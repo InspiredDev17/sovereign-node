@@ -13,7 +13,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sovereign_node::authz::{AuthorizationEngine, Clock, SystemClock};
 use sovereign_node::capabilities::CapabilityExecutor;
-use sovereign_node::config::{HealthConfig, NodeConfig, PolicyConfig};
+use sovereign_node::config::{HealthConfig, NodeConfig, PolicyConfig, ResourceReportingConfig};
 use sovereign_node::identity::NodeIdentity;
 use sovereign_node::lifecycle::{LeaseKind, LifecycleLease};
 use sovereign_node::pairing::{
@@ -379,6 +379,7 @@ fn config_example(data_dir: &Path) -> Result<()> {
         file_roots: Default::default(),
         approved_actions: Default::default(),
         health: HealthConfig::default(),
+        resource_reporting: ResourceReportingConfig::default(),
         updates: None,
     };
     config.validate()?;

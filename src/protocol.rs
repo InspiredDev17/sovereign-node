@@ -5,7 +5,11 @@
 //! authorization layer. Enum variant order and field order are wire format: add
 //! new protocol versions rather than reordering existing variants or fields.
 
-use std::{collections::BTreeMap, fmt, path::Component};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::Component,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest as _, Sha256};
@@ -1180,6 +1184,7 @@ impl NodeResourceReportV1 {
         if self.cpu.utilization.0 > 1_000 {
             return Err(ValidationError::InvalidValue("CPU utilization"));
         }
+        validate_temperature(self.cpu.temperature_millidegrees_celsius, "CPU temperature")?;
         validate_memory(&self.ram, "RAM")?;
         if let Some(memory) = &self.unified_memory {
             validate_memory(memory, "unified memory")?;
@@ -1199,15 +1204,52 @@ impl NodeResourceReportV1 {
         if self.queue.running > self.queue.capacity {
             return Err(ValidationError::InvalidValue("queue running count"));
         }
+        for disk in &self.disks {
+            validate_local_identifier(&disk.label, "disk label")?;
+            if disk.available_bytes > disk.total_bytes {
+                return Err(ValidationError::InvalidValue("disk capacity"));
+            }
+        }
+        let mut gpu_indexes = BTreeSet::new();
         for gpu in &self.gpus {
+            if !gpu_indexes.insert(gpu.index) {
+                return Err(ValidationError::InvalidValue("GPU index"));
+            }
             if gpu.utilization.is_some_and(|value| value.0 > 1_000) {
                 return Err(ValidationError::InvalidValue("GPU utilization"));
             }
+            validate_temperature(gpu.temperature_millidegrees_celsius, "GPU temperature")?;
             if matches!(
+                (gpu.total_memory_bytes, gpu.used_memory_bytes),
+                (None, Some(_)) | (Some(_), None)
+            ) || matches!(
                 (gpu.total_memory_bytes, gpu.used_memory_bytes),
                 (Some(total), Some(used)) if used > total
             ) {
                 return Err(ValidationError::InvalidValue("GPU memory"));
+            }
+        }
+        let mut engine_ids = BTreeSet::new();
+        for engine in &self.inference_engines {
+            validate_local_identifier(&engine.engine_id, "inference engine id")?;
+            if !engine_ids.insert(engine.engine_id.as_str()) {
+                return Err(ValidationError::InvalidValue("inference engine id"));
+            }
+            validate_optional_string(
+                &engine.version,
+                MAX_VERSION_BYTES,
+                "inference engine version",
+            )?;
+        }
+        let mut model_ids = BTreeSet::new();
+        for model in &self.loaded_models {
+            validate_local_identifier(&model.model_id, "model id")?;
+            validate_local_identifier(&model.engine_id, "model engine id")?;
+            if !model_ids.insert(model.model_id.as_str()) {
+                return Err(ValidationError::InvalidValue("model id"));
+            }
+            if !engine_ids.contains(model.engine_id.as_str()) {
+                return Err(ValidationError::InvalidValue("model engine id"));
             }
         }
         validate_optional_string(
@@ -1387,7 +1429,17 @@ fn validate_relative_path(value: &str) -> Result<(), ValidationError> {
 }
 
 fn validate_memory(memory: &MemoryResourceV1, field: &'static str) -> Result<(), ValidationError> {
-    if memory.available_bytes > memory.total_bytes || memory.used_bytes > memory.total_bytes {
+    if memory.available_bytes > memory.total_bytes
+        || memory.used_bytes > memory.total_bytes
+        || memory.used_bytes.saturating_add(memory.available_bytes) > memory.total_bytes
+    {
+        return Err(ValidationError::InvalidValue(field));
+    }
+    Ok(())
+}
+
+fn validate_temperature(value: Option<i32>, field: &'static str) -> Result<(), ValidationError> {
+    if value.is_some_and(|value| !(-100_000..=250_000).contains(&value)) {
         return Err(ValidationError::InvalidValue(field));
     }
     Ok(())
