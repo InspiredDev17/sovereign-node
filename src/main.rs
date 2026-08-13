@@ -445,6 +445,7 @@ fn config_example(data_dir: &Path) -> Result<()> {
         tls: None,
         policy: PolicyConfig::default(),
         file_roots: Default::default(),
+        read_roots: Default::default(),
         approved_actions: Default::default(),
         health: HealthConfig::default(),
         resource_reporting: ResourceReportingConfig::default(),

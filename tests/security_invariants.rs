@@ -15,7 +15,7 @@ use sovereign_node::authz::{
 use sovereign_node::capabilities::{CapabilityError, CapabilityExecutor};
 use sovereign_node::config::{
     HealthConfig, NodeConfig, PolicyConfig, ProcessReportingConfig, ProcessSnapshotConfig,
-    RepositoryReportingConfig, RepositorySnapshotConfig, ResourceReportingConfig,
+    ReadRootConfig, RepositoryReportingConfig, RepositorySnapshotConfig, ResourceReportingConfig,
     ServiceReportingConfig, ServiceSnapshotConfig,
 };
 use sovereign_node::identity::{NodeIdentity, key_id};
@@ -787,6 +787,7 @@ async fn process_status_uses_signed_logical_identity_and_denies_raw_pid() -> Tes
         tls: None,
         policy,
         file_roots: Default::default(),
+        read_roots: Default::default(),
         approved_actions: Default::default(),
         health: HealthConfig::default(),
         resource_reporting: ResourceReportingConfig::default(),
@@ -936,6 +937,7 @@ async fn service_status_uses_signed_logical_identity_without_manager_control() -
         tls: None,
         policy,
         file_roots: Default::default(),
+        read_roots: Default::default(),
         approved_actions: Default::default(),
         health: HealthConfig::default(),
         resource_reporting: ResourceReportingConfig::default(),
@@ -1076,6 +1078,7 @@ async fn repository_status_uses_signed_logical_identity_without_git_access() -> 
         tls: None,
         policy,
         file_roots: Default::default(),
+        read_roots: Default::default(),
         approved_actions: Default::default(),
         health: HealthConfig::default(),
         resource_reporting: ResourceReportingConfig::default(),
@@ -1213,6 +1216,138 @@ async fn repository_status_uses_signed_logical_identity_without_git_access() -> 
             .await,
         Err(CapabilityError::TargetNotAllowed)
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_read_uses_exact_pinned_read_only_root_without_write_authority() -> TestResult {
+    let harness = Harness::with_capabilities(&[Capability::FileRead])?;
+    let read_root = harness._directory.path().join("published-reports");
+    fs::create_dir_all(read_root.join("daily"))?;
+    let read_root = read_root.canonicalize()?;
+    fs::write(read_root.join("daily/status.txt"), b"0123456789")?;
+    fs::write(read_root.join("daily/private.txt"), b"private")?;
+    let policy = PolicyConfig {
+        enabled_capabilities: vec![Capability::FileRead],
+        max_file_read_bytes: 64,
+        ..PolicyConfig::default()
+    };
+    let config = Arc::new(NodeConfig {
+        data_dir: harness.identity_directory.clone(),
+        policy_version: 1,
+        listen: None,
+        tls: None,
+        policy,
+        file_roots: Default::default(),
+        read_roots: std::collections::BTreeMap::from([(
+            "reports".to_owned(),
+            ReadRootConfig {
+                path: read_root,
+                allowed_files: vec!["daily/status.txt".to_owned()],
+            },
+        )]),
+        approved_actions: Default::default(),
+        health: HealthConfig::default(),
+        resource_reporting: ResourceReportingConfig::default(),
+        process_reporting: ProcessReportingConfig::default(),
+        service_reporting: ServiceReportingConfig::default(),
+        repository_reporting: RepositoryReportingConfig::default(),
+        updates: None,
+    });
+    config.validate()?;
+    let executor = CapabilityExecutor::new(
+        Arc::clone(&config),
+        ResourceReporter::new(
+            harness.identity.node_id(),
+            harness.identity.device().clone(),
+        ),
+    );
+    let engine = harness.engine_for(&[Capability::FileRead]);
+    let transport = harness.transport_peer();
+    let read = signed_action(ActionSpec {
+        request_seed: 182,
+        sequence: 14,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::File {
+            root_id: "reports".to_owned(),
+            relative_path: "daily/status.txt".to_owned(),
+        },
+        arguments: ActionArguments::FileRead {
+            offset: 3,
+            max_bytes: 4,
+        },
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    let read = match engine.verify_and_reserve(read, &transport)? {
+        AuthorizationOutcome::Fresh(verified) => verified,
+        AuthorizationOutcome::Duplicate => return Err("fresh file read duplicated".into()),
+    };
+    let result = executor
+        .execute(
+            &read,
+            UnixMillis(NOW + 10),
+            QueueSnapshot::default(),
+            TrustStatus::Trusted,
+        )
+        .await?;
+    let ActionResultV1::FileRead(result) = result else {
+        return Err("file read returned the wrong result type".into());
+    };
+    assert_eq!(result.contents, b"3456");
+    assert!(!result.end_of_file);
+    assert_eq!(result.content_digest, Sha256Digest(sha256(b"3456")));
+
+    let denied = signed_action(ActionSpec {
+        request_seed: 183,
+        sequence: 15,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::File {
+            root_id: "reports".to_owned(),
+            relative_path: "daily/private.txt".to_owned(),
+        },
+        arguments: ActionArguments::FileRead {
+            offset: 0,
+            max_bytes: 4,
+        },
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    let denied = match engine.verify_and_reserve(denied, &transport)? {
+        AuthorizationOutcome::Fresh(verified) => verified,
+        AuthorizationOutcome::Duplicate => return Err("fresh denied file read duplicated".into()),
+    };
+    assert_eq!(
+        executor
+            .execute(
+                &denied,
+                UnixMillis(NOW + 10),
+                QueueSnapshot::default(),
+                TrustStatus::Trusted,
+            )
+            .await,
+        Err(CapabilityError::TargetNotAllowed)
+    );
+
+    let mut write_config = (*config).clone();
+    write_config
+        .policy
+        .enabled_capabilities
+        .push(Capability::FileWrite);
+    assert!(write_config.validate().is_err());
     Ok(())
 }
 

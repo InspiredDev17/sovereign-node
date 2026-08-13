@@ -176,6 +176,14 @@ by an owner-defined logical repository ID. The node never receives a repository
 path, opens a work tree, invokes Git, accesses remotes, reads files or diffs,
 runs hooks, or mutates repository state.
 
+FileRead uses a separate Unix-only publication boundary. The owner configures a
+dedicated root plus exact relative-file allowlist; startup captures the root
+directory descriptor, and requests traverse from it component by component
+with no-follow opens. The node rejects broad roots, unlisted targets, hidden or
+credential-like names, links, executable and special files, and every protected
+node/component path. FileWrite remains unavailable and cannot inherit read-root
+authority.
+
 Agent Green remains independent. Its health is `Healthy`, `Degraded`,
 `Unhealthy`, `Unavailable`, or `Unknown` and must come from a configured,
 component-bound signed local health contract. Process presence alone is not

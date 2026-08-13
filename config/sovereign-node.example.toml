@@ -66,10 +66,18 @@ max_action_runtime_secs = 30
 # public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # max_age_secs = 30
 
-# Reserved future policy shape. v0.1 rejects advertising FileRead/FileWrite.
-# The root must not contain or be contained by data_dir.
+# Optional Unix-only FileRead publication. The root must be a dedicated owner-controlled
+# directory, must not overlap node/snapshot/TLS/action state, and every readable file must be
+# listed exactly. Hidden, credential-like, executable, linked, or special files are denied.
+# Enabling FileRead and adding/changing any entry requires a higher policy_version.
+# [read_roots.reports]
+# path = "/srv/sovereign-node-public/reports"
+# allowed_files = ["daily/status.txt", "summary.json"]
+
+# Reserved future writable-root shape. v0.1 rejects advertising and executing FileWrite.
+# The legacy root must not contain or be contained by data_dir.
 # [file_roots]
-# reports = "/srv/sovereign-node/reports"
+# future-writes = "/srv/sovereign-node/future-writes"
 
 # Reserved future policy shape. v0.1 rejects advertising ExecuteApprovedAction.
 # The eventual caller supplies only a catalog ID; no shell text or uploaded program is accepted.

@@ -32,6 +32,9 @@ pub struct NodeConfig {
     pub policy: PolicyConfig,
     #[serde(default)]
     pub file_roots: BTreeMap<String, PathBuf>,
+    /// Dedicated read-only publication roots with exact relative-file allowlists.
+    #[serde(default)]
+    pub read_roots: BTreeMap<String, ReadRootConfig>,
     #[serde(default)]
     pub approved_actions: BTreeMap<String, ApprovedActionConfig>,
     #[serde(default)]
@@ -112,6 +115,14 @@ pub struct ApprovedActionConfig {
     pub executable_sha256: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadRootConfig {
+    pub path: PathBuf,
+    /// Exact relative paths published for remote reading. Enumeration is never allowed.
+    pub allowed_files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -248,6 +259,16 @@ struct PolicyDigestV4<'a> {
     repository_reporting: &'a RepositoryReportingConfig,
 }
 
+#[derive(Debug, Serialize)]
+struct PolicyDigestV5<'a> {
+    schema_version: u16,
+    base: PolicyDigestV1<'a>,
+    process_reporting: &'a ProcessReportingConfig,
+    service_reporting: &'a ServiceReportingConfig,
+    repository_reporting: &'a RepositoryReportingConfig,
+    read_roots: &'a BTreeMap<String, ReadRootConfig>,
+}
+
 const fn default_max_update_artifact_bytes() -> u64 {
     1_073_741_824
 }
@@ -276,7 +297,16 @@ impl NodeConfig {
             resource_reporting: &self.resource_reporting,
             updates: &self.updates,
         };
-        let encoded = if self.repository_reporting.snapshot.is_some() {
+        let encoded = if !self.read_roots.is_empty() {
+            postcard::to_allocvec(&PolicyDigestV5 {
+                schema_version: 5,
+                base,
+                process_reporting: &self.process_reporting,
+                service_reporting: &self.service_reporting,
+                repository_reporting: &self.repository_reporting,
+                read_roots: &self.read_roots,
+            })
+        } else if self.repository_reporting.snapshot.is_some() {
             postcard::to_allocvec(&PolicyDigestV4 {
                 schema_version: 4,
                 base,
@@ -349,6 +379,7 @@ impl NodeConfig {
         for capability in &policy.enabled_capabilities {
             match capability {
                 Capability::SystemInfo | Capability::ResourceStatus => {}
+                Capability::FileRead if cfg!(unix) && !self.read_roots.is_empty() => {}
                 Capability::GpuStatus | Capability::EngineStatus | Capability::ModelStatus
                     if self.resource_reporting.snapshot.is_some() => {}
                 Capability::ProcessStatus if self.process_reporting.snapshot.is_some() => {}
@@ -660,6 +691,66 @@ impl NodeConfig {
             ));
         }
 
+        for (root_id, root) in &self.read_roots {
+            validate_identifier("read root", root_id)?;
+            validate_read_root(root_id, root)?;
+            if path_contains_or_is_contained(&root.path, &self.data_dir)? {
+                return Err(ConfigError::Invalid(format!(
+                    "read root {root_id} must not overlap the node data directory"
+                )));
+            }
+            if let Some(tls) = &self.tls
+                && (paths_overlap_including_missing(&root.path, &tls.private_key_pem)?
+                    || paths_overlap_including_missing(&root.path, &tls.certificate_pem)?)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "read root {root_id} overlaps TLS credential material"
+                )));
+            }
+            let snapshot_paths = [
+                self.health
+                    .agent_green
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.health
+                    .action_broker
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.resource_reporting
+                    .snapshot
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.process_reporting
+                    .snapshot
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.service_reporting
+                    .snapshot
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.repository_reporting
+                    .snapshot
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+            ];
+            for snapshot_path in snapshot_paths.into_iter().flatten() {
+                if paths_overlap_including_missing(&root.path, snapshot_path)? {
+                    return Err(ConfigError::Invalid(format!(
+                        "read root {root_id} overlaps signed snapshot material"
+                    )));
+                }
+            }
+            for (action_id, action) in &self.approved_actions {
+                if path_contains_or_is_contained(&root.path, &action.executable)?
+                    || path_contains_or_is_contained(&root.path, &action.working_directory)?
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "read root {root_id} overlaps approved action {action_id}"
+                    )));
+                }
+            }
+        }
+
         for (root_id, root) in &self.file_roots {
             validate_identifier("file root", root_id)?;
             require_absolute("file root", root)?;
@@ -872,6 +963,148 @@ fn validate_repository_adapter(
     parse_ed25519_key(&format!("{name}.public_key_hex"), &adapter.public_key_hex)
 }
 
+fn validate_read_root(root_id: &str, root: &ReadRootConfig) -> Result<(), ConfigError> {
+    require_absolute("read root", &root.path)?;
+    if root.path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Err(ConfigError::Invalid(format!(
+            "read root {root_id} must be an absolute normalized path"
+        )));
+    }
+    reject_symlink_path("read root", &root.path)?;
+    let canonical = root.path.canonicalize().map_err(|error| {
+        ConfigError::Invalid(format!("read root {root_id} cannot be resolved: {error}"))
+    })?;
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        ConfigError::Invalid(format!("read root {root_id} cannot be inspected: {error}"))
+    })?;
+    if !metadata.is_dir() || is_broad_read_root(&canonical) {
+        return Err(ConfigError::Invalid(format!(
+            "read root {root_id} must be a dedicated directory, not a broad home or system root"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o022 != 0 {
+            return Err(ConfigError::Invalid(format!(
+                "read root {root_id} must be owner-controlled and not group/world writable"
+            )));
+        }
+        if metadata.mode() & 0o100 == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "read root {root_id} must be traversable by its owner"
+            )));
+        }
+    }
+    if root.allowed_files.is_empty() || root.allowed_files.len() > 128 {
+        return Err(ConfigError::Invalid(format!(
+            "read root {root_id} must allow between 1 and 128 exact files"
+        )));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for relative_path in &root.allowed_files {
+        validate_public_read_path(relative_path)?;
+        if !unique.insert(relative_path.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "read root {root_id} contains a duplicate allowed file"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_read_path(value: &str) -> Result<(), ConfigError> {
+    if value.is_empty() || value.len() > 1_024 || value.contains('\\') {
+        return Err(ConfigError::Invalid(
+            "read-root allowed files must be bounded relative paths".to_owned(),
+        ));
+    }
+    let path = Path::new(value);
+    let mut basename = None;
+    let mut normalized_components = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(ConfigError::Invalid(
+                "read-root allowed files must contain only normal relative components".to_owned(),
+            ));
+        };
+        let component = component.to_str().ok_or_else(|| {
+            ConfigError::Invalid("read-root allowed files must be UTF-8".to_owned())
+        })?;
+        if component.starts_with('.') || component.contains('\0') {
+            return Err(ConfigError::Invalid(
+                "hidden files and components cannot be published by FileRead".to_owned(),
+            ));
+        }
+        let component = component.to_ascii_lowercase();
+        basename = Some(component.clone());
+        normalized_components.push(component);
+    }
+    let basename = basename.ok_or_else(|| {
+        ConfigError::Invalid("read-root allowed file is missing a filename".to_owned())
+    })?;
+    let sensitive_tokens = [
+        "credential",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "private-key",
+        "private_key",
+        "identity",
+        "authorized_keys",
+        "id_rsa",
+        "id_ed25519",
+    ];
+    let sensitive_extensions = ["key", "pem", "p12", "pfx", "jks", "kdbx", "sqlite", "db"];
+    if normalized_components.iter().any(|component| {
+        sensitive_tokens
+            .iter()
+            .any(|token| component.contains(token))
+    }) || Path::new(&basename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| sensitive_extensions.contains(&extension))
+    {
+        return Err(ConfigError::Invalid(
+            "credential-like files cannot be published by FileRead".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_broad_read_root(path: &Path) -> bool {
+    let normal: Vec<_> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect();
+    matches!(
+        normal.as_slice(),
+        [] | ["etc"]
+            | ["var"]
+            | ["usr"]
+            | ["bin"]
+            | ["sbin"]
+            | ["opt"]
+            | ["tmp"]
+            | ["private"]
+            | ["Users"]
+            | ["home"]
+            | ["root"]
+            | ["Users", _]
+            | ["home", _]
+    )
+}
+
 fn require_absolute(name: &str, value: &Path) -> Result<(), ConfigError> {
     if value.is_absolute() {
         Ok(())
@@ -918,6 +1151,46 @@ fn path_contains_or_is_contained(left: &Path, right: &Path) -> Result<bool, Conf
     Ok(left.starts_with(&right) || right.starts_with(&left))
 }
 
+fn paths_overlap_including_missing(left: &Path, right: &Path) -> Result<bool, ConfigError> {
+    let left_lexical = normalize_absolute_lexical(left)?;
+    let right_lexical = normalize_absolute_lexical(right)?;
+    if left_lexical.starts_with(&right_lexical) || right_lexical.starts_with(&left_lexical) {
+        return Ok(true);
+    }
+    if left.exists() && right.exists() {
+        return path_contains_or_is_contained(left, right);
+    }
+    Ok(false)
+}
+
+fn normalize_absolute_lexical(path: &Path) -> Result<PathBuf, ConfigError> {
+    if !path.is_absolute() {
+        return Err(ConfigError::Invalid(format!(
+            "path {} must be absolute",
+            path.display()
+        )));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(ConfigError::Invalid(format!(
+                        "path {} escapes its filesystem root",
+                        path.display()
+                    )));
+                }
+            }
+            std::path::Component::CurDir => {}
+        }
+    }
+    Ok(normalized)
+}
+
 fn validate_identifier(kind: &str, value: &str) -> Result<(), ConfigError> {
     let valid = !value.is_empty()
         && value.len() <= 64
@@ -962,6 +1235,7 @@ mod tests {
             tls: None,
             policy: PolicyConfig::default(),
             file_roots: BTreeMap::new(),
+            read_roots: BTreeMap::new(),
             approved_actions: BTreeMap::new(),
             health: HealthConfig::default(),
             resource_reporting: ResourceReportingConfig::default(),
@@ -1011,6 +1285,141 @@ mod tests {
             PathBuf::from("/var/lib/sovereign-node/files"),
         );
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_read_requires_a_dedicated_exact_allowlist_and_file_write_stays_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::TempDir::new()?;
+        let data_dir = directory.path().join("node-state");
+        let read_root = directory.path().join("published-reports");
+        fs::create_dir_all(&data_dir)?;
+        fs::create_dir_all(read_root.join("daily"))?;
+        let read_root = read_root.canonicalize()?;
+        let mut config = minimal_config();
+        config.data_dir = data_dir;
+        config
+            .policy
+            .enabled_capabilities
+            .push(Capability::FileRead);
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        config.read_roots.insert(
+            "reports".to_owned(),
+            ReadRootConfig {
+                path: read_root,
+                allowed_files: vec!["daily/status.txt".to_owned()],
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config
+            .policy
+            .enabled_capabilities
+            .push(Capability::FileWrite);
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_read_rejects_broad_hidden_and_credential_like_publications()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::TempDir::new()?;
+        let data_dir = directory.path().join("node-state");
+        let read_root = directory.path().join("published-reports");
+        fs::create_dir_all(&data_dir)?;
+        fs::create_dir_all(&read_root)?;
+        let read_root = read_root.canonicalize()?;
+        let mut config = minimal_config();
+        config.data_dir = data_dir;
+        config.read_roots.insert(
+            "reports".to_owned(),
+            ReadRootConfig {
+                path: read_root,
+                allowed_files: vec![".hidden".to_owned()],
+            },
+        );
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        if let Some(root) = config.read_roots.get_mut("reports") {
+            root.allowed_files = vec!["api-token.txt".to_owned()];
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        if let Some(root) = config.read_roots.get_mut("reports") {
+            root.allowed_files = vec!["secrets/public.txt".to_owned()];
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        if let Some(root) = config.read_roots.get_mut("reports") {
+            root.path = PathBuf::from("/");
+            root.allowed_files = vec!["public.txt".to_owned()];
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_read_rejects_protected_paths_before_they_exist()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::TempDir::new()?;
+        let data_dir = directory.path().join("node-state");
+        let read_root = directory.path().join("published-reports");
+        fs::create_dir_all(&data_dir)?;
+        fs::create_dir_all(&read_root)?;
+        let read_root = read_root.canonicalize()?;
+        let snapshot_key = SigningKey::from_bytes(&[0x74; 32]);
+        let mut config = minimal_config();
+        config.data_dir = data_dir;
+        config.read_roots.insert(
+            "reports".to_owned(),
+            ReadRootConfig {
+                path: read_root.clone(),
+                allowed_files: vec!["public.txt".to_owned()],
+            },
+        );
+        config.health.agent_green = Some(HealthSnapshotConfig {
+            snapshot_path: read_root.join("future-health.json"),
+            public_key_hex: hex::encode(snapshot_key.verifying_key().to_bytes()),
+            max_age_secs: 60,
+        });
+
+        assert!(!read_root.join("future-health.json").exists());
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_file_read_roots_use_policy_digest_v5() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::TempDir::new()?;
+        let data_dir = directory.path().join("node-state");
+        let read_root = directory.path().join("published-reports");
+        fs::create_dir_all(&data_dir)?;
+        fs::create_dir_all(&read_root)?;
+        let read_root = read_root.canonicalize()?;
+        let mut config = minimal_config();
+        config.data_dir = data_dir;
+        let original = config.policy_digest()?;
+        config.read_roots.insert(
+            "reports".to_owned(),
+            ReadRootConfig {
+                path: read_root,
+                allowed_files: vec!["status.txt".to_owned()],
+            },
+        );
+        let enabled = config.policy_digest()?;
+        assert_ne!(enabled, original);
+        if let Some(root) = config.read_roots.get_mut("reports") {
+            root.allowed_files.push("summary.txt".to_owned());
+        }
+        assert_ne!(config.policy_digest()?, enabled);
+        config.read_roots.clear();
+        assert_eq!(config.policy_digest()?, original);
+        Ok(())
     }
 
     #[test]

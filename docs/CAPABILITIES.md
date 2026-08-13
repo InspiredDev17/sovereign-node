@@ -106,36 +106,42 @@ verified entries, not verified absence.
 
 ### FileRead
 
-Reads only within owner-configured roots and only when the action authority
-names an allowed logical target. Policy defines maximum bytes, permitted file
-types where useful, and whether metadata or content is allowed.
+v0.1 optionally reads exact files that the owner deliberately publishes inside
+dedicated Unix read-only roots. Each logical root has an explicit relative-file
+allowlist; there is no directory enumeration, glob, prefix rule, ambient path,
+or implicit recursive access. Adding a root or allowlist entry changes the
+versioned policy digest and requires a higher owner-controlled policy version.
 
 The executor:
 
-- canonicalizes the logical target without trusting string prefixes;
-- performs descriptor-relative, no-follow path traversal where supported;
-- rejects absolute paths, parent traversal, symlinks, hard-link escapes where
-  detectable, devices, sockets, pipes, and credential-policy exclusions;
-- verifies the opened object remains beneath the allowed root;
-- limits bytes and time; and
-- never reads the node identity store, audit store, replay store, private keys,
-  raw credentials, or Agent Green secrets.
+- refuses filesystem roots, home directories, system roots, node state, TLS
+  material, signed snapshots, approved-action trees, and broad ambient trees;
+- opens and pins each configured root directory descriptor once at startup;
+- traverses every normal relative component with descriptor-relative
+  `openat`, `O_NOFOLLOW`, directory type checks, and owner-control checks;
+- opens the final object read-only and nonblocking with `O_NOFOLLOW`;
+- accepts only a regular, single-link, owner-controlled, non-executable,
+  non-group/world-writable file whose full relative path is exactly listed;
+- rejects absolute paths, parent traversal, hidden components, symlinks,
+  hard links, devices, sockets, pipes, credential-like names, and unlisted
+  targets;
+- returns at most the locally configured byte limit plus a SHA-256 digest of
+  exactly the returned bytes; and
+- never reads the node identity, trust, audit, replay, TLS, update, Agent Green,
+  Action Broker, process/service/repository snapshot, or raw credential stores.
 
-If the platform cannot enforce the configured boundary safely, FileRead is
-unavailable rather than weakened.
+Replacing or renaming the ambient configured path after startup does not retarget
+the daemon: the pinned descriptor continues to reference the originally opened
+root. FileRead is unavailable on platforms where this Unix boundary is not
+enforced.
 
 ### FileWrite
 
-Writes only to separately configured writable roots. Read permission does not
-imply write permission. Policy fixes maximum input size, file mode, overwrite
-behavior, and allowed target types.
-
-The executor applies the FileRead path protections, refuses executable or
-credential targets by default, writes a temporary file inside the authorized
-directory, synchronizes it as policy requires, and atomically renames it after
-all checks. It does not change ownership, grant execute permission, follow
-links, write devices, or unpack archives. The audit stores a content digest and
-byte count, not file content.
+FileWrite remains unavailable in v0.1. Configuration rejects advertising it and
+the executor returns `CapabilityNotAdvertised` even if invoked through an
+invalid programmatic configuration. Read roots are a distinct policy type and
+carry no write authority. No create, replace, truncate, chmod, link, rename,
+archive extraction, or uploaded-content path is enabled.
 
 ### ProcessStatus
 

@@ -87,7 +87,7 @@ operation fails closed.
 | Replay or duplicate delivery | Durable pre-execution RequestId reservation prevents a second execution across sessions and restarts |
 | Expired queued request | Expiration is checked before reservation and again immediately before execution |
 | Capability confusion | Capability name, version, target, policy version, and argument digest are signed and locally matched |
-| Path traversal or link race | File capabilities use allowlisted roots, descriptor-relative no-follow operations, type checks, and deny sensitive stores |
+| Path traversal, ambient-root replacement, or link race | FileRead uses startup-pinned dedicated root descriptors, exact-file allowlists, component-wise no-follow opens, owner/type/mode checks, and hard-link denial; FileWrite is unavailable |
 | General command injection | No shell exists; approved actions use a fixed executable and typed arguments without shell parsing |
 | Arbitrary code upload | No upload-and-execute capability exists; file writes cannot create executable authority |
 | Credential theft through status or logs | Reports and audit are schema-limited and redacted; security stores are excluded from file capabilities |
@@ -203,6 +203,11 @@ RepositoryStatus tests cover exact signed logical targeting, role separation,
 freshness, forgery, duplicate IDs, inconsistent states, strict-schema privacy,
 symlink denial, bounded counts, untracked-summary minimization, and end-to-end
 denial without any repository, Git, network, hook, or mutation path.
+FileRead tests cover exact allowlisting, bounds and offsets, digest output,
+startup root-descriptor pinning, traversal denial, unlisted targets, symlinked
+files and directories, hard links, executables, directories, broad roots,
+hidden and credential-like names, and the continued unavailability of
+FileWrite.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.

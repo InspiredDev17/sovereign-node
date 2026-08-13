@@ -72,6 +72,10 @@ trust.
 - Optional `RepositoryStatus` uses only an owner-defined logical repository ID and a fresh signed
   local snapshot from its own role key. The node never opens a work tree, invokes Git, accesses a
   remote, reads diffs or files, runs hooks, or mutates repository state.
+- Optional Unix-only `FileRead` exposes only exact files copied into dedicated owner-controlled
+  publication roots. Root descriptors are pinned at startup and every path component is opened
+  relative to them without following links; hidden, credential-like, executable, hard-linked,
+  special, unlisted, oversized, or out-of-root targets are denied. `FileWrite` remains unavailable.
 
 See [Architecture](docs/ARCHITECTURE.md), [Pairing](docs/PAIRING.md),
 [Identity](docs/IDENTITY.md), [Transport](docs/TRANSPORT.md),
@@ -112,7 +116,8 @@ this policy must increment its owner-controlled `policy_version` once before ser
 | --- | --- | --- |
 | `SystemInfo` | Enabled | Minimized OS, architecture, version, and logical CPU data |
 | `ResourceStatus` | Enabled | CPU/RAM/disk/load, live bounded queue state, and optional signed accelerator, model, and health snapshots |
-| `FileRead` / `FileWrite` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
+| `FileRead` | Optional, disabled by default | Unix-only exact-file publication from dedicated pinned read-only roots |
+| `FileWrite` | Unavailable in v0.1 | Configuration and executor both reject it; read permission never grants write authority |
 | `ExecuteApprovedAction` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
 | `GpuStatus` / `EngineStatus` / `ModelStatus` | Optional, disabled by default | Requires the signed local resource adapter; aggregate or exact logical target only |
 | `AgentGreenHealth` / `ActionBrokerHealth` | Optional, disabled by default | Requires its component-specific signed health adapter; never control or attestation |

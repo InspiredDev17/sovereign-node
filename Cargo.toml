@@ -9,7 +9,6 @@ repository = "https://github.com/InspiredDev17/sovereign-node"
 
 [dependencies]
 anyhow = "1.0.104"
-cap-std = "3.4.5"
 clap = { version = "4.6.6", features = ["derive"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core", "zeroize"] }
 hex = "0.4.3"

@@ -1,13 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -17,8 +18,8 @@ use crate::config::{ApprovedActionConfig, NodeConfig};
 use crate::process_status::{ProcessStatusError, ProcessStatusReporter};
 use crate::protocol::{
     ActionArguments, ActionErrorCode, ActionResultV1, ActionTarget, ApprovedActionOutcome,
-    ApprovedActionResultV1, FileReadResultV1, FileWriteMode, FileWriteResultV1, GpuResourceV1,
-    InferenceEngineStatusV1, LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
+    ApprovedActionResultV1, FileReadResultV1, GpuResourceV1, InferenceEngineStatusV1,
+    LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
 };
 use crate::repository_status::{RepositoryStatusError, RepositoryStatusReporter};
 use crate::resources::{HealthReporter, QueueSnapshot, ResourceReporter, ResourceSnapshotReporter};
@@ -64,8 +65,20 @@ pub struct CapabilityExecutor {
     process_status: ProcessStatusReporter,
     service_status: ServiceStatusReporter,
     repository_status: RepositoryStatusReporter,
+    read_roots: BTreeMap<String, ReadRootHandle>,
     health: HealthReporter,
 }
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ReadRootHandle {
+    directory: OwnedFd,
+    allowed_files: BTreeSet<String>,
+}
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct ReadRootHandle;
 
 impl CapabilityExecutor {
     #[must_use]
@@ -76,6 +89,7 @@ impl CapabilityExecutor {
         let service_status = ServiceStatusReporter::new(config.service_reporting.snapshot.as_ref());
         let repository_status =
             RepositoryStatusReporter::new(config.repository_reporting.snapshot.as_ref());
+        let read_roots = open_read_roots(&config);
         Self {
             config,
             resources,
@@ -83,6 +97,7 @@ impl CapabilityExecutor {
             process_status,
             service_status,
             repository_status,
+            read_roots,
             health,
         }
     }
@@ -117,25 +132,9 @@ impl CapabilityExecutor {
             ) => self
                 .read_file(root_id, relative_path, *offset, *max_bytes)
                 .map(ActionResultV1::FileRead),
-            (
-                ActionTarget::File {
-                    root_id,
-                    relative_path,
-                },
-                ActionArguments::FileWrite {
-                    contents,
-                    mode,
-                    expected_current_digest,
-                },
-            ) => self
-                .write_file(
-                    root_id,
-                    relative_path,
-                    contents,
-                    *mode,
-                    *expected_current_digest,
-                )
-                .map(ActionResultV1::FileWrite),
+            (ActionTarget::File { .. }, ActionArguments::FileWrite { .. }) => {
+                Err(CapabilityError::Unsupported)
+            }
             (target, ActionArguments::ProcessStatus { include_children }) => self
                 .process_status
                 .status(now, logical_process_target(target, *include_children)?)
@@ -213,15 +212,19 @@ impl CapabilityExecutor {
         offset: u64,
         requested_max: u64,
     ) -> Result<FileReadResultV1, CapabilityError> {
-        let root = self.open_file_root(root_id)?;
         let policy_max = u64::try_from(self.config.policy.max_file_read_bytes)
             .map_err(|_| CapabilityError::ResourceExhausted)?;
         if requested_max == 0 || requested_max > policy_max {
             return Err(CapabilityError::ResourceExhausted);
         }
-        let mut file = root
-            .open(relative_path)
-            .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
+        let root = self
+            .read_roots
+            .get(root_id)
+            .ok_or(CapabilityError::TargetNotAllowed)?;
+        if !root_allows(root, relative_path) {
+            return Err(CapabilityError::TargetNotAllowed);
+        }
+        let mut file = open_published_file(root, relative_path)?;
         let metadata = file
             .metadata()
             .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
@@ -245,82 +248,6 @@ impl CapabilityExecutor {
             contents,
             end_of_file,
         })
-    }
-
-    fn write_file(
-        &self,
-        root_id: &str,
-        relative_path: &str,
-        contents: &[u8],
-        mode: FileWriteMode,
-        expected_current_digest: Option<Sha256Digest>,
-    ) -> Result<FileWriteResultV1, CapabilityError> {
-        if contents.len() > self.config.policy.max_file_write_bytes {
-            return Err(CapabilityError::ResourceExhausted);
-        }
-        let root = self.open_file_root(root_id)?;
-        let mut options = OpenOptions::new();
-        options.write(true);
-        let mut file = match mode {
-            FileWriteMode::CreateNew => {
-                if expected_current_digest.is_some() {
-                    return Err(CapabilityError::ArgumentMismatch);
-                }
-                options.create_new(true);
-                root.open_with(relative_path, &options)
-            }
-            FileWriteMode::ReplaceExisting => {
-                let expected =
-                    expected_current_digest.ok_or(CapabilityError::UnauthorizedFileAccess)?;
-                options.read(true);
-                let mut file = root
-                    .open_with(relative_path, &options)
-                    .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
-                let metadata = file
-                    .metadata()
-                    .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
-                if !metadata.is_file()
-                    || metadata.len()
-                        > u64::try_from(self.config.policy.max_file_write_bytes).unwrap_or(u64::MAX)
-                {
-                    return Err(CapabilityError::UnauthorizedFileAccess);
-                }
-                let mut current = Vec::with_capacity(
-                    usize::try_from(metadata.len())
-                        .map_err(|_| CapabilityError::ResourceExhausted)?,
-                );
-                file.read_to_end(&mut current)
-                    .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
-                if Sha256Digest(Sha256::digest(&current).into()) != expected {
-                    return Err(CapabilityError::UnauthorizedFileAccess);
-                }
-                file.seek(SeekFrom::Start(0))
-                    .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
-                file.set_len(0)
-                    .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
-                Ok(file)
-            }
-        }
-        .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
-
-        file.write_all(contents)
-            .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
-        file.sync_all()
-            .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
-        Ok(FileWriteResultV1 {
-            bytes_written: u64::try_from(contents.len()).unwrap_or(u64::MAX),
-            content_digest: Sha256Digest(Sha256::digest(contents).into()),
-        })
-    }
-
-    fn open_file_root(&self, root_id: &str) -> Result<Dir, CapabilityError> {
-        let path = self
-            .config
-            .file_roots
-            .get(root_id)
-            .ok_or(CapabilityError::TargetNotAllowed)?;
-        Dir::open_ambient_dir(path, ambient_authority())
-            .map_err(|_| CapabilityError::TargetNotAllowed)
     }
 
     async fn execute_approved_action(
@@ -385,6 +312,155 @@ impl CapabilityExecutor {
             output_truncated,
         })
     }
+}
+
+#[cfg(unix)]
+fn open_read_roots(config: &NodeConfig) -> BTreeMap<String, ReadRootHandle> {
+    config
+        .read_roots
+        .iter()
+        .filter_map(|(root_id, root)| {
+            let directory = open_absolute_directory_nofollow(&root.path).ok()?;
+            directory_is_owner_controlled(&directory).then(|| {
+                (
+                    root_id.clone(),
+                    ReadRootHandle {
+                        directory,
+                        allowed_files: root.allowed_files.iter().cloned().collect(),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn open_absolute_directory_nofollow(path: &Path) -> Result<OwnedFd, CapabilityError> {
+    use rustix::fs::{Mode, OFlags};
+
+    if !path.is_absolute() {
+        return Err(CapabilityError::TargetNotAllowed);
+    }
+    let mut directory = rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| CapabilityError::TargetNotAllowed)?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(component) => {
+                directory = rustix::fs::openat(
+                    &directory,
+                    component,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|_| CapabilityError::TargetNotAllowed)?;
+            }
+            _ => return Err(CapabilityError::TargetNotAllowed),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_read_roots(_config: &NodeConfig) -> BTreeMap<String, ReadRootHandle> {
+    BTreeMap::new()
+}
+
+#[cfg(unix)]
+fn root_allows(root: &ReadRootHandle, relative_path: &str) -> bool {
+    root.allowed_files.contains(relative_path)
+}
+
+#[cfg(not(unix))]
+fn root_allows(_root: &ReadRootHandle, _relative_path: &str) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn open_published_file(
+    root: &ReadRootHandle,
+    relative_path: &str,
+) -> Result<std::fs::File, CapabilityError> {
+    use rustix::fs::{FileType, Mode, OFlags};
+
+    let path = Path::new(relative_path);
+    if path.is_absolute() {
+        return Err(CapabilityError::UnauthorizedFileAccess);
+    }
+    let components: Vec<_> = path.components().collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(CapabilityError::UnauthorizedFileAccess);
+    }
+    let mut directory = rustix::fs::openat(
+        &root.directory,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
+    for component in &components[..components.len() - 1] {
+        let std::path::Component::Normal(component) = component else {
+            return Err(CapabilityError::UnauthorizedFileAccess);
+        };
+        directory = rustix::fs::openat(
+            &directory,
+            *component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
+        if !directory_is_owner_controlled(&directory) {
+            return Err(CapabilityError::UnauthorizedFileAccess);
+        }
+    }
+    let std::path::Component::Normal(filename) = components[components.len() - 1] else {
+        return Err(CapabilityError::UnauthorizedFileAccess);
+    };
+    let descriptor = rustix::fs::openat(
+        &directory,
+        filename,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
+    let status =
+        rustix::fs::fstat(&descriptor).map_err(|_| CapabilityError::UnauthorizedFileAccess)?;
+    let mode = rustix::fs::Mode::from_raw_mode(status.st_mode);
+    if FileType::from_raw_mode(status.st_mode) != FileType::RegularFile
+        || status.st_nlink != 1
+        || status.st_uid != rustix::process::geteuid().as_raw()
+        || mode.intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH | Mode::WGRP | Mode::WOTH)
+    {
+        return Err(CapabilityError::UnauthorizedFileAccess);
+    }
+    Ok(descriptor.into())
+}
+
+#[cfg(not(unix))]
+fn open_published_file(
+    _root: &ReadRootHandle,
+    _relative_path: &str,
+) -> Result<std::fs::File, CapabilityError> {
+    Err(CapabilityError::Unsupported)
+}
+
+#[cfg(unix)]
+fn directory_is_owner_controlled(directory: &OwnedFd) -> bool {
+    use rustix::fs::{FileType, Mode};
+
+    rustix::fs::fstat(directory).is_ok_and(|status| {
+        FileType::from_raw_mode(status.st_mode) == FileType::Directory
+            && status.st_uid == rustix::process::geteuid().as_raw()
+            && !Mode::from_raw_mode(status.st_mode).intersects(Mode::WGRP | Mode::WOTH)
+    })
 }
 
 fn filter_gpu_status(
@@ -524,6 +600,11 @@ fn is_shell_or_interpreter(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::io::Read;
+
     use crate::protocol::{Availability, GpuMemoryKind, ModelLoadState, UtilizationPermille};
 
     use super::*;
@@ -609,5 +690,94 @@ mod tests {
             logical_process_target(&ActionTarget::Process { process_id: 42 }, false),
             Err(CapabilityError::TargetNotAllowed)
         );
+    }
+
+    #[cfg(unix)]
+    fn read_root_handle(
+        path: &Path,
+        allowed_files: &[&str],
+    ) -> Result<ReadRootHandle, CapabilityError> {
+        Ok(ReadRootHandle {
+            directory: open_absolute_directory_nofollow(path)?,
+            allowed_files: allowed_files
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_file_read_is_exact_bounded_and_pins_the_root_descriptor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::TempDir::new()?;
+        let root_path = directory.path().join("published");
+        fs::create_dir_all(root_path.join("daily"))?;
+        let root_path = root_path.canonicalize()?;
+        fs::write(root_path.join("daily/status.txt"), b"trusted-report")?;
+        fs::write(root_path.join("daily/private.txt"), b"private")?;
+        let root = read_root_handle(&root_path, &["daily/status.txt"])?;
+        assert!(root_allows(&root, "daily/status.txt"));
+        assert!(!root_allows(&root, "daily/private.txt"));
+
+        let moved = directory.path().join("published-original");
+        fs::rename(&root_path, &moved)?;
+        fs::create_dir_all(root_path.join("daily"))?;
+        fs::write(root_path.join("daily/status.txt"), b"replacement")?;
+
+        let mut opened = open_published_file(&root, "daily/status.txt")?;
+        let mut contents = Vec::new();
+        opened.read_to_end(&mut contents)?;
+        assert_eq!(contents, b"trusted-report");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_file_read_rejects_symlinks_hardlinks_executables_and_directories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::TempDir::new()?;
+        let root_path = directory.path().join("published");
+        fs::create_dir_all(root_path.join("nested"))?;
+        let root_path = root_path.canonicalize()?;
+        fs::write(root_path.join("safe.txt"), b"safe")?;
+        fs::write(root_path.join("outside.txt"), b"outside")?;
+        fs::write(root_path.join("executable.txt"), b"program")?;
+        fs::set_permissions(
+            root_path.join("executable.txt"),
+            fs::Permissions::from_mode(0o700),
+        )?;
+        fs::hard_link(root_path.join("safe.txt"), root_path.join("hard.txt"))?;
+        symlink(root_path.join("outside.txt"), root_path.join("link.txt"))?;
+        symlink(root_path.join("nested"), root_path.join("linked-directory"))?;
+        let root = read_root_handle(
+            &root_path,
+            &[
+                "safe.txt",
+                "hard.txt",
+                "link.txt",
+                "executable.txt",
+                "nested",
+                "linked-directory/file.txt",
+            ],
+        )?;
+
+        for denied in [
+            "safe.txt",
+            "hard.txt",
+            "link.txt",
+            "executable.txt",
+            "nested",
+            "linked-directory/file.txt",
+        ] {
+            assert_eq!(
+                open_published_file(&root, denied).map(|_| ()),
+                Err(CapabilityError::UnauthorizedFileAccess),
+                "{denied} should be denied"
+            );
+        }
+        Ok(())
     }
 }
