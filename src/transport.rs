@@ -884,6 +884,18 @@ mod tests {
         Ok(())
     }
 
+    async fn send_raw_frame_and_close(
+        stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+        declared_length: u32,
+        body: &[u8],
+    ) -> TestResult {
+        stream.write_all(&declared_length.to_be_bytes()).await?;
+        stream.write_all(body).await?;
+        stream.flush().await?;
+        stream.shutdown().await?;
+        Ok(())
+    }
+
     #[test]
     fn frame_size_constant_fits_u32_prefix() {
         assert!(MAX_WIRE_MESSAGE_BYTES < u32::MAX as usize);
@@ -1151,6 +1163,44 @@ mod tests {
             request_id,
         )?;
         let client_config = client_config(&pki, Some(&pki.paired_client))?;
+
+        let oversized_server = tokio::spawn(accept_runtime_connection(
+            listener.clone(),
+            trust.clone(),
+            runtime.clone(),
+            store.clone(),
+            request_policy,
+        ));
+        let mut oversized_client = connect_test_client(address, client_config.clone()).await?;
+        send_raw_frame_and_close(
+            &mut oversized_client,
+            u32::try_from(request_policy.max_frame + 1)?,
+            &[],
+        )
+        .await?;
+        assert!(matches!(
+            oversized_server.await?,
+            Err(TransportError::Frame)
+        ));
+
+        let trailing_server = tokio::spawn(accept_runtime_connection(
+            listener.clone(),
+            trust.clone(),
+            runtime.clone(),
+            store.clone(),
+            request_policy,
+        ));
+        let mut trailing_client = connect_test_client(address, client_config.clone()).await?;
+        let mut noncanonical = postcard::to_allocvec(&action)?;
+        noncanonical.push(0);
+        send_raw_frame_and_close(
+            &mut trailing_client,
+            u32::try_from(noncanonical.len())?,
+            &noncanonical,
+        )
+        .await?;
+        assert!(matches!(trailing_server.await?, Err(TransportError::Frame)));
+        assert!(store.action_audit_record(request_id.0)?.is_none());
 
         let first_server = tokio::spawn(accept_runtime_connection(
             listener.clone(),

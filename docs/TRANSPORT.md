@@ -194,6 +194,12 @@ but before response receipt, confirms the durable execution record completed,
 then verifies the retried envelope is duplicate-only and cannot create another
 execution attempt.
 
+Authenticated malformed-frame tests send an oversized declared length and a
+fully signed action with trailing bytes. Both connections close with a framing
+error before authorization or replay reservation; the canonical form of that
+same RequestId remains fresh and succeeds on a new mutually authenticated
+session.
+
 Credential-rotation transport tests hold an authenticated old TLS session open
 across an atomic trust-epoch and leaf-pin change. The old session closes within
 the trust-check interval, reconnecting with the prior leaf resolves to no paired
