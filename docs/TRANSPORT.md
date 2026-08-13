@@ -200,6 +200,11 @@ error before authorization or replay reservation; the canonical form of that
 same RequestId remains fresh and succeeds on a new mutually authenticated
 session.
 
+The same live harness exhausts an authenticated peer's durable request window,
+then submits one fresh signed RequestId on two separate TLS sessions. Both
+connections close at admission with the peer-limit classification, and neither
+attempt reaches authorization, replay reservation, or action audit state.
+
 Credential-rotation transport tests hold an authenticated old TLS session open
 across an atomic trust-epoch and leaf-pin change. The old session closes within
 the trust-check interval, reconnecting with the prior leaf resolves to no paired

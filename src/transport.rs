@@ -1146,8 +1146,8 @@ mod tests {
         let address = listener.local_addr()?;
         let request_policy = TransportRequestPolicy {
             max_frame: config.policy.max_frame_bytes,
-            peer_maximum_per_minute: config.policy.max_requests_per_peer_per_minute,
-            global_maximum_per_minute: config.policy.max_requests_global_per_minute,
+            peer_maximum_per_minute: 4,
+            global_maximum_per_minute: 4,
             maximum_clock_rollback_ms: i64::try_from(config.policy.max_clock_rollback_secs)?
                 .saturating_mul(1_000),
         };
@@ -1291,13 +1291,13 @@ mod tests {
         ));
 
         let fifth_server = tokio::spawn(accept_runtime_connection(
-            listener,
-            trust,
-            runtime,
+            listener.clone(),
+            trust.clone(),
+            runtime.clone(),
             store.clone(),
             request_policy,
         ));
-        let mut lost_response_retry = connect_test_client(address, client_config).await?;
+        let mut lost_response_retry = connect_test_client(address, client_config.clone()).await?;
         let lost_response_duplicate =
             send_action_and_close(&mut lost_response_retry, &lost_response_action).await?;
         assert_eq!(
@@ -1310,6 +1310,37 @@ mod tests {
             store.action_audit_record(lost_response_request_id.0)?,
             Some(completed_record)
         );
+
+        let limited_request_id = RequestId(Uuid::new_v4());
+        let limited_action = signed_system_info_action(
+            identity.node_id(),
+            PairingId(trusted.pairing_id),
+            "owner-peer-reconnect",
+            &owner,
+            &broker,
+            UnixMillis(now),
+            3,
+            limited_request_id,
+        )?;
+        for _ in 0..2 {
+            let limited_server = tokio::spawn(accept_runtime_connection(
+                listener.clone(),
+                trust.clone(),
+                runtime.clone(),
+                store.clone(),
+                request_policy,
+            ));
+            let mut limited_client = connect_test_client(address, client_config.clone()).await?;
+            send_action_without_reading_response(&mut limited_client, &limited_action).await?;
+            assert!(matches!(
+                limited_server.await?,
+                Err(TransportError::RateLimited {
+                    scope: RequestLimitScope::Peer,
+                    ..
+                })
+            ));
+            assert!(store.action_audit_record(limited_request_id.0)?.is_none());
+        }
         Ok(())
     }
 
