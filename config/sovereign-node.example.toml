@@ -21,8 +21,8 @@ policy_version = 1
 
 [policy]
 # With the matching signed adapters below, the owner may also add `GpuStatus`, `EngineStatus`,
-# `ModelStatus`, `ProcessStatus`, `AgentGreenHealth`, or `ActionBrokerHealth`. Every addition is a
-# policy change.
+# `ModelStatus`, `ProcessStatus`, `ServiceStatus`, `RepositoryStatus`, `AgentGreenHealth`, or
+# `ActionBrokerHealth`. Every addition is a policy change.
 enabled_capabilities = ["SystemInfo", "ResourceStatus"]
 max_frame_bytes = 1048576
 max_concurrent_actions = 4
@@ -45,6 +45,15 @@ max_action_runtime_secs = 30
 # environments, or process-control instructions.
 # [process_reporting.snapshot]
 # snapshot_path = "/run/sovereign-processes/status.json"
+# public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# max_age_secs = 30
+
+[repository_reporting]
+# Optional and disabled by default. Enabling RepositoryStatus requires this signed, fresh logical
+# snapshot and a higher policy_version. The node does not open a repository or invoke Git, and the
+# payload cannot contain paths, remotes, credentials, diffs, file contents, hooks, or commands.
+# [repository_reporting.snapshot]
+# snapshot_path = "/run/sovereign-repositories/status.json"
 # public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # max_age_secs = 30
 

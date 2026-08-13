@@ -69,6 +69,9 @@ trust.
 - Optional `ServiceStatus` uses only an owner-defined logical service ID and a fresh signed local
   snapshot from another role-separated key. The node invokes no service manager and exposes no
   unit files, commands, credentials, logs, configuration, enumeration, or lifecycle controls.
+- Optional `RepositoryStatus` uses only an owner-defined logical repository ID and a fresh signed
+  local snapshot from its own role key. The node never opens a work tree, invokes Git, accesses a
+  remote, reads diffs or files, runs hooks, or mutates repository state.
 
 See [Architecture](docs/ARCHITECTURE.md), [Pairing](docs/PAIRING.md),
 [Identity](docs/IDENTITY.md), [Transport](docs/TRANSPORT.md),
@@ -115,7 +118,7 @@ this policy must increment its owner-controlled `policy_version` once before ser
 | `AgentGreenHealth` / `ActionBrokerHealth` | Optional, disabled by default | Requires its component-specific signed health adapter; never control or attestation |
 | `ProcessStatus` | Optional, disabled by default | Requires a signed logical-process snapshot; raw PID targets are always denied |
 | `ServiceStatus` | Optional, disabled by default | Requires a signed logical-service snapshot; observation only, with no service-manager access |
-| `RepositoryStatus` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
+| `RepositoryStatus` | Optional, disabled by default | Requires a signed logical-repository snapshot; no repository or Git access |
 
 The producer format and fail-closed freshness rules are documented in
 [Signed local health snapshots](docs/HEALTH-SNAPSHOTS.md) and
@@ -124,6 +127,8 @@ The logical-process format is documented in
 [Signed local process-status snapshots](docs/PROCESS-STATUS-SNAPSHOTS.md).
 The logical-service format is documented in
 [Signed local service-status snapshots](docs/SERVICE-STATUS-SNAPSHOTS.md).
+The logical-repository format is documented in
+[Signed local repository-status snapshots](docs/REPOSITORY-STATUS-SNAPSHOTS.md).
 
 ## Offline and updates
 

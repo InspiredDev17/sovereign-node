@@ -770,6 +770,7 @@ impl ActionResultV1 {
             Self::EngineStatus(engines) => validate_engine_results(engines),
             Self::ModelStatus(models) => validate_model_results(models),
             Self::ProcessStatus(status) | Self::ServiceStatus(status) => status.validate(),
+            Self::RepositoryStatus(status) => status.validate(),
             Self::AgentGreenHealth(health) | Self::ActionBrokerHealth(health) => {
                 validate_optional_string(&health.detail, MAX_DETAIL_BYTES, "health detail")
             }
@@ -1326,6 +1327,7 @@ pub enum ApprovedActionOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryStatusV1 {
     pub head: Option<String>,
     pub branch: Option<String>,
@@ -1333,6 +1335,30 @@ pub struct RepositoryStatusV1 {
     pub ahead: u32,
     pub behind: u32,
     pub untracked_count: Option<u32>,
+}
+
+impl RepositoryStatusV1 {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(head) = &self.head
+            && !((head.len() == 40 || head.len() == 64)
+                && head.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(ValidationError::InvalidValue("repository revision"));
+        }
+        if let Some(branch) = &self.branch {
+            validate_local_identifier(branch, "repository branch alias")?;
+        }
+        if self.ahead > 1_000_000 || self.behind > 1_000_000 {
+            return Err(ValidationError::LimitExceeded("repository divergence"));
+        }
+        if self.untracked_count.is_some_and(|count| count > 1_000_000) {
+            return Err(ValidationError::LimitExceeded("repository untracked count"));
+        }
+        if self.clean && self.untracked_count.is_some_and(|count| count > 0) {
+            return Err(ValidationError::InvalidValue("repository clean state"));
+        }
+        Ok(())
+    }
 }
 
 fn domain_separated_postcard<T: Serialize + ?Sized>(
@@ -1795,6 +1821,34 @@ mod tests {
         invalid.model_id = "private/path".to_owned();
         assert!(
             ActionResultV1::ModelStatus(vec![invalid])
+                .validate()
+                .is_err()
+        );
+
+        let repository = RepositoryStatusV1 {
+            head: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            branch: Some("main".to_owned()),
+            clean: true,
+            ahead: 0,
+            behind: 0,
+            untracked_count: Some(0),
+        };
+        assert!(
+            ActionResultV1::RepositoryStatus(repository.clone())
+                .validate()
+                .is_ok()
+        );
+        let mut invalid = repository.clone();
+        invalid.branch = Some("private/path".to_owned());
+        assert!(
+            ActionResultV1::RepositoryStatus(invalid)
+                .validate()
+                .is_err()
+        );
+        let mut invalid = repository;
+        invalid.untracked_count = Some(1);
+        assert!(
+            ActionResultV1::RepositoryStatus(invalid)
                 .validate()
                 .is_err()
         );

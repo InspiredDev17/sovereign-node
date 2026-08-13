@@ -93,6 +93,7 @@ operation fails closed.
 | Credential theft through status or logs | Reports and audit are schema-limited and redacted; security stores are excluded from file capabilities |
 | PID reuse or process reconnaissance | ProcessStatus accepts only signed owner-defined logical IDs; numeric PIDs, enumeration, commands, paths, users, environments, and controls are denied |
 | Service-manager exposure or lifecycle control | ServiceStatus consumes only a signed logical-ID snapshot; manager commands, enumeration, unit files, configuration, credentials, logs, PIDs, and controls are absent |
+| Repository reconnaissance, credential access, or mutation | RepositoryStatus consumes only a signed logical-ID snapshot; paths, remotes, files, diffs, credentials, hooks, Git invocation, network access, and mutation are absent |
 | Resource-exhaustion attack | Bounded frames, atomic durable per-peer and global admission, queues, concurrency, time, output, and backpressure cause rejection without security bypass |
 | Disconnect ambiguity | Durable execution state returns recorded or Indeterminate outcome and never silently retries |
 | Version downgrade | Locally allowed versions and versions bound into signatures reject unsupported or downgraded semantics |
@@ -198,6 +199,10 @@ ServiceStatus tests cover exact signed logical targeting, role separation,
 freshness, forgery, duplicate IDs, unknown targets, strict-schema privacy,
 symlink denial, bounded output, and end-to-end denial without any service-manager
 or lifecycle-control path.
+RepositoryStatus tests cover exact signed logical targeting, role separation,
+freshness, forgery, duplicate IDs, inconsistent states, strict-schema privacy,
+symlink denial, bounded counts, untracked-summary minimization, and end-to-end
+denial without any repository, Git, network, hook, or mutation path.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.

@@ -218,13 +218,19 @@ separate future capabilities and are not implied.
 
 ### RepositoryStatus
 
-Reports bounded, read-only status for explicitly configured repository roots:
-logical alias, current revision, branch when available, clean or dirty state,
-ahead or behind state when already known locally, and timestamp.
+v0.1 optionally returns bounded status for an exact owner-defined logical
+repository identifier through the signed local snapshot contract in
+`REPOSITORY-STATUS-SNAPSHOTS.md`. Enabling it requires its own pinned,
+role-separated producer key and fresh no-follow snapshot. Results contain only
+a 40- or 64-hex revision, sanitized branch alias, clean or dirty state, bounded
+ahead and behind counts, and an optional bounded untracked count. Snapshot
+freshness is verified locally before any result is returned.
 
-It does not enumerate arbitrary directories, read diffs or file content, expose
-remote credentials or URLs containing secrets, fetch a network remote, switch
-branches, commit, push, run hooks, or execute repository code.
+It does not accept or return repository paths, enumerate directories, open a
+work tree, invoke Git, read diffs or file content, expose remotes, credentials,
+commit messages, authors, hooks, configuration, or logs, contact a network
+remote, switch branches, stage, commit, merge, rebase, push, run hooks, or
+execute repository code.
 
 ## Health reporting
 

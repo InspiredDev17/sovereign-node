@@ -45,6 +45,9 @@ pub struct NodeConfig {
     /// Optional signed logical service-status measurements. No service control is exposed.
     #[serde(default)]
     pub service_reporting: ServiceReportingConfig,
+    /// Optional signed logical repository-status measurements. No repository is opened remotely.
+    #[serde(default)]
+    pub repository_reporting: RepositoryReportingConfig,
     /// Optional pinned offline-update authorities. Absence disables staging.
     #[serde(default)]
     pub updates: Option<UpdateConfig>,
@@ -178,6 +181,22 @@ pub struct ServiceSnapshotConfig {
     pub max_age_secs: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RepositoryReportingConfig {
+    pub snapshot: Option<RepositorySnapshotConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySnapshotConfig {
+    pub snapshot_path: PathBuf,
+    /// Pinned Ed25519 public key for the local logical repository-status producer.
+    pub public_key_hex: String,
+    /// Maximum producer-declared validity window and observation age.
+    pub max_age_secs: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateConfig {
@@ -220,6 +239,15 @@ struct PolicyDigestV3<'a> {
     service_reporting: &'a ServiceReportingConfig,
 }
 
+#[derive(Debug, Serialize)]
+struct PolicyDigestV4<'a> {
+    schema_version: u16,
+    base: PolicyDigestV1<'a>,
+    process_reporting: &'a ProcessReportingConfig,
+    service_reporting: &'a ServiceReportingConfig,
+    repository_reporting: &'a RepositoryReportingConfig,
+}
+
 const fn default_max_update_artifact_bytes() -> u64 {
     1_073_741_824
 }
@@ -248,22 +276,32 @@ impl NodeConfig {
             resource_reporting: &self.resource_reporting,
             updates: &self.updates,
         };
-        let encoded = match (
-            self.process_reporting.snapshot.is_some(),
-            self.service_reporting.snapshot.is_some(),
-        ) {
-            (false, false) => postcard::to_allocvec(&base),
-            (true, false) => postcard::to_allocvec(&PolicyDigestV2 {
-                schema_version: 2,
-                base,
-                process_reporting: &self.process_reporting,
-            }),
-            (_, true) => postcard::to_allocvec(&PolicyDigestV3 {
-                schema_version: 3,
+        let encoded = if self.repository_reporting.snapshot.is_some() {
+            postcard::to_allocvec(&PolicyDigestV4 {
+                schema_version: 4,
                 base,
                 process_reporting: &self.process_reporting,
                 service_reporting: &self.service_reporting,
-            }),
+                repository_reporting: &self.repository_reporting,
+            })
+        } else {
+            match (
+                self.process_reporting.snapshot.is_some(),
+                self.service_reporting.snapshot.is_some(),
+            ) {
+                (false, false) => postcard::to_allocvec(&base),
+                (true, false) => postcard::to_allocvec(&PolicyDigestV2 {
+                    schema_version: 2,
+                    base,
+                    process_reporting: &self.process_reporting,
+                }),
+                (_, true) => postcard::to_allocvec(&PolicyDigestV3 {
+                    schema_version: 3,
+                    base,
+                    process_reporting: &self.process_reporting,
+                    service_reporting: &self.service_reporting,
+                }),
+            }
         }
         .map_err(|_| ConfigError::Invalid("configuration cannot be encoded".to_owned()))?;
         Ok(Sha256::digest(encoded).into())
@@ -315,6 +353,7 @@ impl NodeConfig {
                     if self.resource_reporting.snapshot.is_some() => {}
                 Capability::ProcessStatus if self.process_reporting.snapshot.is_some() => {}
                 Capability::ServiceStatus if self.service_reporting.snapshot.is_some() => {}
+                Capability::RepositoryStatus if self.repository_reporting.snapshot.is_some() => {}
                 Capability::AgentGreenHealth if self.health.agent_green.is_some() => {}
                 Capability::ActionBrokerHealth if self.health.action_broker.is_some() => {}
                 _ => {
@@ -399,6 +438,12 @@ impl NodeConfig {
             .as_ref()
             .map(|adapter| validate_service_adapter("service_reporting.snapshot", adapter))
             .transpose()?;
+        let repository_snapshot_key = self
+            .repository_reporting
+            .snapshot
+            .as_ref()
+            .map(|adapter| validate_repository_adapter("repository_reporting.snapshot", adapter))
+            .transpose()?;
         if agent_green_health_key.is_some() && agent_green_health_key == action_broker_health_key {
             return Err(ConfigError::Invalid(
                 "Agent Green and Action Broker health keys must be role-separated".to_owned(),
@@ -439,6 +484,17 @@ impl NodeConfig {
             return Err(ConfigError::Invalid(
                 "service, process, resource, and health snapshot keys must be role-separated"
                     .to_owned(),
+            ));
+        }
+        if repository_snapshot_key.is_some()
+            && (repository_snapshot_key == agent_green_health_key
+                || repository_snapshot_key == action_broker_health_key
+                || repository_snapshot_key == resource_snapshot_key
+                || repository_snapshot_key == process_snapshot_key
+                || repository_snapshot_key == service_snapshot_key)
+        {
+            return Err(ConfigError::Invalid(
+                "repository and all other snapshot keys must be role-separated".to_owned(),
             ));
         }
         if let Some(resource) = &self.resource_reporting.snapshot
@@ -504,6 +560,37 @@ impl NodeConfig {
                 "service snapshot must use a separate path".to_owned(),
             ));
         }
+        if let Some(repository) = &self.repository_reporting.snapshot
+            && [
+                self.health
+                    .agent_green
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.health
+                    .action_broker
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.resource_reporting
+                    .snapshot
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.process_reporting
+                    .snapshot
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.service_reporting
+                    .snapshot
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|snapshot_path| snapshot_path == &repository.snapshot_path)
+        {
+            return Err(ConfigError::Invalid(
+                "repository snapshot must use a separate path".to_owned(),
+            ));
+        }
         if let Some(updates) = &self.updates {
             if updates.max_artifact_bytes == 0 || updates.max_artifact_bytes > 17_179_869_184 {
                 return Err(ConfigError::Invalid(
@@ -529,6 +616,7 @@ impl NodeConfig {
                 resource_snapshot_key.as_ref(),
                 process_snapshot_key.as_ref(),
                 service_snapshot_key.as_ref(),
+                repository_snapshot_key.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -635,6 +723,14 @@ impl NodeConfig {
             {
                 return Err(ConfigError::Invalid(format!(
                     "file root {root_id} overlaps service snapshot material"
+                )));
+            }
+            if let Some(repository) = &self.repository_reporting.snapshot
+                && repository.snapshot_path.exists()
+                && path_contains_or_is_contained(root, &repository.snapshot_path)?
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "file root {root_id} overlaps repository snapshot material"
                 )));
             }
         }
@@ -763,6 +859,19 @@ fn validate_service_adapter(
     parse_ed25519_key(&format!("{name}.public_key_hex"), &adapter.public_key_hex)
 }
 
+fn validate_repository_adapter(
+    name: &str,
+    adapter: &RepositorySnapshotConfig,
+) -> Result<VerifyingKey, ConfigError> {
+    require_absolute(&format!("{name}.snapshot_path"), &adapter.snapshot_path)?;
+    if adapter.max_age_secs == 0 || adapter.max_age_secs > 86_400 {
+        return Err(ConfigError::Invalid(format!(
+            "{name}.max_age_secs must be between 1 and 86400"
+        )));
+    }
+    parse_ed25519_key(&format!("{name}.public_key_hex"), &adapter.public_key_hex)
+}
+
 fn require_absolute(name: &str, value: &Path) -> Result<(), ConfigError> {
     if value.is_absolute() {
         Ok(())
@@ -858,8 +967,18 @@ mod tests {
             resource_reporting: ResourceReportingConfig::default(),
             process_reporting: ProcessReportingConfig::default(),
             service_reporting: ServiceReportingConfig::default(),
+            repository_reporting: RepositoryReportingConfig::default(),
             updates: None,
         }
+    }
+
+    #[test]
+    fn committed_example_configuration_remains_parseable_and_safe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config: NodeConfig =
+            toml::from_str(include_str!("../config/sovereign-node.example.toml"))?;
+        assert!(config.validate().is_ok());
+        Ok(())
     }
 
     #[test]
@@ -1188,5 +1307,66 @@ mod tests {
 
         config.service_reporting = ServiceReportingConfig::default();
         assert_eq!(config.policy_digest().unwrap_or([0_u8; 32]), process_only);
+    }
+
+    #[test]
+    fn repository_status_requires_a_role_separated_signed_snapshot() {
+        let repository_key = SigningKey::from_bytes(&[0x71; 32]);
+        let service_key = SigningKey::from_bytes(&[0x72; 32]);
+        let mut config = minimal_config();
+        config
+            .policy
+            .enabled_capabilities
+            .push(Capability::RepositoryStatus);
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        config.repository_reporting.snapshot = Some(RepositorySnapshotConfig {
+            snapshot_path: PathBuf::from("/run/sovereign-repositories/status.json"),
+            public_key_hex: hex::encode(repository_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        assert!(config.validate().is_ok());
+
+        config.service_reporting.snapshot = Some(ServiceSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/sovereign-services/status.json"),
+            public_key_hex: hex::encode(service_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        assert!(config.validate().is_ok());
+        if let Some(repository) = &mut config.repository_reporting.snapshot {
+            repository.public_key_hex = hex::encode(service_key.verifying_key().to_bytes());
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn optional_repository_adapter_uses_policy_digest_v4() {
+        let service_key = SigningKey::from_bytes(&[0x73; 32]);
+        let repository_key = SigningKey::from_bytes(&[0x74; 32]);
+        let mut config = minimal_config();
+        config.service_reporting.snapshot = Some(ServiceSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/sovereign-services/status.json"),
+            public_key_hex: hex::encode(service_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        let service_only = config.policy_digest().unwrap_or([0_u8; 32]);
+
+        config.repository_reporting.snapshot = Some(RepositorySnapshotConfig {
+            snapshot_path: PathBuf::from("/run/sovereign-repositories/status.json"),
+            public_key_hex: hex::encode(repository_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        let with_repository = config.policy_digest().unwrap_or([0_u8; 32]);
+        assert_ne!(with_repository, service_only);
+        if let Some(snapshot) = &mut config.repository_reporting.snapshot {
+            snapshot.max_age_secs = 31;
+        }
+        assert_ne!(
+            config.policy_digest().unwrap_or([0_u8; 32]),
+            with_repository
+        );
+
+        config.repository_reporting = RepositoryReportingConfig::default();
+        assert_eq!(config.policy_digest().unwrap_or([0_u8; 32]), service_only);
     }
 }

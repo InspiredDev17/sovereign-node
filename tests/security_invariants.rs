@@ -15,7 +15,8 @@ use sovereign_node::authz::{
 use sovereign_node::capabilities::{CapabilityError, CapabilityExecutor};
 use sovereign_node::config::{
     HealthConfig, NodeConfig, PolicyConfig, ProcessReportingConfig, ProcessSnapshotConfig,
-    ResourceReportingConfig, ServiceReportingConfig, ServiceSnapshotConfig,
+    RepositoryReportingConfig, RepositorySnapshotConfig, ResourceReportingConfig,
+    ServiceReportingConfig, ServiceSnapshotConfig,
 };
 use sovereign_node::identity::{NodeIdentity, key_id};
 use sovereign_node::pairing::{
@@ -30,8 +31,13 @@ use sovereign_node::process_status::{
 use sovereign_node::protocol::{
     ActionArguments, ActionErrorCode, ActionRequestV1, ActionResultV1, ActionTarget, AgentId,
     AuthorityKind, AuthorizationClaimsV1, AuthorizationId, Capability, NodeId, Nonce, PairingId,
-    PublicKeyBytes, ReplayProtectionV1, RequestId, Sha256Digest, SignatureBytes, SignedActionV1,
-    TaskId, TrustStatus, UnixMillis, UserAuthorityV1, ValidationError,
+    PublicKeyBytes, ReplayProtectionV1, RepositoryStatusV1, RequestId, Sha256Digest,
+    SignatureBytes, SignedActionV1, TaskId, TrustStatus, UnixMillis, UserAuthorityV1,
+    ValidationError,
+};
+use sovereign_node::repository_status::{
+    RepositoryStatusEntryV1, RepositoryStatusSnapshotV1, SignedRepositoryStatusSnapshotV1,
+    repository_status_snapshot_signing_bytes,
 };
 use sovereign_node::resources::{QueueSnapshot, ResourceReporter};
 use sovereign_node::service_status::{
@@ -792,6 +798,7 @@ async fn process_status_uses_signed_logical_identity_and_denies_raw_pid() -> Tes
             }),
         },
         service_reporting: ServiceReportingConfig::default(),
+        repository_reporting: RepositoryReportingConfig::default(),
         updates: None,
     });
     config.validate()?;
@@ -940,6 +947,7 @@ async fn service_status_uses_signed_logical_identity_without_manager_control() -
                 max_age_secs: 30,
             }),
         },
+        repository_reporting: RepositoryReportingConfig::default(),
         updates: None,
     });
     config.validate()?;
@@ -1014,6 +1022,185 @@ async fn service_status_uses_signed_logical_identity_without_manager_control() -
     let unknown = match engine.verify_and_reserve(unknown, &transport)? {
         AuthorizationOutcome::Fresh(verified) => verified,
         AuthorizationOutcome::Duplicate => return Err("fresh unknown service duplicated".into()),
+    };
+    assert_eq!(
+        executor
+            .execute(
+                &unknown,
+                UnixMillis(NOW + 10),
+                QueueSnapshot::default(),
+                TrustStatus::Trusted,
+            )
+            .await,
+        Err(CapabilityError::TargetNotAllowed)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn repository_status_uses_signed_logical_identity_without_git_access() -> TestResult {
+    let harness = Harness::with_capabilities(&[Capability::RepositoryStatus])?;
+    let repository_key = SigningKey::from_bytes(&[0x56; 32]);
+    let snapshot = RepositoryStatusSnapshotV1 {
+        schema_version: 1,
+        observed_at_unix_ms: NOW,
+        valid_until_unix_ms: NOW + 30_000,
+        repositories: vec![RepositoryStatusEntryV1 {
+            repository_id: "primary".to_owned(),
+            status: RepositoryStatusV1 {
+                head: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+                branch: Some("main".to_owned()),
+                clean: false,
+                ahead: 1,
+                behind: 0,
+                untracked_count: Some(3),
+            },
+        }],
+    };
+    let payload = serde_json::to_vec(&snapshot)?;
+    let signature = repository_key.sign(&repository_status_snapshot_signing_bytes(&payload));
+    let signed_snapshot = SignedRepositoryStatusSnapshotV1 {
+        payload_hex: hex::encode(payload),
+        signature_hex: hex::encode(signature.to_bytes()),
+    };
+    let snapshot_path = harness._directory.path().join("repository-status.json");
+    fs::write(&snapshot_path, serde_json::to_vec(&signed_snapshot)?)?;
+    let policy = PolicyConfig {
+        enabled_capabilities: vec![Capability::RepositoryStatus],
+        ..PolicyConfig::default()
+    };
+    let config = Arc::new(NodeConfig {
+        data_dir: harness.identity_directory.clone(),
+        policy_version: 1,
+        listen: None,
+        tls: None,
+        policy,
+        file_roots: Default::default(),
+        approved_actions: Default::default(),
+        health: HealthConfig::default(),
+        resource_reporting: ResourceReportingConfig::default(),
+        process_reporting: ProcessReportingConfig::default(),
+        service_reporting: ServiceReportingConfig::default(),
+        repository_reporting: RepositoryReportingConfig {
+            snapshot: Some(RepositorySnapshotConfig {
+                snapshot_path,
+                public_key_hex: hex::encode(repository_key.verifying_key().to_bytes()),
+                max_age_secs: 30,
+            }),
+        },
+        updates: None,
+    });
+    config.validate()?;
+    let executor = CapabilityExecutor::new(
+        Arc::clone(&config),
+        ResourceReporter::new(
+            harness.identity.node_id(),
+            harness.identity.device().clone(),
+        ),
+    );
+    let engine = harness.engine_for(&[Capability::RepositoryStatus]);
+    let transport = harness.transport_peer();
+    let minimized = signed_action(ActionSpec {
+        request_seed: 179,
+        sequence: 11,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::Repository {
+            repository_id: "primary".to_owned(),
+        },
+        arguments: ActionArguments::RepositoryStatus {
+            include_untracked_summary: false,
+        },
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    let minimized = match engine.verify_and_reserve(minimized, &transport)? {
+        AuthorizationOutcome::Fresh(verified) => verified,
+        AuthorizationOutcome::Duplicate => {
+            return Err("fresh repository request duplicated".into());
+        }
+    };
+    let result = executor
+        .execute(
+            &minimized,
+            UnixMillis(NOW + 10),
+            QueueSnapshot::default(),
+            TrustStatus::Trusted,
+        )
+        .await?;
+    let ActionResultV1::RepositoryStatus(status) = result else {
+        return Err("logical repository request returned the wrong result type".into());
+    };
+    assert_eq!(status.branch.as_deref(), Some("main"));
+    assert_eq!(status.untracked_count, None);
+
+    let expanded = signed_action(ActionSpec {
+        request_seed: 180,
+        sequence: 12,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::Repository {
+            repository_id: "primary".to_owned(),
+        },
+        arguments: ActionArguments::RepositoryStatus {
+            include_untracked_summary: true,
+        },
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    let expanded = match engine.verify_and_reserve(expanded, &transport)? {
+        AuthorizationOutcome::Fresh(verified) => verified,
+        AuthorizationOutcome::Duplicate => {
+            return Err("fresh expanded repository request duplicated".into());
+        }
+    };
+    let result = executor
+        .execute(
+            &expanded,
+            UnixMillis(NOW + 10),
+            QueueSnapshot::default(),
+            TrustStatus::Trusted,
+        )
+        .await?;
+    let ActionResultV1::RepositoryStatus(status) = result else {
+        return Err("expanded repository request returned the wrong result type".into());
+    };
+    assert_eq!(status.untracked_count, Some(3));
+
+    let unknown = signed_action(ActionSpec {
+        request_seed: 181,
+        sequence: 13,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::Repository {
+            repository_id: "unknown".to_owned(),
+        },
+        arguments: ActionArguments::RepositoryStatus {
+            include_untracked_summary: false,
+        },
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    let unknown = match engine.verify_and_reserve(unknown, &transport)? {
+        AuthorizationOutcome::Fresh(verified) => verified,
+        AuthorizationOutcome::Duplicate => {
+            return Err("fresh unknown repository request duplicated".into());
+        }
     };
     assert_eq!(
         executor

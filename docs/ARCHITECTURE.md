@@ -171,6 +171,11 @@ only owner-defined logical service identifiers. The node does not invoke a
 service manager, enumerate services, or disclose unit files, configuration,
 credentials, logs, commands, environments, process IDs, or control handles.
 
+RepositoryStatus likewise consumes only a role-separated signed snapshot keyed
+by an owner-defined logical repository ID. The node never receives a repository
+path, opens a work tree, invokes Git, accesses remotes, reads files or diffs,
+runs hooks, or mutates repository state.
+
 Agent Green remains independent. Its health is `Healthy`, `Degraded`,
 `Unhealthy`, `Unavailable`, or `Unknown` and must come from a configured,
 component-bound signed local health contract. Process presence alone is not

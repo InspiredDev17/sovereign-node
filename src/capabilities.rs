@@ -20,6 +20,7 @@ use crate::protocol::{
     ApprovedActionResultV1, FileReadResultV1, FileWriteMode, FileWriteResultV1, GpuResourceV1,
     InferenceEngineStatusV1, LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
 };
+use crate::repository_status::{RepositoryStatusError, RepositoryStatusReporter};
 use crate::resources::{HealthReporter, QueueSnapshot, ResourceReporter, ResourceSnapshotReporter};
 use crate::service_status::{ServiceStatusError, ServiceStatusReporter};
 
@@ -62,6 +63,7 @@ pub struct CapabilityExecutor {
     external_resources: ResourceSnapshotReporter,
     process_status: ProcessStatusReporter,
     service_status: ServiceStatusReporter,
+    repository_status: RepositoryStatusReporter,
     health: HealthReporter,
 }
 
@@ -72,12 +74,15 @@ impl CapabilityExecutor {
         let external_resources = ResourceSnapshotReporter::new(&config.resource_reporting);
         let process_status = ProcessStatusReporter::new(config.process_reporting.snapshot.as_ref());
         let service_status = ServiceStatusReporter::new(config.service_reporting.snapshot.as_ref());
+        let repository_status =
+            RepositoryStatusReporter::new(config.repository_reporting.snapshot.as_ref());
         Self {
             config,
             resources,
             external_resources,
             process_status,
             service_status,
+            repository_status,
             health,
         }
     }
@@ -148,6 +153,19 @@ impl CapabilityExecutor {
                     ServiceStatusError::TargetNotFound => CapabilityError::TargetNotAllowed,
                 }),
             (
+                ActionTarget::Repository { repository_id },
+                ActionArguments::RepositoryStatus {
+                    include_untracked_summary,
+                },
+            ) => self
+                .repository_status
+                .status(now, repository_id, *include_untracked_summary)
+                .map(ActionResultV1::RepositoryStatus)
+                .map_err(|error| match error {
+                    RepositoryStatusError::SnapshotUnavailable => CapabilityError::Execution,
+                    RepositoryStatusError::TargetNotFound => CapabilityError::TargetNotAllowed,
+                }),
+            (
                 ActionTarget::ApprovedAction { action_id },
                 ActionArguments::ExecuteApprovedAction { parameters },
             ) => self
@@ -184,9 +202,6 @@ impl CapabilityExecutor {
             (ActionTarget::ActionBroker, ActionArguments::ActionBrokerHealth) => Ok(
                 ActionResultV1::ActionBrokerHealth(self.health.action_broker(now)),
             ),
-            (ActionTarget::Repository { .. }, ActionArguments::RepositoryStatus { .. }) => {
-                Err(CapabilityError::Unsupported)
-            }
             _ => Err(CapabilityError::ArgumentMismatch),
         }
     }

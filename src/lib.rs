@@ -8,6 +8,7 @@ pub mod lifecycle;
 pub mod pairing;
 pub mod process_status;
 pub mod protocol;
+pub mod repository_status;
 pub mod resources;
 pub mod runtime;
 mod security;
