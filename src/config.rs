@@ -3,6 +3,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -34,6 +35,9 @@ pub struct NodeConfig {
     pub approved_actions: BTreeMap<String, ApprovedActionConfig>,
     #[serde(default)]
     pub health: HealthConfig,
+    /// Optional pinned offline-update authorities. Absence disables staging.
+    #[serde(default)]
+    pub updates: Option<UpdateConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,6 +105,21 @@ pub struct HealthConfig {
     pub agent_green_snapshot: Option<PathBuf>,
     /// Optional local Action Broker health endpoint identifier. Network polling is not implicit.
     pub action_broker_label: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Pinned Ed25519 release-role public key, encoded as 64 hexadecimal characters.
+    pub release_public_key_hex: String,
+    /// Separate pinned Ed25519 key used for exact owner approval of a manifest.
+    pub owner_approval_public_key_hex: String,
+    #[serde(default = "default_max_update_artifact_bytes")]
+    pub max_artifact_bytes: u64,
+}
+
+const fn default_max_update_artifact_bytes() -> u64 {
+    1_073_741_824
 }
 
 #[derive(Debug, Error)]
@@ -213,6 +232,26 @@ impl NodeConfig {
             return Err(ConfigError::Invalid(
                 "health adapters are not implemented in v0.1; status remains Unknown".to_owned(),
             ));
+        }
+        if let Some(updates) = &self.updates {
+            if updates.max_artifact_bytes == 0 || updates.max_artifact_bytes > 17_179_869_184 {
+                return Err(ConfigError::Invalid(
+                    "updates.max_artifact_bytes must be between 1 and 17179869184".to_owned(),
+                ));
+            }
+            let release_key = parse_update_key(
+                "updates.release_public_key_hex",
+                &updates.release_public_key_hex,
+            )?;
+            let owner_key = parse_update_key(
+                "updates.owner_approval_public_key_hex",
+                &updates.owner_approval_public_key_hex,
+            )?;
+            if release_key == owner_key {
+                return Err(ConfigError::Invalid(
+                    "update release and owner-approval keys must be role-separated".to_owned(),
+                ));
+            }
         }
         if policy.max_action_runtime_secs == 0 || policy.max_action_runtime_secs > 3600 {
             return Err(ConfigError::Invalid(
@@ -332,6 +371,22 @@ impl NodeConfig {
     }
 }
 
+fn parse_update_key(name: &str, value: &str) -> Result<VerifyingKey, ConfigError> {
+    let bytes = hex::decode(value)
+        .map_err(|_| ConfigError::Invalid(format!("{name} must be hexadecimal")))?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ConfigError::Invalid(format!("{name} must contain exactly 32 bytes")))?;
+    let key = VerifyingKey::from_bytes(&bytes)
+        .map_err(|_| ConfigError::Invalid(format!("{name} is not a valid Ed25519 key")))?;
+    if key.is_weak() {
+        return Err(ConfigError::Invalid(format!(
+            "{name} is a weak Ed25519 key"
+        )));
+    }
+    Ok(key)
+}
+
 fn require_absolute(name: &str, value: &Path) -> Result<(), ConfigError> {
     if value.is_absolute() {
         Ok(())
@@ -410,6 +465,8 @@ fn is_ipv6_unique_local(ip: Ipv6Addr) -> bool {
 mod tests {
     use std::net::Ipv4Addr;
 
+    use ed25519_dalek::SigningKey;
+
     use super::*;
 
     fn minimal_config() -> NodeConfig {
@@ -422,6 +479,7 @@ mod tests {
             file_roots: BTreeMap::new(),
             approved_actions: BTreeMap::new(),
             health: HealthConfig::default(),
+            updates: None,
         }
     }
 
@@ -473,6 +531,38 @@ mod tests {
             config.policy.max_requests_per_peer_per_minute - 1;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
         config.policy.max_requests_global_per_minute = 1_000_001;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn update_keys_must_be_valid_role_separated_and_bounded() {
+        let release = SigningKey::from_bytes(&[0x41; 32]);
+        let owner = SigningKey::from_bytes(&[0x42; 32]);
+        let mut config = minimal_config();
+        config.updates = Some(UpdateConfig {
+            release_public_key_hex: hex::encode(release.verifying_key().as_bytes()),
+            owner_approval_public_key_hex: hex::encode(owner.verifying_key().as_bytes()),
+            max_artifact_bytes: 1_048_576,
+        });
+        assert!(config.validate().is_ok());
+
+        config.updates = Some(UpdateConfig {
+            release_public_key_hex: hex::encode(release.verifying_key().as_bytes()),
+            owner_approval_public_key_hex: hex::encode(release.verifying_key().as_bytes()),
+            max_artifact_bytes: 1_048_576,
+        });
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        config.updates = Some(UpdateConfig {
+            release_public_key_hex: hex::encode(release.verifying_key().as_bytes()),
+            owner_approval_public_key_hex: "not-hex".to_owned(),
+            max_artifact_bytes: 1_048_576,
+        });
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        config.updates = Some(UpdateConfig {
+            release_public_key_hex: hex::encode(release.verifying_key().as_bytes()),
+            owner_approval_public_key_hex: hex::encode(owner.verifying_key().as_bytes()),
+            max_artifact_bytes: 0,
+        });
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 }

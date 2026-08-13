@@ -11,6 +11,14 @@ policy_version = 1
 # certificate_pem = "/etc/sovereign-node/node-cert.pem"
 # private_key_pem = "/etc/sovereign-node/node-key.pem"
 
+# Optional offline-update staging. Adding or changing these pinned keys is a policy change and
+# requires a higher policy_version. The release and owner-approval keys must be different Ed25519
+# public keys. Staging verifies local bytes but never installs or executes them.
+# [updates]
+# release_public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# owner_approval_public_key_hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+# max_artifact_bytes = 1073741824
+
 [policy]
 enabled_capabilities = ["SystemInfo", "ResourceStatus"]
 max_frame_bytes = 1048576

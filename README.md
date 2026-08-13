@@ -57,6 +57,9 @@ trust.
 - Pairing, revocation, and identity rotation are serialized by an owner-only admin lease; device
   identity rotation is refused while the daemon or a trusted peer is active and is audited.
 - Remote execution fails closed if trust, replay, audit, time, or policy state cannot be verified.
+- Optional offline update staging uses pinned, role-separated release and owner-approval Ed25519
+  keys, a durable monotonic release counter, exact artifact hashing, rollback metadata, private
+  no-follow staging, and digest-only decision audit. Staging never installs or executes anything.
 
 See [Architecture](docs/ARCHITECTURE.md), [Pairing](docs/PAIRING.md),
 [Identity](docs/IDENTITY.md), [Transport](docs/TRANSPORT.md),
@@ -101,10 +104,12 @@ Local status and owner control remain available without the central platform. Ne
 are accepted only while cached signed trust remains current; stale, revoked, corrupt, or
 unverifiable trust is denied. A reconnect does not retry an action with the same request ID.
 
-The daemon has no downloader or self-update code. `update.rs` only verifies a local artifact against
-a release-role signature, an exact owner-approval signature, target OS/architecture, current
-version, artifact digest, and monotonic release counter. Installation, health checks, and rollback
-remain an explicit owner-operated process.
+The daemon has no downloader or self-update code. When pinned update keys are explicitly configured,
+`sovereign-node update stage` verifies a local bundle and artifact against the release-role
+signature, exact owner-approval signature, target OS/architecture, running version, artifact digest,
+signed rollback checkpoint, and durable release-counter high-water mark. It then copies the
+artifact into owner-private staging and audits the decision. Installation, post-install health
+checks, and any signed rollback remain separate owner-operated steps.
 
 ## License
 

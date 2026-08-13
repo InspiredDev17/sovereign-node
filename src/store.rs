@@ -31,7 +31,7 @@ use crate::lifecycle::{LeaseKind, LifecycleLease};
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const PEER_RATE_WINDOW_MS: i64 = 60_000;
 const ZERO_HASH: Sha256Digest = [0_u8; 32];
 const MAX_ID_BYTES: usize = 255;
@@ -42,6 +42,7 @@ const MAX_PUBLIC_KEY_BYTES: usize = 131_072;
 const MAX_CERTIFICATE_CHAIN_COUNT: usize = 8;
 const MAX_CERTIFICATE_CHAIN_BYTES: usize = 262_144;
 const MIN_PAIRING_CHALLENGE_BYTES: usize = 16;
+const MAX_UPDATE_TEXT_BYTES: usize = 1024;
 
 /// Capacity limits intentionally fail closed instead of allowing unbounded
 /// unauthenticated state growth.
@@ -114,6 +115,12 @@ pub enum StoreError {
     RecoveryExpired,
     #[error("pairing recovery state or proof did not match")]
     RecoveryMismatch,
+    #[error("update release counter rollback or replay was rejected")]
+    UpdateCounterRollback,
+    #[error("update release counter already binds different staged content")]
+    UpdateCounterCollision,
+    #[error("update authority keys do not match the durable pinned authorities")]
+    UpdateAuthorityMismatch,
     #[error("audit chain is invalid at sequence {sequence}")]
     AuditChainInvalid { sequence: u64 },
     #[error("policy version rollback was rejected")]
@@ -483,6 +490,83 @@ pub struct PairingRecoveryOutcome {
     pub recovery: PairingRecoveryRecord,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateStageRecord {
+    pub stage_id: Uuid,
+    pub software_version: String,
+    pub previous_version: String,
+    pub rollback_version: String,
+    pub target_os: String,
+    pub target_arch: String,
+    pub release_counter: u64,
+    pub manifest_digest: Sha256Digest,
+    pub artifact_digest: Sha256Digest,
+    pub release_key_digest: Sha256Digest,
+    pub owner_key_digest: Sha256Digest,
+    /// Owner-private path relative to the node data directory.
+    pub staged_artifact_relative_path: String,
+    pub staged_at_unix_ms: i64,
+}
+
+impl UpdateStageRecord {
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.stage_id.is_nil() || self.release_counter == 0 || self.staged_at_unix_ms < 0 {
+            return Err(StoreError::InvalidInput(
+                "update stage identifiers, counter, and time are invalid",
+            ));
+        }
+        for value in [
+            &self.software_version,
+            &self.previous_version,
+            &self.rollback_version,
+            &self.target_os,
+            &self.target_arch,
+            &self.staged_artifact_relative_path,
+        ] {
+            validate_bounded_text(value, MAX_UPDATE_TEXT_BYTES, "update field")?;
+            if value.chars().any(char::is_control) {
+                return Err(StoreError::InvalidInput(
+                    "update field contains control characters",
+                ));
+            }
+        }
+        if self.software_version == self.previous_version
+            || self.rollback_version != self.previous_version
+            || self.release_key_digest == self.owner_key_digest
+            || self.manifest_digest == ZERO_HASH
+            || self.artifact_digest == ZERO_HASH
+            || self.release_key_digest == ZERO_HASH
+            || self.owner_key_digest == ZERO_HASH
+        {
+            return Err(StoreError::InvalidInput(
+                "update stage record is inconsistent",
+            ));
+        }
+        let relative = Path::new(&self.staged_artifact_relative_path);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(StoreError::InvalidInput(
+                "staged update path must be a contained relative path",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UpdateStageOutcome {
+    Staged(UpdateStageRecord),
+    AlreadyStaged(UpdateStageRecord),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TrustStatus {
     Active,
@@ -641,6 +725,8 @@ pub enum AuditKind {
     PairingRecoveryChallengeCreated,
     PairingRecoveryRejected,
     PairingRecovered,
+    UpdateRejected,
+    UpdateStaged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -906,6 +992,166 @@ impl StateStore {
             },
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn latest_staged_update(&self) -> Result<Option<UpdateStageRecord>, StoreError> {
+        let connection = self.lock()?;
+        let state: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = connection
+            .query_row(
+                "SELECT state.highest_release_counter, state.latest_manifest_digest, stages.record
+                 FROM update_state AS state
+                 JOIN update_stages AS stages ON stages.stage_id = state.latest_stage_id
+                 WHERE state.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((counter, manifest_digest, record)) = state else {
+            return Ok(None);
+        };
+        let counter = u64::from_be_bytes(
+            counter
+                .try_into()
+                .map_err(|_| StoreError::CorruptData("update counter has invalid length"))?,
+        );
+        let manifest_digest = digest_from_blob(manifest_digest)?;
+        let record: UpdateStageRecord = decode(&record)?;
+        record.validate()?;
+        if record.release_counter != counter || record.manifest_digest != manifest_digest {
+            return Err(StoreError::CorruptData(
+                "update state does not match its latest stage record",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    /// Atomically advances the durable update counter and audit chain after an
+    /// already-local artifact has passed cryptographic and content validation.
+    /// This records staging only; it does not install or execute the artifact.
+    pub(crate) fn stage_verified_update(
+        &self,
+        record: &UpdateStageRecord,
+    ) -> Result<UpdateStageOutcome, StoreError> {
+        record.validate()?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_state: Option<(Vec<u8>, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT highest_release_counter, latest_manifest_digest
+                 FROM update_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((current_counter, latest_manifest_digest)) = current_state {
+            let current_counter = u64::from_be_bytes(current_counter.try_into().map_err(|_| {
+                StoreError::CorruptData("update release counter has invalid length")
+            })?);
+            let pinned_record: Vec<u8> = transaction.query_row(
+                "SELECT stages.record
+                 FROM update_state AS state
+                 JOIN update_stages AS stages ON stages.stage_id = state.latest_stage_id
+                 WHERE state.singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            let pinned_record: UpdateStageRecord = decode(&pinned_record)?;
+            let latest_manifest_digest = digest_from_blob(latest_manifest_digest)?;
+            pinned_record.validate()?;
+            if pinned_record.release_counter != current_counter
+                || pinned_record.manifest_digest != latest_manifest_digest
+            {
+                return Err(StoreError::CorruptData(
+                    "update state does not match its pinned stage record",
+                ));
+            }
+            if pinned_record.release_key_digest != record.release_key_digest
+                || pinned_record.owner_key_digest != record.owner_key_digest
+            {
+                return Err(StoreError::UpdateAuthorityMismatch);
+            }
+            if record.release_counter < current_counter {
+                return Err(StoreError::UpdateCounterRollback);
+            }
+            if record.release_counter == current_counter {
+                let existing: Vec<u8> = transaction.query_row(
+                    "SELECT record FROM update_stages WHERE release_counter = ?1",
+                    [&u64_blob(record.release_counter)[..]],
+                    |row| row.get(0),
+                )?;
+                let existing: UpdateStageRecord = decode(&existing)?;
+                if existing.manifest_digest == record.manifest_digest
+                    && existing.artifact_digest == record.artifact_digest
+                    && existing.release_key_digest == record.release_key_digest
+                    && existing.owner_key_digest == record.owner_key_digest
+                {
+                    transaction.commit()?;
+                    return Ok(UpdateStageOutcome::AlreadyStaged(existing));
+                }
+                return Err(StoreError::UpdateCounterCollision);
+            }
+        }
+
+        transaction.execute(
+            "INSERT INTO update_stages
+                (stage_id, release_counter, staged_at_unix_ms, record)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                record.stage_id.to_string(),
+                &u64_blob(record.release_counter)[..],
+                record.staged_at_unix_ms,
+                encode(record)?
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO update_state
+                (singleton, highest_release_counter, latest_stage_id, latest_manifest_digest)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 highest_release_counter = excluded.highest_release_counter,
+                 latest_stage_id = excluded.latest_stage_id,
+                 latest_manifest_digest = excluded.latest_manifest_digest",
+            params![
+                &u64_blob(record.release_counter)[..],
+                record.stage_id.to_string(),
+                &record.manifest_digest[..]
+            ],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: record.staged_at_unix_ms,
+                kind: AuditKind::UpdateStaged,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: Some(record.owner_key_digest),
+                subject_digest: Some(record.manifest_digest),
+                context_digest: Some(record.artifact_digest),
+            },
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok(UpdateStageOutcome::Staged(record.clone()))
+    }
+
+    pub(crate) fn audit_update_rejection(
+        &self,
+        occurred_at_unix_ms: i64,
+        actor_digest: Option<Sha256Digest>,
+        subject_digest: Sha256Digest,
+        reason: &[u8],
+    ) -> Result<(), StoreError> {
+        self.append_audit(AuditEventDraft {
+            occurred_at_unix_ms,
+            kind: AuditKind::UpdateRejected,
+            outcome: AuditOutcome::Rejected,
+            request_id: None,
+            actor_digest,
+            subject_digest: Some(subject_digest),
+            context_digest: Some(sha256(reason)),
+        })?;
         Ok(())
     }
 
@@ -2668,6 +2914,22 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
              request_count INTEGER NOT NULL CHECK (request_count > 0)
          ) STRICT;
 
+         CREATE TABLE IF NOT EXISTS update_stages (
+             stage_id TEXT PRIMARY KEY NOT NULL,
+             release_counter BLOB NOT NULL UNIQUE CHECK (length(release_counter) = 8),
+             staged_at_unix_ms INTEGER NOT NULL CHECK (staged_at_unix_ms >= 0),
+             record BLOB NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS update_stages_time_idx
+             ON update_stages(staged_at_unix_ms);
+
+         CREATE TABLE IF NOT EXISTS update_state (
+             singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+             highest_release_counter BLOB NOT NULL CHECK (length(highest_release_counter) = 8),
+             latest_stage_id TEXT NOT NULL REFERENCES update_stages(stage_id),
+             latest_manifest_digest BLOB NOT NULL CHECK (length(latest_manifest_digest) = 32)
+         ) STRICT;
+
          CREATE TABLE IF NOT EXISTS audit_events (
              sequence INTEGER PRIMARY KEY NOT NULL,
              event_id TEXT NOT NULL UNIQUE,
@@ -2684,7 +2946,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
              VALUES (1, 0, zeroblob(32))
              ON CONFLICT(singleton) DO NOTHING;
-         PRAGMA user_version = 6;",
+         PRAGMA user_version = 7;",
     )?;
     // Pending ceremonies are authorization-free, short-lived bootstrap state.
     // Schema 5 adds the certificate chain needed to revalidate X.509 at local
@@ -2696,6 +2958,8 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     }
     // Schema 6 adds recovery-only tables. Existing trust, revocations, replay,
     // policy state, and audit records remain byte-for-byte unchanged.
+    // Schema 7 adds offline update staging and a monotonic release-counter
+    // high-water mark. No executable content is stored in SQLite.
     transaction.commit()?;
     Ok(())
 }
@@ -3238,6 +3502,24 @@ mod tests {
         )
     }
 
+    fn update_record(counter: u64, digest_seed: u8) -> UpdateStageRecord {
+        UpdateStageRecord {
+            stage_id: Uuid::new_v4(),
+            software_version: format!("1.{counter}.0"),
+            previous_version: "0.1.0".to_owned(),
+            rollback_version: "0.1.0".to_owned(),
+            target_os: "test-os".to_owned(),
+            target_arch: "test-arch".to_owned(),
+            release_counter: counter,
+            manifest_digest: [digest_seed; 32],
+            artifact_digest: [digest_seed.wrapping_add(1); 32],
+            release_key_digest: [0x71; 32],
+            owner_key_digest: [0x72; 32],
+            staged_artifact_relative_path: format!("updates/staged/{counter}/artifact.bin"),
+            staged_at_unix_ms: NOW + i64::try_from(counter).unwrap_or_default(),
+        }
+    }
+
     #[test]
     fn pairing_requires_correct_proof_and_survives_restart() -> Result<(), StoreError> {
         let (directory, path, store) = test_store()?;
@@ -3474,6 +3756,84 @@ mod tests {
             )?;
             assert_eq!(exists, 1);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn update_counter_is_monotonic_idempotent_and_audited() -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let first = update_record(2, 0x20);
+        assert_eq!(
+            store.stage_verified_update(&first)?,
+            UpdateStageOutcome::Staged(first.clone())
+        );
+        let same_content = UpdateStageRecord {
+            stage_id: Uuid::new_v4(),
+            staged_at_unix_ms: NOW + 99,
+            ..first.clone()
+        };
+        assert_eq!(
+            store.stage_verified_update(&same_content)?,
+            UpdateStageOutcome::AlreadyStaged(first.clone())
+        );
+        assert!(matches!(
+            store.stage_verified_update(&update_record(2, 0x21)),
+            Err(StoreError::UpdateCounterCollision)
+        ));
+        assert!(matches!(
+            store.stage_verified_update(&update_record(1, 0x10)),
+            Err(StoreError::UpdateCounterRollback)
+        ));
+        let mut wrong_authority = update_record(3, 0x31);
+        wrong_authority.release_key_digest = [0x73; 32];
+        assert!(matches!(
+            store.stage_verified_update(&wrong_authority),
+            Err(StoreError::UpdateAuthorityMismatch)
+        ));
+        let second = update_record(3, 0x30);
+        assert!(matches!(
+            store.stage_verified_update(&second)?,
+            UpdateStageOutcome::Staged(_)
+        ));
+        assert_eq!(store.latest_staged_update()?, Some(second.clone()));
+        let audit = store.verify_audit_chain()?;
+        assert_eq!(audit.event_count, 2);
+        drop(store);
+
+        let reopened = StateStore::open(path)?;
+        assert_eq!(reopened.latest_staged_update()?, Some(second));
+        assert_eq!(reopened.verify_audit_chain()?, audit);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_six_migration_adds_update_state_without_rewriting_audit() -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let (_, trusted) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let before = store.verify_audit_chain()?;
+        drop(store);
+
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch(
+            "DROP TABLE update_state;
+             DROP TABLE update_stages;
+             PRAGMA user_version = 6;",
+        )?;
+        drop(legacy);
+
+        let migrated = StateStore::open(path)?;
+        assert!(migrated.latest_staged_update()?.is_none());
+        assert_eq!(migrated.verify_audit_chain()?, before);
+        assert_eq!(
+            migrated
+                .peer_record(&trusted.peer_id)?
+                .map(|peer| peer.pairing_id),
+            Some(trusted.pairing_id)
+        );
+        assert!(matches!(
+            migrated.stage_verified_update(&update_record(2, 0x20))?,
+            UpdateStageOutcome::Staged(_)
+        ));
         Ok(())
     }
 

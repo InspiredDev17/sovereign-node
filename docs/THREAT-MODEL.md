@@ -179,10 +179,15 @@ reload are covered with real loopback sockets and ephemeral test certificates.
 Certificate enrollment tests cover exact fingerprint mismatch, malformed DER,
 non-CA trust anchors, wrong issuer, serverAuth-only leaves, missing TLS-signing
 usage, expired leaves, approval-time expiry, and a valid intermediate chain.
-Full filesystem-race and persistent update-workflow cases remain explicit
-pre-enablement gates; the associated capabilities are unavailable in v0.1. The
-suite also verifies singleton/admin lease separation and daemon-lease-only crash
-reconciliation to `Indeterminate` without retry.
+Full filesystem-race cases for reserved file/action capabilities remain explicit
+pre-enablement gates; those capabilities are unavailable in v0.1. Offline update
+tests cover pinned role separation, exact signatures and digest, local
+confirmation, target/version/rollback checks, bounded no-follow staging,
+owner-only output, monotonic counter replay/collision/authority resistance,
+rejection audit, restart durability, and schema migration. Installation and
+post-install health verification remain owner-operated and are not claimed by
+these tests. The suite also verifies singleton/admin lease separation and
+daemon-lease-only crash reconciliation to `Indeterminate` without retry.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.
@@ -205,6 +210,7 @@ They assert that denied requests produce no capability side effect.
 | Node restart | NodeId, trust generation, revocation, replay reservation, and audit state persist; incomplete side effects become Indeterminate, not retried |
 | Credential rotation | All current and replacement owner/broker proofs plus local confirmation are required; old sessions and authorizations stop working after the atomic durable epoch change, and the node signs the receipt |
 | Pairing recovery | Only an explicitly revoked peer can enter recovery; replacement owner/broker proofs and local confirmation advance the epoch without erasing the prior revocation, replay, or audit history |
+| Offline update staging | Separate pinned release/owner signatures, local confirmation, exact digest/target/version/rollback checks, and a durable higher counter are required; output remains inert and uninstalled |
 
 Additional tests cover malformed canonical encodings, TLS peer mismatch,
 pairing-window expiry, duplicate enrollment, corrupt state, untrustworthy time,

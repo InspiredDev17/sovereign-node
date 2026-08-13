@@ -29,6 +29,7 @@ use sovereign_node::runtime::{NodeRuntime, RuntimeCapacity};
 use sovereign_node::store::{
     AuditEventDraft, AuditKind, AuditOutcome, RevocationOutcome, StateStore, sha256,
 };
+use sovereign_node::update::{LocalUpdateStageRequest, UpdatePolicy, stage_local_update};
 use uuid::Uuid;
 
 const STATE_DATABASE: &str = "state.sqlite3";
@@ -62,8 +63,32 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Verify and stage an owner-supplied offline update; never installs it.
+    #[command(subcommand)]
+    Update(UpdateCommand),
     /// Run the unprivileged daemon. No listener is opened unless configured.
     Serve { config: PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+enum UpdateCommand {
+    /// Verify pinned release/owner signatures and copy an artifact into private staging.
+    Stage(UpdateStageArgs),
+}
+
+#[derive(Debug, Args)]
+struct UpdateStageArgs {
+    #[arg(long)]
+    config: PathBuf,
+    /// Strict JSON SignedUpdateV1 bundle already present on this machine.
+    #[arg(long)]
+    bundle_json: PathBuf,
+    /// Local artifact whose SHA-256 digest is signed by the bundle.
+    #[arg(long)]
+    artifact: PathBuf,
+    /// Confirms local owner intent to stage this exact signed version transition.
+    #[arg(long)]
+    confirm: bool,
 }
 
 #[derive(Debug, Args)]
@@ -256,6 +281,9 @@ struct StatusOutput {
     listener: Option<String>,
     default_remote_execution: &'static str,
     agent_green_health: &'static str,
+    staged_update_version: Option<String>,
+    staged_update_release_counter: Option<u64>,
+    update_installation: &'static str,
 }
 
 #[tokio::main]
@@ -273,8 +301,54 @@ async fn main() -> Result<()> {
         Command::Status { config } => status(&config),
         Command::Pair(command) => pair(command),
         Command::RotateIdentity { config, confirm } => rotate_identity(&config, confirm),
+        Command::Update(command) => update(command),
         Command::Serve { config } => serve(&config).await,
     }
+}
+
+fn update(command: UpdateCommand) -> Result<()> {
+    match command {
+        UpdateCommand::Stage(args) => update_stage(args),
+    }
+}
+
+fn update_stage(args: UpdateStageArgs) -> Result<()> {
+    let config = NodeConfig::load(&args.config)?;
+    let update_config = config.updates.as_ref().ok_or_else(|| {
+        anyhow!("offline update staging is disabled; configure pinned update keys")
+    })?;
+    let _admin_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::AdminMutation)?;
+    let store = open_store(&config)?;
+    store.verify_audit_chain()?;
+    let release_key = verifying_key_hex(
+        &update_config.release_public_key_hex,
+        "update release public key",
+    )?;
+    let owner_key = verifying_key_hex(
+        &update_config.owner_approval_public_key_hex,
+        "update owner-approval public key",
+    )?;
+    let current_release_counter = store
+        .latest_staged_update()?
+        .map_or(0, |record| record.release_counter);
+    let result = stage_local_update(&LocalUpdateStageRequest {
+        bundle_json_path: &args.bundle_json,
+        artifact_path: &args.artifact,
+        data_dir: &config.data_dir,
+        store: &store,
+        policy: UpdatePolicy {
+            current_version: env!("CARGO_PKG_VERSION").to_owned(),
+            current_release_counter,
+            target_os: std::env::consts::OS.to_owned(),
+            target_arch: std::env::consts::ARCH.to_owned(),
+        },
+        release_key: &release_key,
+        owner_key: &owner_key,
+        max_artifact_bytes: update_config.max_artifact_bytes,
+        owner_confirmed: args.confirm,
+        staged_at_unix_ms: to_i64(now()?)?,
+    })?;
+    print_json(&result)
 }
 
 fn init(args: InitArgs) -> Result<()> {
@@ -304,6 +378,7 @@ fn config_example(data_dir: &Path) -> Result<()> {
         file_roots: Default::default(),
         approved_actions: Default::default(),
         health: HealthConfig::default(),
+        updates: None,
     };
     config.validate()?;
     println!("{}", toml::to_string_pretty(&config)?);
@@ -344,6 +419,7 @@ fn status(config_path: &Path) -> Result<()> {
     let store = open_store(&config)?;
     let audit = store.verify_audit_chain()?;
     let peers = store.currently_trusted_peers(to_i64(now()?)?)?;
+    let staged_update = store.latest_staged_update()?;
     print_json(&StatusOutput {
         node_id: identity.node_id().to_string(),
         identity_fingerprint_sha256: identity.fingerprint(),
@@ -353,6 +429,11 @@ fn status(config_path: &Path) -> Result<()> {
         listener: config.listen.map(|address| address.to_string()),
         default_remote_execution: "deny unless exact owner+broker authorization verifies",
         agent_green_health: "unknown until an explicit authenticated read-only adapter is configured",
+        staged_update_version: staged_update
+            .as_ref()
+            .map(|record| record.software_version.clone()),
+        staged_update_release_counter: staged_update.map(|record| record.release_counter),
+        update_installation: "never automatic; staging does not install or execute",
     })
 }
 
@@ -743,6 +824,15 @@ fn public_key(value: &str) -> Result<PublicKeyBytes> {
         bail!("weak Ed25519 public keys are not accepted");
     }
     Ok(PublicKeyBytes(bytes))
+}
+
+fn verifying_key_hex(value: &str, label: &str) -> Result<VerifyingKey> {
+    let bytes = fixed_bytes::<32>(value, label)?;
+    let key = VerifyingKey::from_bytes(&bytes).with_context(|| format!("invalid {label}"))?;
+    if key.is_weak() {
+        bail!("weak {label} is not accepted");
+    }
+    Ok(key)
 }
 
 fn signature(value: &str) -> Result<SignatureBytes> {

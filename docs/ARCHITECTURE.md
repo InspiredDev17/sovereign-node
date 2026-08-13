@@ -248,29 +248,40 @@ work. The remote peer must reauthenticate and resubmit a still-valid request.
 
 ## Updates
 
-The following is the target owner-operated workflow. v0.1 implements only pure
-offline bundle verification (`update.rs`): release and owner Ed25519 signatures,
-artifact digest, exact version transition, target OS/architecture, and a
-caller-supplied monotonic counter. It has no downloader, installer, persistent
-counter, rollback checkpoint, or update-audit CLI, and therefore cannot claim a
-completed update. Installation remains out of scope until those durable controls
-exist.
+v0.1 implements owner-local offline verification and staging, not installation.
+The optional `[updates]` policy pins separate release-role and owner-approval
+Ed25519 public keys plus an artifact-size ceiling. `update stage` accepts only an
+already-local strict JSON bundle and regular no-follow artifact, requires local
+`--confirm`, verifies both signatures over the deterministic manifest, checks
+the exact running-version transition and OS/architecture, streams and bounds the
+artifact digest, and copies it into an owner-private staging directory.
+
+The same SQLite transaction advances a persistent release-counter high-water
+mark, pins the authority-key digests after first use, stores version and rollback
+checkpoint metadata, and appends a digest-only accepted audit event. Denials are
+also audited when the trust store is available. Staging output explicitly says
+that installation was not performed. A schema migration preserves all existing
+trust, revocation, replay, policy, and audit records.
 
 The node contains no Internet downloader and performs no unattended update.
 An update is an owner-supplied, versioned bundle containing hashes,
-compatibility constraints, release notes, rollback metadata, and a signature
-from a pinned release key. Installation requires:
+compatibility constraints, rollback metadata, and a signature
+from a pinned release key. The implemented staging gate requires:
 
 1. successful bundle signature and content verification;
 2. explicit local owner approval of the displayed version transition;
 3. compatibility and downgrade-policy checks;
-4. a durable pre-update audit entry and rollback checkpoint; and
-5. a post-update identity, policy, and health verification.
+4. a durable pre-update audit entry and rollback checkpoint.
 
-Rollback is permitted only to an explicitly allowed signed version. Rollback
-must not restore revoked trust, erase replay records, or reduce the trust
-generation. Update transport is out of scope; the owner chooses how the bundle
-reaches the machine.
+Installation remains an explicit owner-operated step outside the daemon. A
+future installer must additionally provide a post-update identity, policy, and
+health verification before it can claim completion.
+
+Rollback staging is itself a newly signed transition with a higher release
+counter and must name the currently running version as its rollback checkpoint.
+Rollback must not restore revoked trust, erase replay records, or reduce the
+trust generation. Update transport is out of scope; the owner chooses how the
+bundle reaches the machine.
 
 ## Non-goals
 
