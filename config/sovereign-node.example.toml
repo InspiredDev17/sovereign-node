@@ -31,6 +31,7 @@ max_requests_per_peer_per_minute = 120
 # Durable aggregate limit across every paired peer and connection.
 max_requests_global_per_minute = 1000
 max_action_ttl_secs = 300
+max_clock_rollback_secs = 5
 require_owner_signature_for_all_actions = true
 max_file_read_bytes = 524288
 max_file_write_bytes = 524288

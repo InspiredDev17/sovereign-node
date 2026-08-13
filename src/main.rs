@@ -66,6 +66,9 @@ enum Command {
     /// Verify and stage an owner-supplied offline update; never installs it.
     #[command(subcommand)]
     Update(UpdateCommand),
+    /// Inspect or explicitly acknowledge the durable authorization clock checkpoint.
+    #[command(subcommand)]
+    Clock(ClockCommand),
     /// Run the unprivileged daemon. No listener is opened unless configured.
     Serve { config: PathBuf },
 }
@@ -74,6 +77,18 @@ enum Command {
 enum UpdateCommand {
     /// Verify pinned release/owner signatures and copy an artifact into private staging.
     Stage(UpdateStageArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ClockCommand {
+    /// Compare local wall-clock time with the durable remote-authorization checkpoint.
+    Status { config: PathBuf },
+    /// Replace the checkpoint after explicit local confirmation while the daemon is stopped.
+    Acknowledge {
+        config: PathBuf,
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -303,6 +318,7 @@ async fn main() -> Result<()> {
         Command::Pair(command) => pair(command),
         Command::RotateIdentity { config, confirm } => rotate_identity(&config, confirm),
         Command::Update(command) => update(command),
+        Command::Clock(command) => clock(command),
         Command::Serve { config } => serve(&config).await,
     }
 }
@@ -311,6 +327,55 @@ fn update(command: UpdateCommand) -> Result<()> {
     match command {
         UpdateCommand::Stage(args) => update_stage(args),
     }
+}
+
+fn clock(command: ClockCommand) -> Result<()> {
+    match command {
+        ClockCommand::Status { config } => clock_status(&config),
+        ClockCommand::Acknowledge { config, confirm } => clock_acknowledge(&config, confirm),
+    }
+}
+
+fn clock_status(config_path: &Path) -> Result<()> {
+    let config = NodeConfig::load(config_path)?;
+    let store = open_store(&config)?;
+    store.verify_audit_chain()?;
+    let observed = to_i64(now()?)?;
+    let high_water = store.trusted_clock_high_water()?;
+    let tolerance_ms = i64::try_from(config.policy.max_clock_rollback_secs)?.saturating_mul(1_000);
+    let rollback_detected =
+        high_water.is_some_and(|checkpoint| observed < checkpoint.saturating_sub(tolerance_ms));
+    let authorization_state = match (high_water, rollback_detected) {
+        (None, _) => "uninitialized-until-listener-start",
+        (Some(_), true) => "blocked-clock-rollback",
+        (Some(_), false) => "available",
+    };
+    print_json(&serde_json::json!({
+        "observed_at_unix_ms": observed,
+        "trusted_high_water_unix_ms": high_water,
+        "maximum_rollback_ms": tolerance_ms,
+        "remote_authorization_state": authorization_state,
+    }))
+}
+
+fn clock_acknowledge(config_path: &Path, confirm: bool) -> Result<()> {
+    if !confirm {
+        bail!("clock acknowledgement requires explicit local --confirm");
+    }
+    let config = NodeConfig::load(config_path)?;
+    let admin_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::AdminMutation)?;
+    let daemon_lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::Daemon)
+        .context("clock acknowledgement requires the daemon to be stopped")?;
+    let store = open_store(&config)?;
+    store.verify_audit_chain()?;
+    let observed = to_i64(now()?)?;
+    let previous = store.acknowledge_trusted_clock(&admin_lease, &daemon_lease, observed)?;
+    print_json(&serde_json::json!({
+        "previous_high_water_unix_ms": previous,
+        "acknowledged_high_water_unix_ms": observed,
+        "daemon_restart_required": true,
+        "audit_recorded": true,
+    }))
 }
 
 fn update_stage(args: UpdateStageArgs) -> Result<()> {
@@ -747,7 +812,17 @@ async fn serve(config_path: &Path) -> Result<()> {
     let identity = Arc::new(NodeIdentity::load(&config.data_dir)?);
     let store = Arc::new(open_store(&config)?);
     store.verify_audit_chain()?;
-    let reconciled = store.reconcile_open_replays(&daemon_lease, to_i64(now()?)?)?;
+    let startup_time = to_i64(now()?)?;
+    if config.listen.is_some() {
+        let maximum_clock_rollback_ms =
+            i64::try_from(config.policy.max_clock_rollback_secs)?.saturating_mul(1_000);
+        store
+            .observe_trusted_clock_at(startup_time, maximum_clock_rollback_ms)
+            .context(
+                "remote authorization is blocked because the local clock is behind its durable checkpoint",
+            )?;
+    }
+    let reconciled = store.reconcile_open_replays(&daemon_lease, startup_time)?;
     if reconciled > 0 {
         eprintln!(
             "reconciled {reconciled} prior open request(s) as Indeterminate; none were retried"

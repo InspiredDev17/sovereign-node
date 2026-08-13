@@ -253,6 +253,18 @@ ambiguous, or the clock is outside configured safety bounds, new remote actions
 are rejected. Reconnection does not reset replay state or authorize queued
 work. The remote peer must reauthenticate and resubmit a still-valid request.
 
+The node persists a wall-clock high-water mark in the same SQLite state as its
+replay ledger. Listener startup, authenticated request admission, and the
+atomic replay-reservation transaction reject time earlier than that checkpoint
+by more than `max_clock_rollback_secs`; ordinary observation can advance but
+never lower it. A legitimate larger backwards correction requires the daemon
+to be stopped and an owner-local `clock acknowledge --confirm`, which replaces
+the checkpoint under both lifecycle leases and appends a digest-only audit
+event. The acknowledgement does not consume, revive, or dispatch any action.
+The rollback-rejection audit is latched until a safe time observation or owner
+acknowledgement so a paired client cannot turn one clock fault into unbounded
+duplicate audit growth.
+
 ## Updates
 
 v0.1 implements owner-local offline verification and staging, not installation.

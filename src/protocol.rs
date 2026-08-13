@@ -676,6 +676,7 @@ pub enum ActionErrorCode {
     InvalidRequest,
     LocalExecutionFailed,
     Internal,
+    ClockRollback,
 }
 
 impl ActionRequestV1 {

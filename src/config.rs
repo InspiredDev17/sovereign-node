@@ -14,6 +14,7 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_CONCURRENT_ACTIONS: usize = 4;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 32;
 pub const DEFAULT_MAX_ACTION_TTL_SECS: i64 = 300;
+pub const DEFAULT_MAX_CLOCK_ROLLBACK_SECS: u64 = 5;
 pub const DEFAULT_MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 120;
 pub const DEFAULT_MAX_REQUESTS_GLOBAL_PER_MINUTE: u32 = 1_000;
 
@@ -62,6 +63,8 @@ pub struct PolicyConfig {
     /// Durable fixed-window limit shared by all authenticated peers before authz.
     pub max_requests_global_per_minute: u32,
     pub max_action_ttl_secs: i64,
+    /// Maximum tolerated backwards wall-clock movement before remote work fails closed.
+    pub max_clock_rollback_secs: u64,
     pub require_owner_signature_for_all_actions: bool,
     pub max_file_read_bytes: usize,
     pub max_file_write_bytes: usize,
@@ -79,6 +82,7 @@ impl Default for PolicyConfig {
             max_requests_per_peer_per_minute: DEFAULT_MAX_REQUESTS_PER_PEER_PER_MINUTE,
             max_requests_global_per_minute: DEFAULT_MAX_REQUESTS_GLOBAL_PER_MINUTE,
             max_action_ttl_secs: DEFAULT_MAX_ACTION_TTL_SECS,
+            max_clock_rollback_secs: DEFAULT_MAX_CLOCK_ROLLBACK_SECS,
             require_owner_signature_for_all_actions: true,
             max_file_read_bytes: 524_288,
             max_file_write_bytes: 524_288,
@@ -254,6 +258,11 @@ impl NodeConfig {
         if policy.max_action_ttl_secs <= 0 || policy.max_action_ttl_secs > 3600 {
             return Err(ConfigError::Invalid(
                 "max_action_ttl_secs must be between 1 and 3600".to_owned(),
+            ));
+        }
+        if policy.max_clock_rollback_secs > 60 {
+            return Err(ConfigError::Invalid(
+                "max_clock_rollback_secs must be between 0 and 60".to_owned(),
             ));
         }
         if !policy.require_owner_signature_for_all_actions {
@@ -674,6 +683,17 @@ mod tests {
             config.policy.max_requests_per_peer_per_minute - 1;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
         config.policy.max_requests_global_per_minute = 1_000_001;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn clock_rollback_tolerance_is_tightly_bounded() {
+        let mut config = minimal_config();
+        config.policy.max_clock_rollback_secs = 0;
+        assert!(config.validate().is_ok());
+        config.policy.max_clock_rollback_secs = 60;
+        assert!(config.validate().is_ok());
+        config.policy.max_clock_rollback_secs = 61;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 

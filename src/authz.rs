@@ -131,6 +131,7 @@ impl AuthorizationError {
                 ActionErrorCode::RevokedPairing
             }
             Self::Store(StoreError::ResourceLimit(_)) => ActionErrorCode::ResourceExhausted,
+            Self::Store(StoreError::ClockRollback) => ActionErrorCode::ClockRollback,
             Self::Store(_) | Self::Clock => ActionErrorCode::Internal,
             Self::Forged | Self::OwnerMismatch | Self::TransportBinding => {
                 ActionErrorCode::ForgedAuthorization
@@ -149,6 +150,7 @@ pub struct AuthorizationEngine {
     clock: Arc<dyn Clock>,
     advertised_capabilities: BTreeSet<Capability>,
     max_action_ttl_millis: u64,
+    max_clock_rollback_millis: i64,
     policy_version: u64,
     policy_digest: Sha256Digest,
 }
@@ -169,6 +171,9 @@ impl AuthorizationEngine {
             clock,
             advertised_capabilities: policy.enabled_capabilities.iter().copied().collect(),
             max_action_ttl_millis: u64::try_from(policy.max_action_ttl_secs)
+                .unwrap_or(0)
+                .saturating_mul(1_000),
+            max_clock_rollback_millis: i64::try_from(policy.max_clock_rollback_secs)
                 .unwrap_or(0)
                 .saturating_mul(1_000),
             policy_version,
@@ -215,9 +220,10 @@ impl AuthorizationEngine {
             return Err(error);
         }
 
-        let outcome = self.store.reserve_validated_replay_at(
+        let outcome = self.store.reserve_validated_replay_with_clock_at(
             &reservation,
             i64::try_from(now.0).map_err(|_| AuthorizationError::Clock)?,
+            self.max_clock_rollback_millis,
         )?;
         match outcome {
             ReplayOutcome::Reserved { fingerprint } => {

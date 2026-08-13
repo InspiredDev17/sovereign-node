@@ -693,6 +693,33 @@ fn forged_authorizations_do_not_consume_the_request_id() -> TestResult {
 }
 
 #[test]
+fn material_clock_rollback_denies_authorization_without_consuming_request_id() -> TestResult {
+    let harness = Harness::new()?;
+    let engine = harness.engine();
+    let transport = harness.transport_peer();
+    harness.clock.set(NOW + 20_000);
+    assert!(matches!(
+        engine.verify_and_reserve(harness.system_info_action(150, 5)?, &transport)?,
+        AuthorizationOutcome::Fresh(_)
+    ));
+
+    let retryable = harness.system_info_action(151, 6)?;
+    harness.clock.set(NOW + 14_999);
+    let rollback = match engine.verify_and_reserve(retryable.clone(), &transport) {
+        Err(error) => error,
+        Ok(_) => return Err("rollback beyond the five-second policy was accepted".into()),
+    };
+    assert_eq!(rollback.code(), ActionErrorCode::ClockRollback);
+
+    harness.clock.set(NOW + 15_000);
+    assert!(matches!(
+        engine.verify_and_reserve(retryable, &transport)?,
+        AuthorizationOutcome::Fresh(_)
+    ));
+    Ok(())
+}
+
+#[test]
 fn expired_wrong_node_and_capability_mismatch_fail_closed() -> TestResult {
     let harness = Harness::new()?;
     let engine = harness.engine();

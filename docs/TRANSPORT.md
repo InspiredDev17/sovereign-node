@@ -18,7 +18,9 @@ handshake, and write deadlines. Every authenticated request is atomically
 checked against durable per-peer and node-global one-minute fixed-window limits
 after bounded decoding and before authorization or replay reservation.
 Reconnecting or reopening the state store does not reset either limit; a
-backwards clock step fails closed. Every admitted frame is authorized again
+backwards clock step beyond the configured zero-to-sixty-second tolerance fails
+closed against a durable high-water mark. The default tolerance is five seconds.
+Every admitted frame is authorized again
 against current durable trust. Local administration is CLI-only, not a Unix
 socket. Paired client trust snapshots reload every 250 milliseconds. New and
 rotated pairings become eligible for a new handshake without daemon restart.
@@ -28,6 +30,12 @@ writing. Revocation, expiry, rotation, malformed trust, or an unavailable trust
 store closes the session. Application version negotiation remains target work.
 The node server certificate must be provisioned to clients through a separate
 owner-controlled channel and does not reload in v0.1.
+
+The clock checkpoint is advanced at listener startup and inside authenticated
+admission/replay transactions. It never moves backwards automatically. Clock
+rollback recovery is intentionally unavailable over this transport: the owner
+must stop the daemon, verify local time, and invoke the audited local CLI
+acknowledgement with explicit confirmation.
 
 An action already durably dispatched is not cancelled solely because its
 session closes; it finishes under the normal bounded runtime and terminal-state

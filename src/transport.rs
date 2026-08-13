@@ -75,6 +75,14 @@ struct ServerIdentity {
     private_key: PrivateKeyDer<'static>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TransportRequestPolicy {
+    max_frame: usize,
+    peer_maximum_per_minute: u32,
+    global_maximum_per_minute: u32,
+    maximum_clock_rollback_ms: i64,
+}
+
 pub async fn serve(
     config: Arc<NodeConfig>,
     store: Arc<StateStore>,
@@ -108,9 +116,16 @@ pub async fn serve(
         let acceptor = TlsAcceptor::from(trust.tls.clone());
         let runtime = runtime.clone();
         let store = store.clone();
-        let max_frame = config.policy.max_frame_bytes.min(MAX_WIRE_MESSAGE_BYTES);
-        let peer_maximum_per_minute = config.policy.max_requests_per_peer_per_minute;
-        let global_maximum_per_minute = config.policy.max_requests_global_per_minute;
+        let request_policy = TransportRequestPolicy {
+            max_frame: config.policy.max_frame_bytes.min(MAX_WIRE_MESSAGE_BYTES),
+            peer_maximum_per_minute: config.policy.max_requests_per_peer_per_minute,
+            global_maximum_per_minute: config.policy.max_requests_global_per_minute,
+            maximum_clock_rollback_ms: i64::try_from(config.policy.max_clock_rollback_secs)
+                .map_err(|_| {
+                    TransportError::Configuration("clock rollback policy overflow".to_owned())
+                })?
+                .saturating_mul(1_000),
+        };
         tokio::spawn(async move {
             let _permit = permit;
             let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
@@ -123,16 +138,7 @@ pub async fn serve(
             if !session_is_current(&store, &session).unwrap_or(false) {
                 return;
             }
-            let _ = serve_connection(
-                tls_stream,
-                session,
-                runtime,
-                store,
-                max_frame,
-                peer_maximum_per_minute,
-                global_maximum_per_minute,
-            )
-            .await;
+            let _ = serve_connection(tls_stream, session, runtime, store, request_policy).await;
         });
     }
 }
@@ -142,14 +148,12 @@ async fn serve_connection(
     session: TransportSession,
     runtime: Arc<NodeRuntime>,
     store: Arc<StateStore>,
-    max_frame: usize,
-    peer_maximum_per_minute: u32,
-    global_maximum_per_minute: u32,
+    request_policy: TransportRequestPolicy,
 ) -> Result<(), TransportError> {
     loop {
         let Some(frame) = tokio::time::timeout(
             FRAME_TIMEOUT,
-            read_frame_with_trust(&mut stream, &store, &session, max_frame),
+            read_frame_with_trust(&mut stream, &store, &session, request_policy.max_frame),
         )
         .await
         .map_err(|_| TransportError::Frame)??
@@ -161,10 +165,11 @@ async fn serve_connection(
         if !remainder.is_empty() {
             return Err(TransportError::Frame);
         }
-        match store.admit_remote_request(
+        match store.admit_remote_request_with_clock_policy(
             &session.peer.peer_id,
-            peer_maximum_per_minute,
-            global_maximum_per_minute,
+            request_policy.peer_maximum_per_minute,
+            request_policy.global_maximum_per_minute,
+            request_policy.maximum_clock_rollback_ms,
         )? {
             RemoteRequestAdmission::Admitted { .. } => {}
             RemoteRequestAdmission::Limited {
@@ -185,7 +190,7 @@ async fn serve_connection(
             tokio::spawn(async move { runtime_for_action.handle(action, &peer_for_action).await });
         let response = wait_for_action_or_trust_change(&mut action_task, &store, &session).await?;
         let encoded = postcard::to_allocvec(&response).map_err(|_| TransportError::Frame)?;
-        if encoded.len() > max_frame || encoded.len() > u32::MAX as usize {
+        if encoded.len() > request_policy.max_frame || encoded.len() > u32::MAX as usize {
             return Err(TransportError::Frame);
         }
         let encoded_length = u32::try_from(encoded.len()).map_err(|_| TransportError::Frame)?;

@@ -57,6 +57,9 @@ trust.
 - Pairing, revocation, and identity rotation are serialized by an owner-only admin lease; device
   identity rotation is refused while the daemon or a trusted peer is active and is audited.
 - Remote execution fails closed if trust, replay, audit, time, or policy state cannot be verified.
+- Remote authorization time is anchored to a durable high-water mark. A backwards wall-clock
+  step beyond the tightly bounded local tolerance is denied and audited; lowering the checkpoint
+  requires the daemon to be stopped plus explicit owner-local `clock acknowledge --confirm`.
 - Optional offline update staging uses pinned, role-separated release and owner-approval Ed25519
   keys, a durable monotonic release counter, exact artifact hashing, rollback metadata, private
   no-follow staging, and digest-only decision audit. Staging never installs or executes anything.
@@ -86,6 +89,13 @@ cargo run --locked -- config-example --data-dir /absolute/private/path
 The LAN listener is disabled until the owner supplies a TLS certificate/key, at least one approved
 paired client CA and leaf certificate, and an exact private or loopback bind address. Pairing and
 revocation commands are owner-local operations; run `sovereign-node --help` for the current CLI.
+
+Inspect the durable authorization-time checkpoint with `sovereign-node clock status`. If an owner
+intentionally corrects the host clock backwards beyond policy, recovery is an explicit maintenance
+operation: stop the daemon, verify the new time independently, then run
+`sovereign-node clock acknowledge --confirm`. This never authorizes or retries an action.
+`max_clock_rollback_secs` is part of the canonical policy digest, so an existing node adopting
+this policy must increment its owner-controlled `policy_version` once before serving again.
 
 ## Capability defaults
 

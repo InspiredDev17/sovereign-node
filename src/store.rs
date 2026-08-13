@@ -31,7 +31,7 @@ use crate::lifecycle::{LeaseKind, LifecycleLease};
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const PEER_RATE_WINDOW_MS: i64 = 60_000;
 const ZERO_HASH: Sha256Digest = [0_u8; 32];
 const MAX_ID_BYTES: usize = 255;
@@ -127,7 +127,7 @@ pub enum StoreError {
     PolicyRollback,
     #[error("policy content changed without increasing its version")]
     PolicyVersionReuse,
-    #[error("system clock moved backwards across a peer admission window")]
+    #[error("system clock moved backwards beyond the locally permitted tolerance")]
     ClockRollback,
 }
 
@@ -727,6 +727,8 @@ pub enum AuditKind {
     PairingRecovered,
     UpdateRejected,
     UpdateStaged,
+    ClockRollbackRejected,
+    ClockRollbackAcknowledged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -832,6 +834,22 @@ impl StateStore {
         )
     }
 
+    pub fn admit_remote_request_with_clock_policy(
+        &self,
+        peer_id: &str,
+        peer_maximum_per_minute: u32,
+        global_maximum_per_minute: u32,
+        maximum_rollback_ms: i64,
+    ) -> Result<RemoteRequestAdmission, StoreError> {
+        self.admit_remote_request_with_clock_policy_at(
+            peer_id,
+            peer_maximum_per_minute,
+            global_maximum_per_minute,
+            unix_time_ms()?,
+            maximum_rollback_ms,
+        )
+    }
+
     pub fn admit_remote_request_at(
         &self,
         peer_id: &str,
@@ -839,7 +857,25 @@ impl StateStore {
         global_maximum_per_minute: u32,
         now_unix_ms: i64,
     ) -> Result<RemoteRequestAdmission, StoreError> {
+        self.admit_remote_request_with_clock_policy_at(
+            peer_id,
+            peer_maximum_per_minute,
+            global_maximum_per_minute,
+            now_unix_ms,
+            0,
+        )
+    }
+
+    pub fn admit_remote_request_with_clock_policy_at(
+        &self,
+        peer_id: &str,
+        peer_maximum_per_minute: u32,
+        global_maximum_per_minute: u32,
+        now_unix_ms: i64,
+        maximum_rollback_ms: i64,
+    ) -> Result<RemoteRequestAdmission, StoreError> {
         validate_identifier(peer_id)?;
+        validate_clock_policy(now_unix_ms, maximum_rollback_ms)?;
         if peer_maximum_per_minute == 0 || global_maximum_per_minute < peer_maximum_per_minute {
             return Err(StoreError::InvalidInput(
                 "request limits must be non-zero and global must cover per-peer",
@@ -853,6 +889,26 @@ impl StateStore {
 
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match advance_trusted_clock_in_transaction(&transaction, now_unix_ms, maximum_rollback_ms) {
+            Ok(()) => {}
+            Err(StoreError::ClockRollback) => {
+                append_clock_rollback_audit_once(
+                    &transaction,
+                    AuditEventDraft {
+                        occurred_at_unix_ms: now_unix_ms,
+                        kind: AuditKind::ClockRollbackRejected,
+                        outcome: AuditOutcome::Rejected,
+                        request_id: None,
+                        actor_digest: Some(sha256(peer_id.as_bytes())),
+                        subject_digest: Some(sha256(b"trusted-clock")),
+                        context_digest: Some(sha256(b"rollback-beyond-policy")),
+                    },
+                )?;
+                transaction.commit()?;
+                return Err(StoreError::ClockRollback);
+            }
+            Err(error) => return Err(error),
+        }
         let peer_window = transaction
             .query_row(
                 "SELECT window_started_at_unix_ms, request_count
@@ -870,10 +926,18 @@ impl StateStore {
             )
             .optional()?;
 
-        let peer_decision =
-            evaluate_rate_window(peer_window, peer_maximum_per_minute, now_unix_ms)?;
-        let global_decision =
-            evaluate_rate_window(global_window, global_maximum_per_minute, now_unix_ms)?;
+        let peer_decision = evaluate_rate_window(
+            peer_window,
+            peer_maximum_per_minute,
+            now_unix_ms,
+            maximum_rollback_ms,
+        )?;
+        let global_decision = evaluate_rate_window(
+            global_window,
+            global_maximum_per_minute,
+            now_unix_ms,
+            maximum_rollback_ms,
+        )?;
         if let RateWindowDecision::Limit { retry_after_ms } = peer_decision {
             transaction.commit()?;
             return Ok(RemoteRequestAdmission::Limited {
@@ -993,6 +1057,103 @@ impl StateStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Return the durable wall-clock high-water mark used for remote authorization.
+    pub fn trusted_clock_high_water(&self) -> Result<Option<i64>, StoreError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT high_water_unix_ms FROM trusted_clock_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Check and advance the durable wall-clock checkpoint. A backwards step beyond the
+    /// configured tolerance is audited and rejected without lowering the checkpoint.
+    pub fn observe_trusted_clock_at(
+        &self,
+        now_unix_ms: i64,
+        maximum_rollback_ms: i64,
+    ) -> Result<(), StoreError> {
+        validate_clock_policy(now_unix_ms, maximum_rollback_ms)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match advance_trusted_clock_in_transaction(&transaction, now_unix_ms, maximum_rollback_ms) {
+            Ok(()) => {}
+            Err(StoreError::ClockRollback) => {
+                append_clock_rollback_audit_once(
+                    &transaction,
+                    AuditEventDraft {
+                        occurred_at_unix_ms: now_unix_ms,
+                        kind: AuditKind::ClockRollbackRejected,
+                        outcome: AuditOutcome::Rejected,
+                        request_id: None,
+                        actor_digest: None,
+                        subject_digest: Some(sha256(b"trusted-clock")),
+                        context_digest: Some(sha256(b"rollback-beyond-policy")),
+                    },
+                )?;
+                transaction.commit()?;
+                return Err(StoreError::ClockRollback);
+            }
+            Err(error) => return Err(error),
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Replace the clock checkpoint only during an explicit owner-local maintenance window.
+    /// Both leases prove that the daemon is stopped and another state mutation is not racing.
+    pub fn acknowledge_trusted_clock(
+        &self,
+        admin_lease: &LifecycleLease,
+        daemon_lease: &LifecycleLease,
+        now_unix_ms: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        if admin_lease.kind() != LeaseKind::AdminMutation
+            || daemon_lease.kind() != LeaseKind::Daemon
+        {
+            return Err(StoreError::InvalidInput(
+                "clock acknowledgement requires admin and daemon leases",
+            ));
+        }
+        validate_clock_policy(now_unix_ms, 0)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<i64> = transaction
+            .query_row(
+                "SELECT high_water_unix_ms FROM trusted_clock_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        transaction.execute(
+            "INSERT INTO trusted_clock_state
+                (singleton, high_water_unix_ms, rollback_rejection_latched)
+             VALUES (1, ?1, 0)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 high_water_unix_ms = excluded.high_water_unix_ms,
+                 rollback_rejection_latched = 0",
+            [now_unix_ms],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: now_unix_ms,
+                kind: AuditKind::ClockRollbackAcknowledged,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: Some(sha256(b"local-owner-confirmed-clock-acknowledgement-v1")),
+                subject_digest: Some(sha256(b"trusted-clock")),
+                context_digest: Some(sha256(&previous.unwrap_or_default().to_be_bytes())),
+            },
+        )?;
+        transaction.commit()?;
+        Ok(previous)
     }
 
     pub fn latest_staged_update(&self) -> Result<Option<UpdateStageRecord>, StoreError> {
@@ -2320,12 +2481,43 @@ impl StateStore {
         reservation: &ReplayReservation,
         now_unix_ms: i64,
     ) -> Result<ReplayOutcome, StoreError> {
+        self.reserve_validated_replay_with_clock_at(reservation, now_unix_ms, 0)
+    }
+
+    pub fn reserve_validated_replay_with_clock_at(
+        &self,
+        reservation: &ReplayReservation,
+        now_unix_ms: i64,
+        maximum_rollback_ms: i64,
+    ) -> Result<ReplayOutcome, StoreError> {
+        validate_clock_policy(now_unix_ms, maximum_rollback_ms)?;
         if reservation.expires_at_unix_ms <= now_unix_ms {
             return Err(StoreError::AuthorizationExpired);
         }
         let fingerprint = reservation.fingerprint()?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        match advance_trusted_clock_in_transaction(&transaction, now_unix_ms, maximum_rollback_ms) {
+            Ok(()) => {}
+            Err(StoreError::ClockRollback) => {
+                append_clock_rollback_audit_once(
+                    &transaction,
+                    AuditEventDraft {
+                        occurred_at_unix_ms: now_unix_ms,
+                        kind: AuditKind::ClockRollbackRejected,
+                        outcome: AuditOutcome::Rejected,
+                        request_id: Some(reservation.request_id),
+                        actor_digest: Some(sha256(reservation.agent_id.as_bytes())),
+                        subject_digest: Some(sha256(reservation.node_id.as_bytes())),
+                        context_digest: Some(sha256(b"rollback-beyond-policy")),
+                    },
+                )?;
+                transaction.commit()?;
+                return Err(StoreError::ClockRollback);
+            }
+            Err(error) => return Err(error),
+        }
 
         // Defense in depth: even a caller that accidentally treats a stale
         // authorization as valid cannot reserve work for a revoked pairing.
@@ -2902,6 +3094,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
              policy_digest BLOB NOT NULL CHECK (length(policy_digest) = 32)
          ) STRICT;
 
+         CREATE TABLE IF NOT EXISTS trusted_clock_state (
+             singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+             high_water_unix_ms INTEGER NOT NULL CHECK (high_water_unix_ms >= 0),
+             rollback_rejection_latched INTEGER NOT NULL DEFAULT 0
+                 CHECK (rollback_rejection_latched IN (0, 1))
+         ) STRICT;
+
          CREATE TABLE IF NOT EXISTS peer_rate_limits (
              peer_id TEXT PRIMARY KEY NOT NULL REFERENCES trusted_peers(peer_id),
              window_started_at_unix_ms INTEGER NOT NULL CHECK (window_started_at_unix_ms >= 0),
@@ -2946,7 +3145,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
              VALUES (1, 0, zeroblob(32))
              ON CONFLICT(singleton) DO NOTHING;
-         PRAGMA user_version = 7;",
+         PRAGMA user_version = 8;",
     )?;
     // Pending ceremonies are authorization-free, short-lived bootstrap state.
     // Schema 5 adds the certificate chain needed to revalidate X.509 at local
@@ -2960,6 +3159,8 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     // policy state, and audit records remain byte-for-byte unchanged.
     // Schema 7 adds offline update staging and a monotonic release-counter
     // high-water mark. No executable content is stored in SQLite.
+    // Schema 8 adds the durable trusted-clock high-water mark. It is initialized
+    // only from a live local observation, never guessed during migration.
     transaction.commit()?;
     Ok(())
 }
@@ -3207,6 +3408,7 @@ fn evaluate_rate_window(
     existing: Option<RateWindow>,
     maximum_per_minute: u32,
     now_unix_ms: i64,
+    maximum_rollback_ms: i64,
 ) -> Result<RateWindowDecision, StoreError> {
     let Some(existing) = existing else {
         return Ok(RateWindowDecision::Admit {
@@ -3217,10 +3419,16 @@ fn evaluate_rate_window(
             remaining: maximum_per_minute - 1,
         });
     };
-    if now_unix_ms < existing.started_at_unix_ms {
+    if now_unix_ms
+        < existing
+            .started_at_unix_ms
+            .saturating_sub(maximum_rollback_ms)
+    {
         return Err(StoreError::ClockRollback);
     }
-    let elapsed = now_unix_ms - existing.started_at_unix_ms;
+    let elapsed = now_unix_ms
+        .saturating_sub(existing.started_at_unix_ms)
+        .max(0);
     if elapsed >= PEER_RATE_WINDOW_MS {
         return Ok(RateWindowDecision::Admit {
             next: RateWindow {
@@ -3246,6 +3454,73 @@ fn evaluate_rate_window(
         },
         remaining: maximum_per_minute - next_count,
     })
+}
+
+fn validate_clock_policy(now_unix_ms: i64, maximum_rollback_ms: i64) -> Result<(), StoreError> {
+    if now_unix_ms < 0 || maximum_rollback_ms < 0 {
+        return Err(StoreError::InvalidInput(
+            "clock values must not predate the Unix epoch",
+        ));
+    }
+    Ok(())
+}
+
+fn advance_trusted_clock_in_transaction(
+    transaction: &Transaction<'_>,
+    now_unix_ms: i64,
+    maximum_rollback_ms: i64,
+) -> Result<(), StoreError> {
+    validate_clock_policy(now_unix_ms, maximum_rollback_ms)?;
+    let high_water: Option<i64> = transaction
+        .query_row(
+            "SELECT high_water_unix_ms FROM trusted_clock_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(high_water) = high_water {
+        let earliest_permitted = high_water.saturating_sub(maximum_rollback_ms);
+        if now_unix_ms < earliest_permitted {
+            return Err(StoreError::ClockRollback);
+        }
+        if now_unix_ms <= high_water {
+            transaction.execute(
+                "UPDATE trusted_clock_state SET rollback_rejection_latched = 0
+                 WHERE singleton = 1 AND rollback_rejection_latched != 0",
+                [],
+            )?;
+            return Ok(());
+        }
+    }
+    transaction.execute(
+        "INSERT INTO trusted_clock_state
+            (singleton, high_water_unix_ms, rollback_rejection_latched)
+         VALUES (1, ?1, 0)
+         ON CONFLICT(singleton) DO UPDATE SET
+             high_water_unix_ms = excluded.high_water_unix_ms,
+             rollback_rejection_latched = 0",
+        [now_unix_ms],
+    )?;
+    Ok(())
+}
+
+fn append_clock_rollback_audit_once(
+    transaction: &Transaction<'_>,
+    draft: AuditEventDraft,
+) -> Result<(), StoreError> {
+    let latched: i64 = transaction.query_row(
+        "SELECT rollback_rejection_latched FROM trusted_clock_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if latched == 0 {
+        append_audit_in_transaction(transaction, draft)?;
+        transaction.execute(
+            "UPDATE trusted_clock_state SET rollback_rejection_latched = 1 WHERE singleton = 1",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_limits(limits: StoreLimits) -> Result<(), StoreError> {
@@ -3647,6 +3922,107 @@ mod tests {
     }
 
     #[test]
+    fn trusted_clock_rollback_is_durable_tolerated_only_within_policy_and_audited()
+    -> Result<(), StoreError> {
+        let (directory, path, store) = test_store()?;
+        store.observe_trusted_clock_at(NOW, 5_000)?;
+        store.observe_trusted_clock_at(NOW - 5_000, 5_000)?;
+        assert_eq!(store.trusted_clock_high_water()?, Some(NOW));
+        assert!(matches!(
+            store.observe_trusted_clock_at(NOW - 5_001, 5_000),
+            Err(StoreError::ClockRollback)
+        ));
+        assert!(matches!(
+            store.observe_trusted_clock_at(NOW - 6_000, 5_000),
+            Err(StoreError::ClockRollback)
+        ));
+        assert_eq!(store.trusted_clock_high_water()?, Some(NOW));
+        assert_eq!(
+            store
+                .audit_events_after(0, 100)?
+                .iter()
+                .filter(|event| event.kind == AuditKind::ClockRollbackRejected)
+                .count(),
+            1
+        );
+
+        drop(store);
+        let reopened = StateStore::open(path)?;
+        assert_eq!(reopened.trusted_clock_high_water()?, Some(NOW));
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let admin_lease = LifecycleLease::acquire(directory.path(), LeaseKind::AdminMutation)
+            .map_err(|_| StoreError::InvalidInput("could not acquire test admin lease"))?;
+        let daemon_lease = LifecycleLease::acquire(directory.path(), LeaseKind::Daemon)
+            .map_err(|_| StoreError::InvalidInput("could not acquire test daemon lease"))?;
+        assert_eq!(
+            reopened.acknowledge_trusted_clock(&admin_lease, &daemon_lease, NOW - 60_000)?,
+            Some(NOW)
+        );
+        assert_eq!(reopened.trusted_clock_high_water()?, Some(NOW - 60_000));
+        assert!(
+            reopened
+                .audit_events_after(0, 100)?
+                .iter()
+                .any(|event| event.kind == AuditKind::ClockRollbackAcknowledged)
+        );
+        reopened.verify_audit_chain()?;
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_admission_uses_the_configured_clock_tolerance() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let (_, peer) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        assert!(matches!(
+            store.admit_remote_request_with_clock_policy_at(&peer.peer_id, 3, 10, NOW, 5_000)?,
+            RemoteRequestAdmission::Admitted { .. }
+        ));
+        assert!(matches!(
+            store.admit_remote_request_with_clock_policy_at(
+                &peer.peer_id,
+                3,
+                10,
+                NOW - 5_000,
+                5_000
+            )?,
+            RemoteRequestAdmission::Admitted { .. }
+        ));
+        assert!(matches!(
+            store.admit_remote_request_with_clock_policy_at(
+                &peer.peer_id,
+                3,
+                10,
+                NOW - 5_001,
+                5_000
+            ),
+            Err(StoreError::ClockRollback)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_reservation_rechecks_trusted_clock_before_consuming_request_id()
+    -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let request = replay(&store, Uuid::new_v4())?;
+        store.observe_trusted_clock_at(NOW + 10_000, 5_000)?;
+        assert!(matches!(
+            store.reserve_validated_replay_with_clock_at(&request, NOW, 5_000),
+            Err(StoreError::ClockRollback)
+        ));
+        assert!(store.replay_outcome(&request)?.is_none());
+        assert!(
+            store
+                .audit_events_after(0, 100)?
+                .iter()
+                .any(|event| event.kind == AuditKind::ClockRollbackRejected
+                    && event.request_id == Some(request.request_id))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn schema_one_store_migrates_to_durable_request_admission() -> Result<(), StoreError> {
         let (_directory, path, store) = test_store()?;
         let (_, peer) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
@@ -3834,6 +4210,35 @@ mod tests {
             migrated.stage_verified_update(&update_record(2, 0x20))?,
             UpdateStageOutcome::Staged(_)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_seven_migration_adds_uninitialized_trusted_clock_without_rewriting_audit()
+    -> Result<(), StoreError> {
+        let (_directory, path, store) = test_store()?;
+        let (_, trusted) = pair_peer(&store, b"0123456789abcdef0123456789abcdef")?;
+        let before = store.verify_audit_chain()?;
+        drop(store);
+
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch(
+            "DROP TABLE trusted_clock_state;
+             PRAGMA user_version = 7;",
+        )?;
+        drop(legacy);
+
+        let migrated = StateStore::open(path)?;
+        assert_eq!(migrated.trusted_clock_high_water()?, None);
+        assert_eq!(migrated.verify_audit_chain()?, before);
+        assert_eq!(
+            migrated
+                .peer_record(&trusted.peer_id)?
+                .map(|peer| peer.pairing_id),
+            Some(trusted.pairing_id)
+        );
+        migrated.observe_trusted_clock_at(NOW, 5_000)?;
+        assert_eq!(migrated.trusted_clock_high_water()?, Some(NOW));
         Ok(())
     }
 
