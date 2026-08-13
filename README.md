@@ -63,6 +63,9 @@ trust.
 - Optional offline update staging uses pinned, role-separated release and owner-approval Ed25519
   keys, a durable monotonic release counter, exact artifact hashing, rollback metadata, private
   no-follow staging, and digest-only decision audit. Staging never installs or executes anything.
+- Optional `ProcessStatus` uses only an owner-defined logical process ID and a fresh signed local
+  snapshot from a separate pinned key. Numeric PIDs, enumeration, commands, environments, paths,
+  user identities, signals, and lifecycle controls are not exposed.
 
 See [Architecture](docs/ARCHITECTURE.md), [Pairing](docs/PAIRING.md),
 [Identity](docs/IDENTITY.md), [Transport](docs/TRANSPORT.md),
@@ -107,11 +110,14 @@ this policy must increment its owner-controlled `policy_version` once before ser
 | `ExecuteApprovedAction` | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
 | `GpuStatus` / `EngineStatus` / `ModelStatus` | Optional, disabled by default | Requires the signed local resource adapter; aggregate or exact logical target only |
 | `AgentGreenHealth` / `ActionBrokerHealth` | Optional, disabled by default | Requires its component-specific signed health adapter; never control or attestation |
-| Process/service/repository status | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
+| `ProcessStatus` | Optional, disabled by default | Requires a signed logical-process snapshot; raw PID targets are always denied |
+| Service/repository status | Unavailable in v0.1 | Reserved schema; configuration rejects advertisement |
 
 The producer format and fail-closed freshness rules are documented in
 [Signed local health snapshots](docs/HEALTH-SNAPSHOTS.md) and
 [Signed local resource snapshots](docs/RESOURCE-SNAPSHOTS.md).
+The logical-process format is documented in
+[Signed local process-status snapshots](docs/PROCESS-STATUS-SNAPSHOTS.md).
 
 ## Offline and updates
 

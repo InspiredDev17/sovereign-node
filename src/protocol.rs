@@ -201,6 +201,11 @@ pub enum ActionTarget {
     },
     AgentGreen,
     ActionBroker,
+    /// Owner-defined logical process identity. Unlike `Process`, this never exposes or accepts a
+    /// host PID, which may be reused and is not a stable authorization target.
+    ManagedProcess {
+        process_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -294,7 +299,7 @@ impl Capability {
             (self, target),
             (Self::SystemInfo | Self::ResourceStatus, ActionTarget::Node)
                 | (Self::FileRead | Self::FileWrite, ActionTarget::File { .. })
-                | (Self::ProcessStatus, ActionTarget::Process { .. })
+                | (Self::ProcessStatus, ActionTarget::ManagedProcess { .. })
                 | (Self::ServiceStatus, ActionTarget::Service { .. })
                 | (
                     Self::ExecuteApprovedAction,
@@ -334,6 +339,9 @@ impl ActionTarget {
                 Err(ValidationError::InvalidValue("process id"))
             }
             Self::Process { .. } | Self::Gpu { index: Some(_) } => Ok(()),
+            Self::ManagedProcess { process_id } => {
+                validate_local_identifier(process_id, "logical process id")
+            }
             Self::Service { service_name } => {
                 validate_required_string(service_name, MAX_ID_BYTES, "service name")
             }
@@ -1517,7 +1525,9 @@ mod tests {
                 root_id: "reports".to_owned(),
                 relative_path: "daily/report.txt".to_owned(),
             },
-            Capability::ProcessStatus => ActionTarget::Process { process_id: 42 },
+            Capability::ProcessStatus => ActionTarget::ManagedProcess {
+                process_id: "model-engine".to_owned(),
+            },
             Capability::ServiceStatus => ActionTarget::Service {
                 service_name: "example.service".to_owned(),
             },
@@ -1647,6 +1657,27 @@ mod tests {
                     || !Capability::SystemInfo.matches_arguments(&argument)
             );
         }
+    }
+
+    #[test]
+    fn logical_process_target_is_strict_and_appended_without_repurposing_pid_target() {
+        let logical = ActionTarget::ManagedProcess {
+            process_id: "model-engine".to_owned(),
+        };
+        assert!(logical.validate().is_ok());
+        assert!(Capability::ProcessStatus.matches_target(&logical));
+        assert!(
+            ActionTarget::ManagedProcess {
+                process_id: "private/path".to_owned(),
+            }
+            .validate()
+            .is_err()
+        );
+        // The legacy target remains decodable for deterministic denial by the executor; it was
+        // not silently reinterpreted as a logical identifier.
+        let legacy = ActionTarget::Process { process_id: 42 };
+        assert!(legacy.validate().is_ok());
+        assert!(!Capability::ProcessStatus.matches_target(&legacy));
     }
 
     #[test]

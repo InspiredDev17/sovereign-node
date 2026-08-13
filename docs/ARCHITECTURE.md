@@ -160,6 +160,12 @@ model measurements may come from the optional component-specific signed local
 resource snapshot contract. An empty GPU or model list means that no verified
 entries are available; it is not proof that the machine has no GPU or models.
 
+ProcessStatus follows a separate role-key and signed-snapshot contract because
+process identity and freshness have different semantics from hardware. Remote
+requests name only an owner-defined `ManagedProcess` identifier. A numeric PID
+is never authorization identity, and the node neither enumerates processes nor
+returns command lines, environments, paths, users, or control handles.
+
 Agent Green remains independent. Its health is `Healthy`, `Degraded`,
 `Unhealthy`, `Unavailable`, or `Unknown` and must come from a configured,
 component-bound signed local health contract. Process presence alone is not

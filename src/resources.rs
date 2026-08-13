@@ -174,7 +174,10 @@ fn valid_detail_code(value: Option<&str>) -> bool {
     })
 }
 
-fn read_bounded_regular_nofollow(path: &Path, maximum_bytes: u64) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_bounded_regular_nofollow(
+    path: &Path,
+    maximum_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
     let descriptor = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
@@ -184,7 +187,7 @@ fn read_bounded_regular_nofollow(path: &Path, maximum_bytes: u64) -> std::io::Re
     let file = File::from(descriptor);
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other(
-            "health snapshot is not a regular file",
+            "local snapshot is not a regular file",
         ));
     }
     let mut bytes = Vec::new();

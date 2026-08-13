@@ -21,7 +21,8 @@ policy_version = 1
 
 [policy]
 # With the matching signed adapters below, the owner may also add `GpuStatus`, `EngineStatus`,
-# `ModelStatus`, `AgentGreenHealth`, or `ActionBrokerHealth`. Every addition is a policy change.
+# `ModelStatus`, `ProcessStatus`, `AgentGreenHealth`, or `ActionBrokerHealth`. Every addition is a
+# policy change.
 enabled_capabilities = ["SystemInfo", "ResourceStatus"]
 max_frame_bytes = 1048576
 max_concurrent_actions = 4
@@ -37,6 +38,15 @@ max_file_read_bytes = 524288
 max_file_write_bytes = 524288
 max_action_output_bytes = 262144
 max_action_runtime_secs = 30
+
+[process_reporting]
+# Optional and disabled by default. Enabling ProcessStatus requires this signed, fresh logical
+# snapshot and a higher policy_version. The payload cannot contain PIDs, commands, paths, users,
+# environments, or process-control instructions.
+# [process_reporting.snapshot]
+# snapshot_path = "/run/sovereign-processes/status.json"
+# public_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# max_age_secs = 30
 
 # Reserved future policy shape. v0.1 rejects advertising FileRead/FileWrite.
 # The root must not contain or be contained by data_dir.

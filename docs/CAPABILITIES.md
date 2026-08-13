@@ -19,15 +19,17 @@ control, or automatic update.
 The hardened v0.1 default manifest permits only `SystemInfo` and
 `ResourceStatus`. When its corresponding component-specific signed local
 adapter is configured, the owner may explicitly add `GpuStatus`,
-`EngineStatus`, `ModelStatus`, `AgentGreenHealth`, or `ActionBrokerHealth` and
-increment `policy_version`. Configuration validation rejects those capabilities
-without their exact adapter and rejects advertising every other capability
-below. In particular, `FileRead`, `FileWrite`, and `ExecuteApprovedAction`
+`EngineStatus`, `ModelStatus`, `ProcessStatus`, `AgentGreenHealth`, or
+`ActionBrokerHealth` and increment `policy_version`. Configuration validation
+rejects those capabilities without their exact adapter and rejects advertising
+every other capability below. In particular, `FileRead`, `FileWrite`, and
+`ExecuteApprovedAction`
 remain unavailable until
 descriptor-relative no-follow access, credential exclusions, atomic writes,
 and a separate OS sandbox/process boundary are implemented and tested.
-Unverifiable GPU, engine, model, Agent Green, and Action Broker measurements
-report `Unknown`/no verified entries rather than inventing state.
+Unverifiable process snapshots fail the specific request; unverifiable GPU,
+engine, model, Agent Green, and Action Broker measurements report `Unknown`/no
+verified entries rather than inventing state.
 
 ## Manifest
 
@@ -137,12 +139,18 @@ byte count, not file content.
 
 ### ProcessStatus
 
-Returns bounded status for locally configured process identifiers or service
-labels. It may report running state, start time, health freshness, and
-privacy-minimized resource use.
+v0.1 optionally returns bounded status for an exact owner-defined logical
+process identifier through the signed local snapshot contract in
+`PROCESS-STATUS-SNAPSHOTS.md`. Enabling it requires a pinned, role-separated
+producer key and fresh no-follow snapshot. The result contains only the logical
+ID, a small state vocabulary, snapshot observation time, and an optional
+sanitized detail code.
 
 It does not enumerate every process, expose command lines or environments,
 attach a debugger, send signals, or start and stop processes.
+The legacy numeric-PID wire target is never executable: PIDs are reusable and
+therefore cannot serve as stable authorization identities. Requests also cannot
+ask for child-process enumeration.
 
 ### ServiceStatus
 

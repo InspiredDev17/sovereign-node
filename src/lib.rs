@@ -6,6 +6,7 @@ pub mod config;
 pub mod identity;
 pub mod lifecycle;
 pub mod pairing;
+pub mod process_status;
 pub mod protocol;
 pub mod resources;
 pub mod runtime;

@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fs;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,19 +12,28 @@ use rcgen::{
 use sovereign_node::authz::{
     AuthorizationEngine, AuthorizationError, AuthorizationOutcome, Clock, TransportPeer,
 };
-use sovereign_node::config::PolicyConfig;
+use sovereign_node::capabilities::CapabilityExecutor;
+use sovereign_node::config::{
+    HealthConfig, NodeConfig, PolicyConfig, ProcessReportingConfig, ProcessSnapshotConfig,
+    ResourceReportingConfig,
+};
 use sovereign_node::identity::{NodeIdentity, key_id};
 use sovereign_node::pairing::{
     CredentialRotationDisplay, CredentialRotationProof, CredentialRotationRequest, PairingDisplay,
     PairingError, PairingKeyMaterialV1, PairingManager, PairingProof, PairingRecoveryDisplay,
     PairingRecoveryProof, PairingRecoveryRequest, PairingRequest, TrustReceiptKind,
 };
-use sovereign_node::protocol::{
-    ActionArguments, ActionErrorCode, ActionRequestV1, ActionTarget, AgentId, AuthorityKind,
-    AuthorizationClaimsV1, AuthorizationId, Capability, NodeId, Nonce, PairingId, PublicKeyBytes,
-    ReplayProtectionV1, RequestId, Sha256Digest, SignatureBytes, SignedActionV1, TaskId,
-    UnixMillis, UserAuthorityV1, ValidationError,
+use sovereign_node::process_status::{
+    ProcessStateV1, ProcessStatusEntryV1, ProcessStatusSnapshotV1, SignedProcessStatusSnapshotV1,
+    process_status_snapshot_signing_bytes,
 };
+use sovereign_node::protocol::{
+    ActionArguments, ActionErrorCode, ActionRequestV1, ActionResultV1, ActionTarget, AgentId,
+    AuthorityKind, AuthorizationClaimsV1, AuthorizationId, Capability, NodeId, Nonce, PairingId,
+    PublicKeyBytes, ReplayProtectionV1, RequestId, Sha256Digest, SignatureBytes, SignedActionV1,
+    TaskId, TrustStatus, UnixMillis, UserAuthorityV1, ValidationError,
+};
+use sovereign_node::resources::{QueueSnapshot, ResourceReporter};
 use sovereign_node::store::{RevocationOutcome, StateStore, StoreError, StoreLimits, sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -78,6 +88,24 @@ impl Harness {
     }
 
     fn with_limits(limits: StoreLimits) -> TestResult<Self> {
+        Self::with_limits_and_capabilities(
+            limits,
+            &[
+                Capability::SystemInfo,
+                Capability::ResourceStatus,
+                Capability::FileRead,
+            ],
+        )
+    }
+
+    fn with_capabilities(capabilities: &[Capability]) -> TestResult<Self> {
+        Self::with_limits_and_capabilities(StoreLimits::default(), capabilities)
+    }
+
+    fn with_limits_and_capabilities(
+        limits: StoreLimits,
+        capabilities: &[Capability],
+    ) -> TestResult<Self> {
         let directory = TempDir::new()?;
         let identity_directory = directory.path().join("identity");
         let database_path = directory.path().join("state.sqlite3");
@@ -92,16 +120,13 @@ impl Harness {
         store.activate_policy(1, TEST_POLICY_DIGEST.0, NOW as i64)?;
         let owner_key = SigningKey::from_bytes(&[0x11; 32]);
         let broker_key = SigningKey::from_bytes(&[0x22; 32]);
-        let (material, client_certificate_chain_der) =
+        let (mut material, client_certificate_chain_der) =
             key_material(&owner_key, &broker_key, ExtendedKeyUsagePurpose::ClientAuth)?;
+        material.allowed_capabilities = capabilities.to_vec();
         let manager = PairingManager::new(
             Arc::clone(&identity),
             Arc::clone(&store),
-            [
-                Capability::SystemInfo,
-                Capability::ResourceStatus,
-                Capability::FileRead,
-            ],
+            capabilities.iter().copied(),
         );
         let display = manager.begin(
             pairing_request(material.clone(), client_certificate_chain_der.clone()),
@@ -714,6 +739,153 @@ fn material_clock_rollback_denies_authorization_without_consuming_request_id() -
     harness.clock.set(NOW + 15_000);
     assert!(matches!(
         engine.verify_and_reserve(retryable, &transport)?,
+        AuthorizationOutcome::Fresh(_)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_status_uses_signed_logical_identity_and_denies_raw_pid() -> TestResult {
+    let harness = Harness::with_capabilities(&[Capability::ProcessStatus])?;
+    let process_key = SigningKey::from_bytes(&[0x44; 32]);
+    let snapshot = ProcessStatusSnapshotV1 {
+        schema_version: 1,
+        observed_at_unix_ms: NOW,
+        valid_until_unix_ms: NOW + 30_000,
+        processes: vec![ProcessStatusEntryV1 {
+            process_id: "model-engine".to_owned(),
+            state: ProcessStateV1::Running,
+            detail_code: Some("ready".to_owned()),
+        }],
+    };
+    let payload = serde_json::to_vec(&snapshot)?;
+    let signature = process_key.sign(&process_status_snapshot_signing_bytes(&payload));
+    let signed_snapshot = SignedProcessStatusSnapshotV1 {
+        payload_hex: hex::encode(payload),
+        signature_hex: hex::encode(signature.to_bytes()),
+    };
+    let snapshot_path = harness._directory.path().join("process-status.json");
+    fs::write(&snapshot_path, serde_json::to_vec(&signed_snapshot)?)?;
+    let policy = PolicyConfig {
+        enabled_capabilities: vec![Capability::ProcessStatus],
+        ..PolicyConfig::default()
+    };
+    let config = Arc::new(NodeConfig {
+        data_dir: harness.identity_directory.clone(),
+        policy_version: 1,
+        listen: None,
+        tls: None,
+        policy,
+        file_roots: Default::default(),
+        approved_actions: Default::default(),
+        health: HealthConfig::default(),
+        resource_reporting: ResourceReportingConfig::default(),
+        process_reporting: ProcessReportingConfig {
+            snapshot: Some(ProcessSnapshotConfig {
+                snapshot_path,
+                public_key_hex: hex::encode(process_key.verifying_key().to_bytes()),
+                max_age_secs: 30,
+            }),
+        },
+        updates: None,
+    });
+    config.validate()?;
+    let executor = CapabilityExecutor::new(
+        Arc::clone(&config),
+        ResourceReporter::new(
+            harness.identity.node_id(),
+            harness.identity.device().clone(),
+        ),
+    );
+    let engine = harness.engine_for(&[Capability::ProcessStatus]);
+    let transport = harness.transport_peer();
+    let logical = signed_action(ActionSpec {
+        request_seed: 175,
+        sequence: 7,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::ManagedProcess {
+            process_id: "model-engine".to_owned(),
+        },
+        arguments: ActionArguments::ProcessStatus {
+            include_children: false,
+        },
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    let verified = match engine.verify_and_reserve(logical, &transport)? {
+        AuthorizationOutcome::Fresh(verified) => verified,
+        AuthorizationOutcome::Duplicate => {
+            return Err("fresh logical process request duplicated".into());
+        }
+    };
+    let result = executor
+        .execute(
+            &verified,
+            UnixMillis(NOW + 10),
+            QueueSnapshot::default(),
+            TrustStatus::Trusted,
+        )
+        .await?;
+    let ActionResultV1::ProcessStatus(status) = result else {
+        return Err("logical process request returned the wrong result type".into());
+    };
+    assert_eq!(status.state, "running");
+    assert_eq!(status.attributes.len(), 2);
+
+    let mut raw_pid = signed_action(ActionSpec {
+        request_seed: 176,
+        sequence: 8,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::ManagedProcess {
+            process_id: "model-engine".to_owned(),
+        },
+        arguments: ActionArguments::ProcessStatus {
+            include_children: false,
+        },
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    raw_pid.request.target = ActionTarget::Process { process_id: 42 };
+    raw_pid.request.authorization.permitted_target_digest = raw_pid.request.target.digest()?;
+    raw_pid = sign_request(raw_pid.request, &harness.owner_key, &harness.broker_key)?;
+    assert!(matches!(
+        engine.verify_and_reserve(raw_pid, &transport),
+        Err(AuthorizationError::CapabilityMismatch)
+    ));
+    // The rejected raw-PID envelope did not consume its replay identity.
+    let corrected = signed_action(ActionSpec {
+        request_seed: 176,
+        sequence: 8,
+        node_id: harness.identity.node_id(),
+        pairing_id: harness.pairing_id,
+        trust_epoch: 1,
+        owner_id: OWNER_ID,
+        target: ActionTarget::ManagedProcess {
+            process_id: "model-engine".to_owned(),
+        },
+        arguments: ActionArguments::ProcessStatus {
+            include_children: false,
+        },
+        issued_at: NOW,
+        not_before: NOW,
+        expires_at: NOW + 60_000,
+        owner_key: &harness.owner_key,
+        broker_key: &harness.broker_key,
+    })?;
+    assert!(matches!(
+        engine.verify_and_reserve(corrected, &transport)?,
         AuthorizationOutcome::Fresh(_)
     ));
     Ok(())

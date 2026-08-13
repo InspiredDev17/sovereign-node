@@ -9,16 +9,16 @@ use std::time::Duration;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use sha2::{Digest, Sha256};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
 use crate::authz::VerifiedAction;
 use crate::config::{ApprovedActionConfig, NodeConfig};
+use crate::process_status::{ProcessStatusError, ProcessStatusReporter};
 use crate::protocol::{
     ActionArguments, ActionErrorCode, ActionResultV1, ActionTarget, ApprovedActionOutcome,
-    ApprovedActionResultV1, EntityStatusV1, FileReadResultV1, FileWriteMode, FileWriteResultV1,
-    GpuResourceV1, InferenceEngineStatusV1, LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
+    ApprovedActionResultV1, FileReadResultV1, FileWriteMode, FileWriteResultV1, GpuResourceV1,
+    InferenceEngineStatusV1, LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
 };
 use crate::resources::{HealthReporter, QueueSnapshot, ResourceReporter, ResourceSnapshotReporter};
 
@@ -59,6 +59,7 @@ pub struct CapabilityExecutor {
     config: Arc<NodeConfig>,
     resources: ResourceReporter,
     external_resources: ResourceSnapshotReporter,
+    process_status: ProcessStatusReporter,
     health: HealthReporter,
 }
 
@@ -67,10 +68,12 @@ impl CapabilityExecutor {
     pub fn new(config: Arc<NodeConfig>, resources: ResourceReporter) -> Self {
         let health = HealthReporter::new(&config.health);
         let external_resources = ResourceSnapshotReporter::new(&config.resource_reporting);
+        let process_status = ProcessStatusReporter::new(config.process_reporting.snapshot.as_ref());
         Self {
             config,
             resources,
             external_resources,
+            process_status,
             health,
         }
     }
@@ -124,12 +127,14 @@ impl CapabilityExecutor {
                     *expected_current_digest,
                 )
                 .map(ActionResultV1::FileWrite),
-            (
-                ActionTarget::Process { process_id },
-                ActionArguments::ProcessStatus { include_children },
-            ) => self
-                .process_status(*process_id, *include_children)
-                .map(ActionResultV1::ProcessStatus),
+            (target, ActionArguments::ProcessStatus { include_children }) => self
+                .process_status
+                .status(now, logical_process_target(target, *include_children)?)
+                .map(ActionResultV1::ProcessStatus)
+                .map_err(|error| match error {
+                    ProcessStatusError::SnapshotUnavailable => CapabilityError::Execution,
+                    ProcessStatusError::TargetNotFound => CapabilityError::TargetNotAllowed,
+                }),
             (
                 ActionTarget::ApprovedAction { action_id },
                 ActionArguments::ExecuteApprovedAction { parameters },
@@ -292,31 +297,6 @@ impl CapabilityExecutor {
             .map_err(|_| CapabilityError::TargetNotAllowed)
     }
 
-    fn process_status(
-        &self,
-        process_id: u32,
-        include_children: bool,
-    ) -> Result<EntityStatusV1, CapabilityError> {
-        if include_children {
-            return Err(CapabilityError::ArgumentMismatch);
-        }
-        let mut system = System::new();
-        let pid = Pid::from_u32(process_id);
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            true,
-            ProcessRefreshKind::nothing(),
-        );
-        let process = system
-            .process(pid)
-            .ok_or(CapabilityError::TargetNotAllowed)?;
-        Ok(EntityStatusV1 {
-            state: format!("{:?}", process.status()),
-            detail: None,
-            attributes: BTreeMap::new(),
-        })
-    }
-
     async fn execute_approved_action(
         &self,
         action_id: &str,
@@ -392,6 +372,20 @@ fn filter_gpu_status(
             .find(|gpu| gpu.index == index)
             .map(|gpu| vec![gpu])
             .ok_or(CapabilityError::TargetNotAllowed),
+    }
+}
+
+fn logical_process_target(
+    target: &ActionTarget,
+    include_children: bool,
+) -> Result<&str, CapabilityError> {
+    if include_children {
+        return Err(CapabilityError::ArgumentMismatch);
+    }
+    match target {
+        ActionTarget::ManagedProcess { process_id } => Ok(process_id),
+        ActionTarget::Process { .. } => Err(CapabilityError::TargetNotAllowed),
+        _ => Err(CapabilityError::ArgumentMismatch),
     }
 }
 
@@ -573,5 +567,21 @@ mod tests {
             filter_model_status(Vec::new(), Some("owner-model")),
             Err(CapabilityError::TargetNotAllowed)
         ));
+    }
+
+    #[test]
+    fn process_status_accepts_only_logical_targets_and_never_raw_pids() {
+        let logical = ActionTarget::ManagedProcess {
+            process_id: "model-engine".to_owned(),
+        };
+        assert_eq!(logical_process_target(&logical, false), Ok("model-engine"));
+        assert_eq!(
+            logical_process_target(&logical, true),
+            Err(CapabilityError::ArgumentMismatch)
+        );
+        assert_eq!(
+            logical_process_target(&ActionTarget::Process { process_id: 42 }, false),
+            Err(CapabilityError::TargetNotAllowed)
+        );
     }
 }

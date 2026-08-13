@@ -39,6 +39,9 @@ pub struct NodeConfig {
     /// Optional signed local accelerator/model measurements. Absence remains Unknown.
     #[serde(default)]
     pub resource_reporting: ResourceReportingConfig,
+    /// Optional signed logical process-status measurements. Raw PIDs are never targets.
+    #[serde(default)]
+    pub process_reporting: ProcessReportingConfig,
     /// Optional pinned offline-update authorities. Absence disables staging.
     #[serde(default)]
     pub updates: Option<UpdateConfig>,
@@ -140,6 +143,22 @@ pub struct ResourceSnapshotConfig {
     pub max_age_secs: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProcessReportingConfig {
+    pub snapshot: Option<ProcessSnapshotConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSnapshotConfig {
+    pub snapshot_path: PathBuf,
+    /// Pinned Ed25519 public key for the local logical process-status producer.
+    pub public_key_hex: String,
+    /// Maximum producer-declared validity window and observation age.
+    pub max_age_secs: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateConfig {
@@ -149,6 +168,29 @@ pub struct UpdateConfig {
     pub owner_approval_public_key_hex: String,
     #[serde(default = "default_max_update_artifact_bytes")]
     pub max_artifact_bytes: u64,
+}
+
+/// Exact pre-ProcessStatus policy serialization. Keep field order stable so a node that leaves
+/// the new optional adapter disabled does not needlessly remap its durable policy digest.
+#[derive(Debug, Serialize)]
+struct PolicyDigestV1<'a> {
+    data_dir: &'a PathBuf,
+    policy_version: u64,
+    listen: Option<SocketAddr>,
+    tls: &'a Option<TlsConfig>,
+    policy: &'a PolicyConfig,
+    file_roots: &'a BTreeMap<String, PathBuf>,
+    approved_actions: &'a BTreeMap<String, ApprovedActionConfig>,
+    health: &'a HealthConfig,
+    resource_reporting: &'a ResourceReportingConfig,
+    updates: &'a Option<UpdateConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyDigestV2<'a> {
+    schema_version: u16,
+    base: PolicyDigestV1<'a>,
+    process_reporting: &'a ProcessReportingConfig,
 }
 
 const fn default_max_update_artifact_bytes() -> u64 {
@@ -167,8 +209,28 @@ pub enum ConfigError {
 
 impl NodeConfig {
     pub fn policy_digest(&self) -> Result<[u8; 32], ConfigError> {
-        let encoded = postcard::to_allocvec(self)
-            .map_err(|_| ConfigError::Invalid("configuration cannot be encoded".to_owned()))?;
+        let base = PolicyDigestV1 {
+            data_dir: &self.data_dir,
+            policy_version: self.policy_version,
+            listen: self.listen,
+            tls: &self.tls,
+            policy: &self.policy,
+            file_roots: &self.file_roots,
+            approved_actions: &self.approved_actions,
+            health: &self.health,
+            resource_reporting: &self.resource_reporting,
+            updates: &self.updates,
+        };
+        let encoded = if self.process_reporting.snapshot.is_none() {
+            postcard::to_allocvec(&base)
+        } else {
+            postcard::to_allocvec(&PolicyDigestV2 {
+                schema_version: 2,
+                base,
+                process_reporting: &self.process_reporting,
+            })
+        }
+        .map_err(|_| ConfigError::Invalid("configuration cannot be encoded".to_owned()))?;
         Ok(Sha256::digest(encoded).into())
     }
 
@@ -216,6 +278,7 @@ impl NodeConfig {
                 Capability::SystemInfo | Capability::ResourceStatus => {}
                 Capability::GpuStatus | Capability::EngineStatus | Capability::ModelStatus
                     if self.resource_reporting.snapshot.is_some() => {}
+                Capability::ProcessStatus if self.process_reporting.snapshot.is_some() => {}
                 Capability::AgentGreenHealth if self.health.agent_green.is_some() => {}
                 Capability::ActionBrokerHealth if self.health.action_broker.is_some() => {}
                 _ => {
@@ -288,6 +351,12 @@ impl NodeConfig {
             .as_ref()
             .map(|adapter| validate_resource_adapter("resource_reporting.snapshot", adapter))
             .transpose()?;
+        let process_snapshot_key = self
+            .process_reporting
+            .snapshot
+            .as_ref()
+            .map(|adapter| validate_process_adapter("process_reporting.snapshot", adapter))
+            .transpose()?;
         if agent_green_health_key.is_some() && agent_green_health_key == action_broker_health_key {
             return Err(ConfigError::Invalid(
                 "Agent Green and Action Broker health keys must be role-separated".to_owned(),
@@ -310,6 +379,15 @@ impl NodeConfig {
                     .to_owned(),
             ));
         }
+        if process_snapshot_key.is_some()
+            && (process_snapshot_key == agent_green_health_key
+                || process_snapshot_key == action_broker_health_key
+                || process_snapshot_key == resource_snapshot_key)
+        {
+            return Err(ConfigError::Invalid(
+                "process, resource, and health snapshot keys must be role-separated".to_owned(),
+            ));
+        }
         if let Some(resource) = &self.resource_reporting.snapshot
             && [
                 self.health.agent_green.as_ref(),
@@ -321,6 +399,29 @@ impl NodeConfig {
         {
             return Err(ConfigError::Invalid(
                 "resource and health snapshots must use separate paths".to_owned(),
+            ));
+        }
+        if let Some(process) = &self.process_reporting.snapshot
+            && [
+                self.health
+                    .agent_green
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.health
+                    .action_broker
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+                self.resource_reporting
+                    .snapshot
+                    .as_ref()
+                    .map(|value| &value.snapshot_path),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|snapshot_path| snapshot_path == &process.snapshot_path)
+        {
+            return Err(ConfigError::Invalid(
+                "process snapshot must use a separate path".to_owned(),
             ));
         }
         if let Some(updates) = &self.updates {
@@ -346,6 +447,7 @@ impl NodeConfig {
                 agent_green_health_key.as_ref(),
                 action_broker_health_key.as_ref(),
                 resource_snapshot_key.as_ref(),
+                process_snapshot_key.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -438,6 +540,14 @@ impl NodeConfig {
                     "file root {root_id} overlaps resource snapshot material"
                 )));
             }
+            if let Some(process) = &self.process_reporting.snapshot
+                && process.snapshot_path.exists()
+                && path_contains_or_is_contained(root, &process.snapshot_path)?
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "file root {root_id} overlaps process snapshot material"
+                )));
+            }
         }
 
         for (action_id, action) in &self.approved_actions {
@@ -528,6 +638,19 @@ fn validate_health_adapter(
 fn validate_resource_adapter(
     name: &str,
     adapter: &ResourceSnapshotConfig,
+) -> Result<VerifyingKey, ConfigError> {
+    require_absolute(&format!("{name}.snapshot_path"), &adapter.snapshot_path)?;
+    if adapter.max_age_secs == 0 || adapter.max_age_secs > 86_400 {
+        return Err(ConfigError::Invalid(format!(
+            "{name}.max_age_secs must be between 1 and 86400"
+        )));
+    }
+    parse_ed25519_key(&format!("{name}.public_key_hex"), &adapter.public_key_hex)
+}
+
+fn validate_process_adapter(
+    name: &str,
+    adapter: &ProcessSnapshotConfig,
 ) -> Result<VerifyingKey, ConfigError> {
     require_absolute(&format!("{name}.snapshot_path"), &adapter.snapshot_path)?;
     if adapter.max_age_secs == 0 || adapter.max_age_secs > 86_400 {
@@ -631,6 +754,7 @@ mod tests {
             approved_actions: BTreeMap::new(),
             health: HealthConfig::default(),
             resource_reporting: ResourceReportingConfig::default(),
+            process_reporting: ProcessReportingConfig::default(),
             updates: None,
         }
     }
@@ -850,5 +974,55 @@ mod tests {
             .enabled_capabilities
             .push(Capability::ActionBrokerHealth);
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn process_status_requires_a_role_separated_signed_snapshot() {
+        let process_key = SigningKey::from_bytes(&[0x68; 32]);
+        let health_key = SigningKey::from_bytes(&[0x69; 32]);
+        let mut config = minimal_config();
+        config
+            .policy
+            .enabled_capabilities
+            .push(Capability::ProcessStatus);
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        config.process_reporting.snapshot = Some(ProcessSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/sovereign-processes/status.json"),
+            public_key_hex: hex::encode(process_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        assert!(config.validate().is_ok());
+
+        config.health.agent_green = Some(HealthSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/agentgreen/health.json"),
+            public_key_hex: hex::encode(health_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        assert!(config.validate().is_ok());
+        if let Some(process) = &mut config.process_reporting.snapshot {
+            process.public_key_hex = hex::encode(health_key.verifying_key().to_bytes());
+        }
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn optional_process_adapter_uses_a_versioned_policy_digest() {
+        let process_key = SigningKey::from_bytes(&[0x6a; 32]);
+        let mut config = minimal_config();
+        let original = config.policy_digest().unwrap_or([0_u8; 32]);
+        config.process_reporting.snapshot = Some(ProcessSnapshotConfig {
+            snapshot_path: PathBuf::from("/run/sovereign-processes/status.json"),
+            public_key_hex: hex::encode(process_key.verifying_key().to_bytes()),
+            max_age_secs: 30,
+        });
+        let enabled = config.policy_digest().unwrap_or([0_u8; 32]);
+        assert_ne!(enabled, original);
+        if let Some(snapshot) = &mut config.process_reporting.snapshot {
+            snapshot.max_age_secs = 31;
+        }
+        assert_ne!(config.policy_digest().unwrap_or([0_u8; 32]), enabled);
+        config.process_reporting = ProcessReportingConfig::default();
+        assert_eq!(config.policy_digest().unwrap_or([0_u8; 32]), original);
     }
 }

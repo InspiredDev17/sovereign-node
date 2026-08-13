@@ -91,6 +91,7 @@ operation fails closed.
 | General command injection | No shell exists; approved actions use a fixed executable and typed arguments without shell parsing |
 | Arbitrary code upload | No upload-and-execute capability exists; file writes cannot create executable authority |
 | Credential theft through status or logs | Reports and audit are schema-limited and redacted; security stores are excluded from file capabilities |
+| PID reuse or process reconnaissance | ProcessStatus accepts only signed owner-defined logical IDs; numeric PIDs, enumeration, commands, paths, users, environments, and controls are denied |
 | Resource-exhaustion attack | Bounded frames, atomic durable per-peer and global admission, queues, concurrency, time, output, and backpressure cause rejection without security bypass |
 | Disconnect ambiguity | Durable execution state returns recorded or Indeterminate outcome and never silently retries |
 | Version downgrade | Locally allowed versions and versions bound into signatures reject unsupported or downgraded semantics |
@@ -188,6 +189,10 @@ rejection audit, restart durability, and schema migration. Installation and
 post-install health verification remain owner-operated and are not claimed by
 these tests. The suite also verifies singleton/admin lease separation and
 daemon-lease-only crash reconciliation to `Indeterminate` without retry.
+ProcessStatus tests cover exact signed logical targeting, role separation,
+freshness, forgery, duplicate IDs, unknown targets, symlink denial, bounded
+privacy output, child-enumeration denial, and raw-PID rejection before replay
+reservation.
 
 Tests use isolated temporary state and deterministic clocks where appropriate.
 They assert that denied requests produce no capability side effect.
