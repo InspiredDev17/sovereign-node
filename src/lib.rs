@@ -17,6 +17,7 @@ pub mod service_status;
 pub mod store;
 pub mod transport;
 pub mod update;
+pub mod workload;
 
 #[doc(hidden)]
 #[must_use]
