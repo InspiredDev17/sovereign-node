@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,6 +13,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
 use crate::authz::TransportPeer;
@@ -31,6 +33,7 @@ const MAX_CONCURRENT_HANDSHAKES: usize = 32;
 const MAX_AUTHENTICATED_SESSIONS: usize = 256;
 const MAX_SESSIONS_PER_PEER: usize = 8;
 const MAX_SESSIONS_PER_LEAF: usize = 4;
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -162,6 +165,21 @@ pub async fn serve(
     store: Arc<StateStore>,
     runtime: Arc<NodeRuntime>,
 ) -> Result<(), TransportError> {
+    serve_until_shutdown(config, store, runtime, std::future::pending()).await
+}
+
+/// Serve until the lifecycle owner requests shutdown. New handshakes stop
+/// immediately, idle sessions are notified, and already-dispatched bounded
+/// actions receive a grace period to reach their durable terminal state.
+pub async fn serve_until_shutdown<F>(
+    config: Arc<NodeConfig>,
+    store: Arc<StateStore>,
+    runtime: Arc<NodeRuntime>,
+    shutdown: F,
+) -> Result<(), TransportError>
+where
+    F: Future<Output = Result<(), std::io::Error>>,
+{
     let address = config.listen.ok_or(TransportError::Disabled)?;
     let server_identity = Arc::new(load_server_identity(&config)?);
     let initial_trust = build_transport_trust(&server_identity, &store)?.ok_or_else(|| {
@@ -170,13 +188,29 @@ pub async fn serve(
         )
     })?;
     let (trust_sender, trust_receiver) = watch::channel(Some(Arc::new(initial_trust)));
-    spawn_trust_reloader(server_identity, store.clone(), trust_sender);
+    let trust_task = spawn_trust_reloader(server_identity, store.clone(), trust_sender.clone());
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let listener = TcpListener::bind(address).await?;
     let handshakes = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     let sessions = Arc::new(SessionAdmission::default());
+    let mut connections = JoinSet::new();
+    tokio::pin!(shutdown);
 
-    loop {
-        let (stream, _) = listener.accept().await?;
+    let serve_result = loop {
+        let accepted = tokio::select! {
+            result = &mut shutdown => break result,
+            accepted = listener.accept() => match accepted {
+                Ok(value) => Some(value),
+                Err(error) => break Err(error),
+            },
+            completed = connections.join_next(), if !connections.is_empty() => {
+                let _ = completed;
+                None
+            }
+        };
+        let Some((stream, _)) = accepted else {
+            continue;
+        };
         let Some(trust) = trust_receiver.borrow().clone() else {
             continue;
         };
@@ -188,6 +222,7 @@ pub async fn serve(
         let store = store.clone();
         let session_admission = sessions.clone();
         let session_trust = trust_receiver.clone();
+        let session_shutdown = shutdown_receiver.clone();
         let request_policy = TransportRequestPolicy {
             max_frame: config.policy.max_frame_bytes.min(MAX_WIRE_MESSAGE_BYTES),
             peer_maximum_per_minute: config.policy.max_requests_per_peer_per_minute,
@@ -198,7 +233,7 @@ pub async fn serve(
                 })?
                 .saturating_mul(1_000),
         };
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
             let Ok(Ok(tls_stream)) = accepted else {
                 return;
@@ -219,11 +254,28 @@ pub async fn serve(
                 runtime,
                 store,
                 session_trust,
+                session_shutdown,
                 request_policy,
             )
             .await;
         });
+    };
+
+    drop(listener);
+    trust_task.abort();
+    let _ = trust_task.await;
+    shutdown_sender.send_replace(true);
+    let drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     }
+    trust_sender.send_replace(None);
+    serve_result?;
+    Ok(())
 }
 
 async fn serve_connection(
@@ -232,22 +284,30 @@ async fn serve_connection(
     runtime: Arc<NodeRuntime>,
     store: Arc<StateStore>,
     trust: watch::Receiver<Option<Arc<TransportTrust>>>,
+    mut shutdown: watch::Receiver<bool>,
     request_policy: TransportRequestPolicy,
 ) -> Result<(), TransportError> {
     let mut first_frame = true;
     loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let timeout = if first_frame {
             FIRST_FRAME_TIMEOUT
         } else {
             IDLE_SESSION_TIMEOUT
         };
-        let Some(frame) = tokio::time::timeout(
-            timeout,
-            read_frame_with_trust(&mut stream, &trust, &session, request_policy.max_frame),
-        )
-        .await
-        .map_err(|_| TransportError::Frame)??
-        else {
+        let frame = tokio::select! {
+            changed = shutdown.changed() => {
+                changed.map_err(|_| TransportError::SessionTrustChanged)?;
+                return Ok(());
+            }
+            frame = tokio::time::timeout(
+                timeout,
+                read_frame_with_trust(&mut stream, &trust, &session, request_policy.max_frame),
+            ) => frame.map_err(|_| TransportError::Frame)??,
+        };
+        let Some(frame) = frame else {
             return Ok(());
         };
         first_frame = false;
@@ -301,7 +361,9 @@ async fn serve_connection(
         let peer_for_action = session.peer.clone();
         let mut action_task =
             tokio::spawn(async move { runtime_for_action.handle(action, &peer_for_action).await });
-        let response = wait_for_action_or_trust_change(&mut action_task, &trust, &session).await?;
+        let response =
+            wait_for_action_or_trust_change(&mut action_task, &trust, &session, &mut shutdown)
+                .await?;
         write_signed_response(
             &mut stream,
             &trust,
@@ -421,6 +483,7 @@ async fn wait_for_action_or_trust_change(
     task: &mut tokio::task::JoinHandle<Result<SignedActionResponseV1, RuntimeError>>,
     trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
     session: &TransportSession,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<SignedActionResponseV1, TransportError> {
     ensure_session_current(trust, session)?;
     let mut changes = trust.clone();
@@ -432,6 +495,14 @@ async fn wait_for_action_or_trust_change(
             changed = changes.changed() => {
                 changed.map_err(|_| TransportError::SessionTrustChanged)?;
                 ensure_session_current(&changes, session)?;
+            },
+            changed = shutdown.changed() => {
+                changed.map_err(|_| TransportError::RuntimeTask)?;
+                if *shutdown.borrow() {
+                    return task.await
+                        .map_err(|_| TransportError::RuntimeTask)?
+                        .map_err(Into::into);
+                }
             },
         }
     }
@@ -503,7 +574,7 @@ fn spawn_trust_reloader(
     server_identity: Arc<ServerIdentity>,
     store: Arc<StateStore>,
     sender: watch::Sender<Option<Arc<TransportTrust>>>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(TRUST_REFRESH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -532,7 +603,7 @@ fn spawn_trust_reloader(
                 .map(Arc::new);
             sender.send_replace(refreshed);
         }
-    });
+    })
 }
 
 fn load_server_identity(config: &NodeConfig) -> Result<ServerIdentity, TransportError> {
@@ -1082,8 +1153,18 @@ mod tests {
         let session = authenticated_session(&tls, &trust.session_by_leaf)
             .ok_or(TransportError::UnpairedClient)?;
         let (_sender, receiver) = watch::channel(Some(trust));
+        let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
         ensure_session_current(&receiver, &session)?;
-        serve_connection(tls, session, runtime, store, receiver, request_policy).await
+        serve_connection(
+            tls,
+            session,
+            runtime,
+            store,
+            receiver,
+            shutdown_receiver,
+            request_policy,
+        )
+        .await
     }
 
     async fn connect_test_client(
@@ -1212,7 +1293,7 @@ mod tests {
         let initial = build_transport_trust(&identity, &store)?
             .ok_or_else(|| std::io::Error::other("initial trust missing"))?;
         let (sender, mut receiver) = watch::channel(Some(Arc::new(initial)));
-        spawn_trust_reloader(identity, store.clone(), sender);
+        let _reloader = spawn_trust_reloader(identity, store.clone(), sender);
 
         let second = pair_transport_peer(&store, &pki, "peer-02", &pki.unpaired_client, 2)?;
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1612,7 +1693,8 @@ mod tests {
         let address = listener.local_addr()?;
         let acceptor = TlsAcceptor::from(old_trust.tls.clone());
         let (trust_sender, trust_receiver) = watch::channel(Some(old_trust.clone()));
-        spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
+        let _reloader =
+            spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
         let server_trust = trust_receiver.clone();
         let (session_ready, session_established) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -1724,7 +1806,8 @@ mod tests {
         let address = listener.local_addr()?;
         let acceptor = TlsAcceptor::from(trust.tls.clone());
         let (trust_sender, trust_receiver) = watch::channel(Some(trust.clone()));
-        spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
+        let _reloader =
+            spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
         let server_trust = trust_receiver.clone();
         let (session_ready, session_established) = tokio::sync::oneshot::channel();
         let established_server = tokio::spawn(async move {
@@ -1822,7 +1905,8 @@ mod tests {
         let address = listener.local_addr()?;
         let acceptor = TlsAcceptor::from(trust.tls.clone());
         let (trust_sender, trust_receiver) = watch::channel(Some(trust.clone()));
-        spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
+        let _reloader =
+            spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
         let server_trust = trust_receiver.clone();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.map_err(TransportError::Io)?;

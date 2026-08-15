@@ -109,6 +109,17 @@ async fn compiled_binary_tls_pair_action_duplicate_revoke_and_restart() -> TestR
     assert_eq!(duplicate.response.status, ActionStatus::Duplicate);
     stream.shutdown().await?;
 
+    let mut shutdown_connection = connect_with_retry(&client, &address, &mut daemon).await?;
+    stop_daemon(&mut daemon)?;
+    let mut closed = [0_u8; 1];
+    let shutdown_read = tokio::time::timeout(
+        Duration::from_secs(2),
+        shutdown_connection.read(&mut closed),
+    )
+    .await?;
+    assert!(matches!(shutdown_read, Ok(0) | Err(_)));
+
+    let mut daemon = spawn_daemon(&configuration)?;
     let mut pre_revocation = connect_with_retry(&client, &address, &mut daemon).await?;
     let revoked = run(&[
         "pair",

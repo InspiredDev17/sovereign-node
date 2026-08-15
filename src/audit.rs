@@ -533,7 +533,7 @@ fn seal_eligible_audit_segment_inner(
     eligible_before_unix_ms: i64,
     maximum_events: u32,
     created_at: UnixMillis,
-    injected_fault_after: Option<&'static str>,
+    injected_fault_at: Option<&'static str>,
 ) -> Result<Option<AuditArchiveResult>, AuditExportError> {
     ensure_private_directory(archive_root)?;
     let created_at_i64 = i64::try_from(created_at.0)
@@ -543,7 +543,7 @@ fn seal_eligible_audit_segment_inner(
     else {
         return Ok(None);
     };
-    if injected_fault_after == Some("pending-state") {
+    if injected_fault_at == Some("pending-state") {
         return Err(AuditExportError::InjectedFault("pending-state"));
     }
     let segment = AuditSegmentV1 {
@@ -586,15 +586,24 @@ fn seal_eligible_audit_segment_inner(
                 ));
             }
         } else {
+            if injected_fault_at == Some("temporary-write-failure") {
+                return Err(AuditExportError::InjectedFault("temporary-write-failure"));
+            }
             create_private_file(&temporary_path, &encoded)?;
         }
-        if injected_fault_after == Some("temporary-write") {
+        if injected_fault_at == Some("temporary-write") {
             return Err(AuditExportError::InjectedFault("temporary-write"));
         }
         verify_audit_segment_file(&temporary_path)?;
+        if injected_fault_at == Some("rename-failure") {
+            return Err(AuditExportError::InjectedFault("rename-failure"));
+        }
         fs::rename(&temporary_path, &final_path)?;
+        if injected_fault_at == Some("directory-sync-failure") {
+            return Err(AuditExportError::InjectedFault("directory-sync-failure"));
+        }
         File::open(archive_root)?.sync_all()?;
-        if injected_fault_after == Some("rename") {
+        if injected_fault_at == Some("rename") {
             return Err(AuditExportError::InjectedFault("rename"));
         }
     }
@@ -610,7 +619,7 @@ fn seal_eligible_audit_segment_inner(
         segment_digest.0,
         &relative_name,
     )?;
-    if injected_fault_after == Some("database-commit") {
+    if injected_fault_at == Some("database-commit") {
         return Err(AuditExportError::InjectedFault("database-commit"));
     }
     let (archived_events, retired_replays) =
@@ -1121,7 +1130,10 @@ mod tests {
     fn archive_restart_reconciliation_finishes_every_durable_boundary() -> TestResult {
         for fault in [
             "pending-state",
+            "temporary-write-failure",
             "temporary-write",
+            "rename-failure",
+            "directory-sync-failure",
             "rename",
             "database-commit",
         ] {

@@ -1155,16 +1155,14 @@ async fn serve(config_path: &Path) -> Result<()> {
         },
         daemon_lease.clone(),
     ));
-    tokio::select! {
-        result = sovereign_node::transport::serve(config, store, runtime) => {
-            result?;
-            Ok(())
-        }
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            Ok(())
-        }
-    }
+    sovereign_node::transport::serve_until_shutdown(
+        config,
+        store,
+        runtime,
+        tokio::signal::ctrl_c(),
+    )
+    .await?;
+    Ok(())
 }
 
 fn pairing_context(

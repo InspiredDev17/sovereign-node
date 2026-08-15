@@ -8,6 +8,14 @@ invoke a real service, and does not persist workload reservations. It must not
 be described as production workload execution. Canonical types and fixtures in
 Sovereign-AI-Contracts are the next external dependency.
 
+Sovereign-AI-Contracts currently publishes cognitive-execution and inference
+runtime v3 shapes, but not one Node-targeted authenticated admission envelope
+that also binds NodeId, enrollment/trust epoch, sealed classification and
+locality, node policy, Agent Green restriction evidence, and control-plane
+authorization. Its Rust bindings are also not a published registry crate.
+Sovereign Node therefore does not persist or expose the transitional local
+envelope as if it were that missing canonical contract.
+
 Implemented in the module:
 
 - deterministic, domain-separated Ed25519 `WorkloadIntentV1` signing;

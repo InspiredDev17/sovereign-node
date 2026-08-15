@@ -50,6 +50,14 @@ metadata/checkpoint; then prune in a separate transaction. Restart resumes the
 same immutable candidate after interruption at any boundary. Pruning never
 precedes durable segment verification.
 
+Deterministic fault injection covers refusal before the temporary write,
+failure before rename, failure at the post-rename directory-sync boundary, and
+interruptions after the pending record, temporary publication, durable rename,
+and database commit. Each case reopens the original database and completes the
+same candidate without duplicate segments or unsafe pruning. These are modeled
+faults; an operated filesystem-exhaustion campaign remains separate production
+qualification evidence.
+
 Only a contiguous prefix is eligible. Any nonterminal replay stops selection.
 A terminal replay is retained until its signed validity has expired plus the
 configured action-TTL, clock-rollback and safety margin represented by the

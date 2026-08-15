@@ -263,6 +263,16 @@ Session permits are RAII-owned and return after handshake failure, disconnect,
 timeout, or shutdown. These are conservative compile-time v0.1 limits rather
 than values derived from the application queue.
 
+The daemon owns every handshake and authenticated-session task in one bounded
+task set. On SIGINT it closes the listener, stops the trust watcher, notifies
+idle sessions, and gives an already-dispatched bounded action up to 35 seconds
+to reach its durable terminal state and finish its response. After that fixed
+grace period, remaining session tasks are aborted and the process exits; an
+unknown or incomplete action remains governed by durable replay/restart
+reconciliation and is never automatically retried. A compiled-binary test
+holds an authenticated idle session open during shutdown, observes closure,
+restarts the daemon, and then proves revocation still persists.
+
 When either v0.1 request limit is reached, the connection is closed before
 action authorization or replay reservation. Reconnecting remains limited for
 the current window. The two counters advance atomically only when both admit,
