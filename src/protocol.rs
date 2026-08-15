@@ -108,7 +108,7 @@ uuid_id!(AuthorizationId);
 #[serde(transparent)]
 pub struct UnixMillis(pub u64);
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Sha256Digest(pub [u8; 32]);
 
@@ -690,6 +690,7 @@ pub enum ActionErrorCode {
     LocalExecutionFailed,
     Internal,
     ClockRollback,
+    StoragePressure,
 }
 
 impl ActionRequestV1 {

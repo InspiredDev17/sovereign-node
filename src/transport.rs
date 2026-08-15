@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustls::server::WebPkiClientVerifier;
@@ -25,6 +25,12 @@ use crate::store::{RemoteRequestAdmission, RequestLimitScope, StateStore, StoreE
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 const TRUST_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_CONCURRENT_HANDSHAKES: usize = 32;
+const MAX_AUTHENTICATED_SESSIONS: usize = 256;
+const MAX_SESSIONS_PER_PEER: usize = 8;
+const MAX_SESSIONS_PER_LEAF: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -69,6 +75,74 @@ struct TransportSession {
     peer: TransportPeer,
 }
 
+#[derive(Debug, Default)]
+struct SessionCounts {
+    total: usize,
+    by_peer: HashMap<String, usize>,
+    by_leaf: HashMap<[u8; 32], usize>,
+}
+
+#[derive(Debug, Default)]
+struct SessionAdmission {
+    counts: Mutex<SessionCounts>,
+}
+
+#[derive(Debug)]
+struct SessionPermit {
+    admission: Arc<SessionAdmission>,
+    peer_id: String,
+    leaf: [u8; 32],
+}
+
+impl SessionAdmission {
+    fn try_admit(self: &Arc<Self>, session: &TransportSession) -> Option<SessionPermit> {
+        let mut counts = self.counts.lock().ok()?;
+        let peer_count = counts
+            .by_peer
+            .get(&session.peer.peer_id)
+            .copied()
+            .unwrap_or(0);
+        let leaf = session.peer.certificate_sha256.0;
+        let leaf_count = counts.by_leaf.get(&leaf).copied().unwrap_or(0);
+        if counts.total >= MAX_AUTHENTICATED_SESSIONS
+            || peer_count >= MAX_SESSIONS_PER_PEER
+            || leaf_count >= MAX_SESSIONS_PER_LEAF
+        {
+            return None;
+        }
+        counts.total += 1;
+        counts
+            .by_peer
+            .insert(session.peer.peer_id.clone(), peer_count + 1);
+        counts.by_leaf.insert(leaf, leaf_count + 1);
+        Some(SessionPermit {
+            admission: Arc::clone(self),
+            peer_id: session.peer.peer_id.clone(),
+            leaf,
+        })
+    }
+}
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.admission.counts.lock() else {
+            return;
+        };
+        counts.total = counts.total.saturating_sub(1);
+        decrement_count(&mut counts.by_peer, &self.peer_id);
+        decrement_count(&mut counts.by_leaf, &self.leaf);
+    }
+}
+
+fn decrement_count<K: Eq + std::hash::Hash + Clone>(counts: &mut HashMap<K, usize>, key: &K) {
+    if let Some(value) = counts.get_mut(key) {
+        *value = value.saturating_sub(1);
+        if *value == 0 {
+            counts.remove(key);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ServerIdentity {
     certificate_chain: Vec<CertificateDer<'static>>,
@@ -98,24 +172,22 @@ pub async fn serve(
     let (trust_sender, trust_receiver) = watch::channel(Some(Arc::new(initial_trust)));
     spawn_trust_reloader(server_identity, store.clone(), trust_sender);
     let listener = TcpListener::bind(address).await?;
-    let max_connections = config
-        .policy
-        .queue_capacity
-        .saturating_mul(2)
-        .clamp(1, 8_192);
-    let connections = Arc::new(Semaphore::new(max_connections));
+    let handshakes = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+    let sessions = Arc::new(SessionAdmission::default());
 
     loop {
         let (stream, _) = listener.accept().await?;
         let Some(trust) = trust_receiver.borrow().clone() else {
             continue;
         };
-        let Ok(permit) = connections.clone().try_acquire_owned() else {
+        let Ok(handshake_permit) = handshakes.clone().try_acquire_owned() else {
             continue;
         };
         let acceptor = TlsAcceptor::from(trust.tls.clone());
         let runtime = runtime.clone();
         let store = store.clone();
+        let session_admission = sessions.clone();
+        let session_trust = trust_receiver.clone();
         let request_policy = TransportRequestPolicy {
             max_frame: config.policy.max_frame_bytes.min(MAX_WIRE_MESSAGE_BYTES),
             peer_maximum_per_minute: config.policy.max_requests_per_peer_per_minute,
@@ -127,18 +199,29 @@ pub async fn serve(
                 .saturating_mul(1_000),
         };
         tokio::spawn(async move {
-            let _permit = permit;
             let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
             let Ok(Ok(tls_stream)) = accepted else {
                 return;
             };
+            drop(handshake_permit);
             let Some(session) = authenticated_session(&tls_stream, &trust.session_by_leaf) else {
                 return;
             };
-            if !session_is_current(&store, &session).unwrap_or(false) {
+            if !session_is_current(&session_trust, &session) {
                 return;
             }
-            let _ = serve_connection(tls_stream, session, runtime, store, request_policy).await;
+            let Some(_session_permit) = session_admission.try_admit(&session) else {
+                return;
+            };
+            let _ = serve_connection(
+                tls_stream,
+                session,
+                runtime,
+                store,
+                session_trust,
+                request_policy,
+            )
+            .await;
         });
     }
 }
@@ -148,34 +231,64 @@ async fn serve_connection(
     session: TransportSession,
     runtime: Arc<NodeRuntime>,
     store: Arc<StateStore>,
+    trust: watch::Receiver<Option<Arc<TransportTrust>>>,
     request_policy: TransportRequestPolicy,
 ) -> Result<(), TransportError> {
+    let mut first_frame = true;
     loop {
+        let timeout = if first_frame {
+            FIRST_FRAME_TIMEOUT
+        } else {
+            IDLE_SESSION_TIMEOUT
+        };
         let Some(frame) = tokio::time::timeout(
-            FRAME_TIMEOUT,
-            read_frame_with_trust(&mut stream, &store, &session, request_policy.max_frame),
+            timeout,
+            read_frame_with_trust(&mut stream, &trust, &session, request_policy.max_frame),
         )
         .await
         .map_err(|_| TransportError::Frame)??
         else {
             return Ok(());
         };
-        let (action, remainder): (SignedActionV1, &[u8]) =
-            postcard::take_from_bytes(&frame).map_err(|_| TransportError::Frame)?;
-        if !remainder.is_empty() {
-            return Err(TransportError::Frame);
+        first_frame = false;
+        let action = decode_action_frame(&frame, request_policy.max_frame)?;
+        if let Some(response) = runtime.storage_pressure_response(&action)? {
+            write_signed_response(
+                &mut stream,
+                &trust,
+                &session,
+                request_policy.max_frame,
+                &response,
+            )
+            .await?;
+            continue;
         }
         match store.admit_remote_request_with_clock_policy(
             &session.peer.peer_id,
             request_policy.peer_maximum_per_minute,
             request_policy.global_maximum_per_minute,
             request_policy.maximum_clock_rollback_ms,
-        )? {
-            RemoteRequestAdmission::Admitted { .. } => {}
-            RemoteRequestAdmission::Limited {
+        ) {
+            Err(StoreError::StoragePressure) => {
+                let Some(response) = runtime.storage_pressure_response(&action)? else {
+                    return Err(StoreError::StoragePressure.into());
+                };
+                write_signed_response(
+                    &mut stream,
+                    &trust,
+                    &session,
+                    request_policy.max_frame,
+                    &response,
+                )
+                .await?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+            Ok(RemoteRequestAdmission::Admitted { .. }) => {}
+            Ok(RemoteRequestAdmission::Limited {
                 scope,
                 retry_after_ms,
-            } => {
+            }) => {
                 return Err(TransportError::RateLimited {
                     scope,
                     retry_after_ms,
@@ -188,29 +301,81 @@ async fn serve_connection(
         let peer_for_action = session.peer.clone();
         let mut action_task =
             tokio::spawn(async move { runtime_for_action.handle(action, &peer_for_action).await });
-        let response = wait_for_action_or_trust_change(&mut action_task, &store, &session).await?;
-        let encoded = postcard::to_allocvec(&response).map_err(|_| TransportError::Frame)?;
-        if encoded.len() > request_policy.max_frame || encoded.len() > u32::MAX as usize {
-            return Err(TransportError::Frame);
-        }
-        let encoded_length = u32::try_from(encoded.len()).map_err(|_| TransportError::Frame)?;
-        tokio::time::timeout(
-            FRAME_TIMEOUT,
-            write_response_with_trust(&mut stream, &store, &session, encoded_length, &encoded),
+        let response = wait_for_action_or_trust_change(&mut action_task, &trust, &session).await?;
+        write_signed_response(
+            &mut stream,
+            &trust,
+            &session,
+            request_policy.max_frame,
+            &response,
         )
-        .await
-        .map_err(|_| TransportError::Frame)??;
+        .await?;
     }
+}
+
+pub fn decode_action_frame(
+    frame: &[u8],
+    maximum_frame: usize,
+) -> Result<SignedActionV1, TransportError> {
+    if frame.is_empty() || frame.len() > maximum_frame || frame.len() > MAX_WIRE_MESSAGE_BYTES {
+        return Err(TransportError::Frame);
+    }
+    let (action, remainder): (SignedActionV1, &[u8]) =
+        postcard::take_from_bytes(frame).map_err(|_| TransportError::Frame)?;
+    if !remainder.is_empty()
+        || postcard::to_allocvec(&action).map_err(|_| TransportError::Frame)? != frame
+    {
+        return Err(TransportError::Frame);
+    }
+    Ok(action)
+}
+
+pub fn decode_length_prefixed_action(
+    input: &[u8],
+    maximum_frame: usize,
+) -> Result<SignedActionV1, TransportError> {
+    let length_bytes: [u8; 4] = input
+        .get(..4)
+        .ok_or(TransportError::Frame)?
+        .try_into()
+        .map_err(|_| TransportError::Frame)?;
+    let length =
+        usize::try_from(u32::from_be_bytes(length_bytes)).map_err(|_| TransportError::Frame)?;
+    if length == 0 || length > maximum_frame || input.len() != length.saturating_add(4) {
+        return Err(TransportError::Frame);
+    }
+    decode_action_frame(&input[4..], maximum_frame)
+}
+
+async fn write_signed_response<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
+    session: &TransportSession,
+    maximum_frame: usize,
+    response: &SignedActionResponseV1,
+) -> Result<(), TransportError> {
+    let encoded = postcard::to_allocvec(response).map_err(|_| TransportError::Frame)?;
+    if encoded.len() > maximum_frame || encoded.len() > u32::MAX as usize {
+        return Err(TransportError::Frame);
+    }
+    let encoded_length = u32::try_from(encoded.len()).map_err(|_| TransportError::Frame)?;
+    tokio::time::timeout(
+        FRAME_TIMEOUT,
+        write_response_with_trust(stream, trust, session, encoded_length, &encoded),
+    )
+    .await
+    .map_err(|_| TransportError::Frame)??;
+    Ok(())
 }
 
 async fn read_frame_with_trust<R: AsyncRead + Unpin>(
     stream: &mut R,
-    store: &StateStore,
+    trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
     session: &TransportSession,
     max_frame: usize,
 ) -> Result<Option<Vec<u8>>, TransportError> {
     let mut length_bytes = [0_u8; 4];
-    if !read_exact_with_trust(stream, store, session, &mut length_bytes).await? {
+    if !read_exact_with_trust(stream, trust, session, &mut length_bytes).await? {
         return Ok(None);
     }
     let length =
@@ -219,7 +384,7 @@ async fn read_frame_with_trust<R: AsyncRead + Unpin>(
         return Err(TransportError::Frame);
     }
     let mut frame = vec![0_u8; length];
-    if !read_exact_with_trust(stream, store, session, &mut frame).await? {
+    if !read_exact_with_trust(stream, trust, session, &mut frame).await? {
         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
     }
     Ok(Some(frame))
@@ -227,15 +392,13 @@ async fn read_frame_with_trust<R: AsyncRead + Unpin>(
 
 async fn read_exact_with_trust<R: AsyncRead + Unpin>(
     stream: &mut R,
-    store: &StateStore,
+    trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
     session: &TransportSession,
     buffer: &mut [u8],
 ) -> Result<bool, TransportError> {
-    ensure_session_current(store, session)?;
+    ensure_session_current(trust, session)?;
     let mut filled = 0;
-    let mut interval = tokio::time::interval(TRUST_REFRESH_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
+    let mut changes = trust.clone();
     while filled < buffer.len() {
         tokio::select! {
             read = stream.read(&mut buffer[filled..]) => {
@@ -245,7 +408,10 @@ async fn read_exact_with_trust<R: AsyncRead + Unpin>(
                     read => filled += read,
                 }
             }
-            _ = interval.tick() => ensure_session_current(store, session)?,
+            changed = changes.changed() => {
+                changed.map_err(|_| TransportError::SessionTrustChanged)?;
+                ensure_session_current(&changes, session)?;
+            },
         }
     }
     Ok(true)
@@ -253,57 +419,57 @@ async fn read_exact_with_trust<R: AsyncRead + Unpin>(
 
 async fn wait_for_action_or_trust_change(
     task: &mut tokio::task::JoinHandle<Result<SignedActionResponseV1, RuntimeError>>,
-    store: &StateStore,
+    trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
     session: &TransportSession,
 ) -> Result<SignedActionResponseV1, TransportError> {
-    ensure_session_current(store, session)?;
-    let mut interval = tokio::time::interval(TRUST_REFRESH_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
+    ensure_session_current(trust, session)?;
+    let mut changes = trust.clone();
     loop {
         tokio::select! {
             result = &mut *task => return result
                 .map_err(|_| TransportError::RuntimeTask)?
                 .map_err(Into::into),
-            _ = interval.tick() => ensure_session_current(store, session)?,
+            changed = changes.changed() => {
+                changed.map_err(|_| TransportError::SessionTrustChanged)?;
+                ensure_session_current(&changes, session)?;
+            },
         }
     }
 }
 
 async fn write_response_with_trust<W: AsyncWrite + Unpin>(
     stream: &mut W,
-    store: &StateStore,
+    trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
     session: &TransportSession,
     encoded_length: u32,
     encoded: &[u8],
 ) -> Result<(), TransportError> {
-    write_all_with_trust(stream, store, session, &encoded_length.to_be_bytes()).await?;
-    write_all_with_trust(stream, store, session, encoded).await?;
-    ensure_session_current(store, session)?;
-    let mut interval = tokio::time::interval(TRUST_REFRESH_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
+    write_all_with_trust(stream, trust, session, &encoded_length.to_be_bytes()).await?;
+    write_all_with_trust(stream, trust, session, encoded).await?;
+    ensure_session_current(trust, session)?;
+    let mut changes = trust.clone();
     let flush = stream.flush();
     tokio::pin!(flush);
     loop {
         tokio::select! {
             result = &mut flush => return result.map_err(Into::into),
-            _ = interval.tick() => ensure_session_current(store, session)?,
+            changed = changes.changed() => {
+                changed.map_err(|_| TransportError::SessionTrustChanged)?;
+                ensure_session_current(&changes, session)?;
+            },
         }
     }
 }
 
 async fn write_all_with_trust<W: AsyncWrite + Unpin>(
     stream: &mut W,
-    store: &StateStore,
+    trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
     session: &TransportSession,
     buffer: &[u8],
 ) -> Result<(), TransportError> {
-    ensure_session_current(store, session)?;
+    ensure_session_current(trust, session)?;
     let mut written = 0;
-    let mut interval = tokio::time::interval(TRUST_REFRESH_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
+    let mut changes = trust.clone();
     while written < buffer.len() {
         tokio::select! {
             result = stream.write(&buffer[written..]) => {
@@ -313,17 +479,20 @@ async fn write_all_with_trust<W: AsyncWrite + Unpin>(
                 }
                 written += count;
             }
-            _ = interval.tick() => ensure_session_current(store, session)?,
+            changed = changes.changed() => {
+                changed.map_err(|_| TransportError::SessionTrustChanged)?;
+                ensure_session_current(&changes, session)?;
+            },
         }
     }
     Ok(())
 }
 
 fn ensure_session_current(
-    store: &StateStore,
+    trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
     session: &TransportSession,
 ) -> Result<(), TransportError> {
-    if session_is_current(store, session)? {
+    if session_is_current(trust, session) {
         Ok(())
     } else {
         Err(TransportError::SessionTrustChanged)
@@ -479,19 +648,15 @@ fn current_time_millis() -> Result<i64, TransportError> {
 }
 
 fn session_is_current(
-    store: &StateStore,
+    trust: &watch::Receiver<Option<Arc<TransportTrust>>>,
     session: &TransportSession,
-) -> Result<bool, TransportError> {
-    let Some(peer) = store.currently_trusted_peer(&session.peer.peer_id, current_time_millis()?)?
-    else {
-        return Ok(false);
-    };
-    if peer.trust_epoch != session.peer.trust_epoch {
-        return Ok(false);
-    }
-    let material = decode_key_material(&peer.public_key)
-        .map_err(|_| TransportError::Configuration("stored pairing is invalid".to_owned()))?;
-    Ok(material.client_certificate_sha256 == session.peer.certificate_sha256)
+) -> bool {
+    trust.borrow().as_ref().is_some_and(|snapshot| {
+        snapshot
+            .session_by_leaf
+            .get(&session.peer.certificate_sha256.0)
+            == Some(session)
+    })
 }
 
 fn load_certificates(
@@ -554,6 +719,77 @@ mod tests {
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    fn admission_session(peer_id: &str, leaf_seed: u16) -> TransportSession {
+        let mut leaf = [0_u8; 32];
+        leaf[..2].copy_from_slice(&leaf_seed.to_be_bytes());
+        TransportSession {
+            peer: TransportPeer {
+                peer_id: peer_id.to_owned(),
+                certificate_sha256: Sha256Digest(leaf),
+                trust_epoch: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn authenticated_session_admission_is_global_peer_and_leaf_bounded() -> TestResult {
+        let admission = Arc::new(SessionAdmission::default());
+        let shared = admission_session("peer-a", 1);
+        let mut leaf_permits = Vec::new();
+        for _ in 0..MAX_SESSIONS_PER_LEAF {
+            leaf_permits.push(
+                admission
+                    .try_admit(&shared)
+                    .ok_or_else(|| std::io::Error::other("test admission failed"))?,
+            );
+        }
+        assert!(admission.try_admit(&shared).is_none());
+        drop(leaf_permits.pop());
+        assert!(admission.try_admit(&shared).is_some());
+
+        let peer_admission = Arc::new(SessionAdmission::default());
+        let mut peer_permits = Vec::new();
+        for seed in 0..MAX_SESSIONS_PER_PEER {
+            peer_permits.push(
+                peer_admission
+                    .try_admit(&admission_session("peer-a", seed as u16))
+                    .ok_or_else(|| std::io::Error::other("test peer admission failed"))?,
+            );
+        }
+        assert!(
+            peer_admission
+                .try_admit(&admission_session("peer-a", 500))
+                .is_none()
+        );
+        assert!(
+            peer_admission
+                .try_admit(&admission_session("peer-b", 501))
+                .is_some()
+        );
+
+        let global = Arc::new(SessionAdmission::default());
+        let mut global_permits = Vec::new();
+        for seed in 0..MAX_AUTHENTICATED_SESSIONS {
+            global_permits.push(
+                global
+                    .try_admit(&admission_session(&format!("peer-{seed}"), seed as u16))
+                    .ok_or_else(|| std::io::Error::other("test global admission failed"))?,
+            );
+        }
+        assert!(
+            global
+                .try_admit(&admission_session("overflow", u16::MAX))
+                .is_none()
+        );
+        drop(global_permits.pop());
+        assert!(
+            global
+                .try_admit(&admission_session("recovered", u16::MAX))
+                .is_some()
+        );
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct ManualClock(u64);
@@ -845,8 +1081,9 @@ mod tests {
         let tls = acceptor.accept(tcp).await.map_err(TransportError::Io)?;
         let session = authenticated_session(&tls, &trust.session_by_leaf)
             .ok_or(TransportError::UnpairedClient)?;
-        ensure_session_current(&store, &session)?;
-        serve_connection(tls, session, runtime, store, request_policy).await
+        let (_sender, receiver) = watch::channel(Some(trust));
+        ensure_session_current(&receiver, &session)?;
+        serve_connection(tls, session, runtime, store, receiver, request_policy).await
     }
 
     async fn connect_test_client(
@@ -1017,7 +1254,6 @@ mod tests {
             )?,
             CredentialRotationOutcome::Rotated(_)
         ));
-        assert!(!session_is_current(&store, &old_second_session)?);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 receiver.changed().await?;
@@ -1031,6 +1267,7 @@ mod tests {
             }
         })
         .await??;
+        assert!(!session_is_current(&receiver, &old_second_session));
 
         assert!(matches!(
             store.revoke_peer(
@@ -1116,6 +1353,7 @@ mod tests {
             listen: None,
             tls: None,
             policy,
+            storage: Default::default(),
             file_roots: Default::default(),
             read_roots: Default::default(),
             approved_actions: Default::default(),
@@ -1373,7 +1611,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let acceptor = TlsAcceptor::from(old_trust.tls.clone());
-        let server_store = store.clone();
+        let (trust_sender, trust_receiver) = watch::channel(Some(old_trust.clone()));
+        spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
+        let server_trust = trust_receiver.clone();
         let (session_ready, session_established) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.map_err(TransportError::Io)?;
@@ -1383,7 +1623,7 @@ mod tests {
             session_ready
                 .send(())
                 .map_err(|()| TransportError::RuntimeTask)?;
-            read_frame_with_trust(&mut tls, &server_store, &session, 1024).await
+            read_frame_with_trust(&mut tls, &server_trust, &session, 1024).await
         });
 
         let tcp = TcpStream::connect(address).await?;
@@ -1483,7 +1723,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let acceptor = TlsAcceptor::from(trust.tls.clone());
-        let server_store = store.clone();
+        let (trust_sender, trust_receiver) = watch::channel(Some(trust.clone()));
+        spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
+        let server_trust = trust_receiver.clone();
         let (session_ready, session_established) = tokio::sync::oneshot::channel();
         let established_server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.map_err(TransportError::Io)?;
@@ -1493,7 +1735,7 @@ mod tests {
             session_ready
                 .send(())
                 .map_err(|()| TransportError::RuntimeTask)?;
-            read_frame_with_trust(&mut tls, &server_store, &session, 1024).await
+            read_frame_with_trust(&mut tls, &server_trust, &session, 1024).await
         });
 
         let tcp = TcpStream::connect(address).await?;
@@ -1531,7 +1773,7 @@ mod tests {
         let reconnect_listener = TcpListener::bind("127.0.0.1:0").await?;
         let reconnect_address = reconnect_listener.local_addr()?;
         let reconnect_acceptor = TlsAcceptor::from(cached);
-        let reconnect_store = store.clone();
+        let reconnect_trust = trust_receiver.clone();
         let reconnect_session = TransportSession {
             peer: TransportPeer {
                 peer_id: trusted.peer_id.clone(),
@@ -1550,7 +1792,7 @@ mod tests {
                 .accept(tcp)
                 .await
                 .map_err(TransportError::Io)?;
-            ensure_session_current(&reconnect_store, &reconnect_session)?;
+            ensure_session_current(&reconnect_trust, &reconnect_session)?;
             drop(tls);
             Ok::<_, TransportError>(())
         });
@@ -1579,13 +1821,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let acceptor = TlsAcceptor::from(trust.tls.clone());
-        let server_store = store.clone();
+        let (trust_sender, trust_receiver) = watch::channel(Some(trust.clone()));
+        spawn_trust_reloader(Arc::new(server_identity(&pki)), store.clone(), trust_sender);
+        let server_trust = trust_receiver.clone();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.map_err(TransportError::Io)?;
             let mut tls = acceptor.accept(tcp).await.map_err(TransportError::Io)?;
             let session = authenticated_session(&tls, &trust.session_by_leaf)
                 .ok_or(TransportError::UnpairedClient)?;
-            read_frame_with_trust(&mut tls, &server_store, &session, 1024).await
+            read_frame_with_trust(&mut tls, &server_trust, &session, 1024).await
         });
 
         let tcp = TcpStream::connect(address).await?;

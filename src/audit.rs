@@ -4,7 +4,12 @@
 //! The node device key signs a canonical page so an owner can verify origin and
 //! detect changes after export. This is evidence, not remote attestation.
 
-use std::{collections::BTreeSet, fs::File, io::Read, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    io::Read,
+    path::Path,
+};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use rustix::fs::{Mode, OFlags};
@@ -14,13 +19,17 @@ use thiserror::Error;
 
 use crate::identity::{IdentityError, NodeIdentity};
 use crate::protocol::{NodeId, PublicKeyBytes, Sha256Digest, SignatureBytes, UnixMillis};
+use crate::security::{create_private_file, ensure_private_directory, read_private_file};
 use crate::store::{
-    ActionAuditContextV1, AuditEvent, AuditKind, StateStore, StoreError, TerminalResponseMetadata,
+    ActionAuditContextV1, AuditArchiveCandidateV1, AuditEvent, AuditKind, StateStore, StoreError,
+    TerminalResponseMetadata,
 };
 
 const AUDIT_EXPORT_DOMAIN: &[u8] = b"sovereign-node/local-audit-export/v1\0";
+const AUDIT_SEGMENT_DOMAIN: &[u8] = b"sovereign-node/audit-segment/v1\0";
 pub const MAX_AUDIT_EXPORT_EVENTS: u32 = 1_000;
 pub const MAX_AUDIT_EXPORT_JSON_BYTES: u64 = 32 * 1_024 * 1_024;
+pub const MAX_AUDIT_SEGMENT_BYTES: usize = 64 * 1_024 * 1_024;
 
 #[derive(Debug, Error)]
 pub enum AuditExportError {
@@ -42,6 +51,101 @@ pub enum AuditExportError {
     ResourceLimit,
     #[error("audit export does not match the pinned {0}")]
     PinMismatch(&'static str),
+    #[error("audit archive filesystem policy failed: {0}")]
+    SecureFile(#[from] crate::security::SecureFileError),
+    #[error("injected audit archive interruption after {0}")]
+    InjectedFault(&'static str),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSegmentV1 {
+    pub schema_version: u16,
+    pub format: String,
+    pub signature_algorithm: String,
+    pub node_id: NodeId,
+    pub node_key_id: Sha256Digest,
+    pub identity_generation: u64,
+    pub candidate: AuditArchiveCandidateV1,
+    pub content_digest: Sha256Digest,
+}
+
+impl AuditSegmentV1 {
+    fn signing_bytes(&self) -> Result<Vec<u8>, AuditExportError> {
+        self.validate()?;
+        let encoded = postcard::to_allocvec(self)?;
+        let mut bytes = Vec::with_capacity(AUDIT_SEGMENT_DOMAIN.len() + encoded.len());
+        bytes.extend_from_slice(AUDIT_SEGMENT_DOMAIN);
+        bytes.extend_from_slice(&encoded);
+        Ok(bytes)
+    }
+
+    fn validate(&self) -> Result<(), AuditExportError> {
+        if self.schema_version != 1
+            || self.format != "postcard-v1"
+            || self.signature_algorithm != "Ed25519"
+            || self.node_id.0.is_nil()
+            || self.content_digest.0 != self.candidate.digest()?
+        {
+            return Err(AuditExportError::Invalid(
+                "audit segment metadata is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedAuditSegmentV1 {
+    pub segment: AuditSegmentV1,
+    pub node_public_key: PublicKeyBytes,
+    pub node_signature: SignatureBytes,
+}
+
+impl SignedAuditSegmentV1 {
+    pub fn verify(&self) -> Result<(), AuditExportError> {
+        self.segment.validate()?;
+        let key = VerifyingKey::from_bytes(&self.node_public_key.0)
+            .map_err(|_| AuditExportError::InvalidSignature)?;
+        if key.is_weak()
+            || Sha256Digest(Sha256::digest(self.node_public_key.0).into())
+                != self.segment.node_key_id
+        {
+            return Err(AuditExportError::InvalidSignature);
+        }
+        let signature = Signature::from_slice(self.node_signature.as_bytes())
+            .map_err(|_| AuditExportError::InvalidSignature)?;
+        key.verify_strict(&self.segment.signing_bytes()?, &signature)
+            .map_err(|_| AuditExportError::InvalidSignature)
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, AuditExportError> {
+        self.verify()?;
+        Ok(Sha256Digest(
+            Sha256::digest(postcard::to_allocvec(self)?).into(),
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AuditArchiveResult {
+    pub segment_sequence: u64,
+    pub first_audit_sequence: u64,
+    pub last_audit_sequence: u64,
+    pub archived_events: u64,
+    pub retired_replays: u64,
+    pub segment_digest_sha256: String,
+    pub relative_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AuditArchiveVerification {
+    pub verification: &'static str,
+    pub segment_count: u64,
+    pub archived_event_count: u64,
+    pub final_segment_digest_sha256: String,
+    pub final_audit_hash_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -400,6 +504,211 @@ pub fn export_local_audit(
     Ok(signed)
 }
 
+/// Seal one eligible audit prefix into the owner-private archive. This is an
+/// owner-local maintenance operation and never accepts a remote output path.
+pub fn seal_eligible_audit_segment(
+    store: &StateStore,
+    identity: &NodeIdentity,
+    archive_root: &Path,
+    eligible_before_unix_ms: i64,
+    maximum_events: u32,
+    created_at: UnixMillis,
+) -> Result<Option<AuditArchiveResult>, AuditExportError> {
+    seal_eligible_audit_segment_inner(
+        store,
+        identity,
+        archive_root,
+        eligible_before_unix_ms,
+        maximum_events,
+        created_at,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_eligible_audit_segment_inner(
+    store: &StateStore,
+    identity: &NodeIdentity,
+    archive_root: &Path,
+    eligible_before_unix_ms: i64,
+    maximum_events: u32,
+    created_at: UnixMillis,
+    injected_fault_after: Option<&'static str>,
+) -> Result<Option<AuditArchiveResult>, AuditExportError> {
+    ensure_private_directory(archive_root)?;
+    let created_at_i64 = i64::try_from(created_at.0)
+        .map_err(|_| AuditExportError::Invalid("archive time is outside supported range"))?;
+    let Some(candidate) =
+        store.prepare_audit_archive(eligible_before_unix_ms, maximum_events, created_at_i64)?
+    else {
+        return Ok(None);
+    };
+    if injected_fault_after == Some("pending-state") {
+        return Err(AuditExportError::InjectedFault("pending-state"));
+    }
+    let segment = AuditSegmentV1 {
+        schema_version: 1,
+        format: "postcard-v1".to_owned(),
+        signature_algorithm: "Ed25519".to_owned(),
+        node_id: identity.node_id(),
+        node_key_id: identity.key_id(),
+        identity_generation: identity.cryptographic_identity().rotation_counter,
+        content_digest: Sha256Digest(candidate.digest()?),
+        candidate,
+    };
+    let signed = SignedAuditSegmentV1 {
+        node_signature: identity.sign(&segment.signing_bytes()?)?,
+        node_public_key: identity.public_key(),
+        segment,
+    };
+    signed.verify()?;
+    let encoded = postcard::to_allocvec(&signed)?;
+    if encoded.len() > MAX_AUDIT_SEGMENT_BYTES {
+        return Err(AuditExportError::ResourceLimit);
+    }
+    let relative_name = format!(
+        "audit-segment-{:020}.postcard",
+        signed.segment.candidate.segment_sequence
+    );
+    let final_path = archive_root.join(&relative_name);
+    let temporary_path = archive_root.join(format!(".{relative_name}.pending"));
+    if final_path.exists() {
+        if read_private_file(&final_path)? != encoded {
+            return Err(AuditExportError::Invalid(
+                "existing archive segment conflicts with pending candidate",
+            ));
+        }
+    } else {
+        if temporary_path.exists() {
+            if read_private_file(&temporary_path)? != encoded {
+                return Err(AuditExportError::Invalid(
+                    "pending archive file conflicts with durable candidate",
+                ));
+            }
+        } else {
+            create_private_file(&temporary_path, &encoded)?;
+        }
+        if injected_fault_after == Some("temporary-write") {
+            return Err(AuditExportError::InjectedFault("temporary-write"));
+        }
+        verify_audit_segment_file(&temporary_path)?;
+        fs::rename(&temporary_path, &final_path)?;
+        File::open(archive_root)?.sync_all()?;
+        if injected_fault_after == Some("rename") {
+            return Err(AuditExportError::InjectedFault("rename"));
+        }
+    }
+    let verified = verify_audit_segment_file(&final_path)?;
+    if verified != signed {
+        return Err(AuditExportError::Invalid(
+            "sealed archive bytes changed during publication",
+        ));
+    }
+    let segment_digest = signed.digest()?;
+    store.record_sealed_audit_segment(
+        &signed.segment.candidate,
+        segment_digest.0,
+        &relative_name,
+    )?;
+    if injected_fault_after == Some("database-commit") {
+        return Err(AuditExportError::InjectedFault("database-commit"));
+    }
+    let (archived_events, retired_replays) =
+        store.prune_sealed_audit_segment(signed.segment.candidate.candidate_id)?;
+    Ok(Some(AuditArchiveResult {
+        segment_sequence: signed.segment.candidate.segment_sequence,
+        first_audit_sequence: signed.segment.candidate.first_audit_sequence,
+        last_audit_sequence: signed.segment.candidate.last_audit_sequence,
+        archived_events,
+        retired_replays,
+        segment_digest_sha256: hex::encode(segment_digest.0),
+        relative_name,
+    }))
+}
+
+pub fn verify_audit_segment_file(path: &Path) -> Result<SignedAuditSegmentV1, AuditExportError> {
+    let bytes = read_private_file(path)?;
+    verify_audit_segment_bytes(&bytes)
+}
+
+pub fn verify_audit_segment_bytes(bytes: &[u8]) -> Result<SignedAuditSegmentV1, AuditExportError> {
+    if bytes.len() > MAX_AUDIT_SEGMENT_BYTES {
+        return Err(AuditExportError::ResourceLimit);
+    }
+    let (segment, remainder): (SignedAuditSegmentV1, &[u8]) = postcard::take_from_bytes(bytes)?;
+    if !remainder.is_empty() {
+        return Err(AuditExportError::Invalid(
+            "audit segment contains trailing bytes",
+        ));
+    }
+    segment.verify()?;
+    Ok(segment)
+}
+
+/// Verify every sealed file against its durable database manifest and both the
+/// segment-digest chain and audit-event chain. This does not mutate the store.
+pub fn verify_complete_audit_archive(
+    store: &StateStore,
+    archive_root: &Path,
+) -> Result<AuditArchiveVerification, AuditExportError> {
+    let metadata = store.sealed_audit_segments()?;
+    let checkpoint = store.audit_archive_checkpoint()?;
+    let mut expected_segment = 1_u64;
+    let mut expected_audit_sequence = 1_u64;
+    let mut previous_segment_digest = [0_u8; 32];
+    let mut previous_audit_hash = [0_u8; 32];
+    for item in &metadata {
+        if item.segment_sequence != expected_segment
+            || item.first_audit_sequence != expected_audit_sequence
+        {
+            return Err(AuditExportError::Invalid(
+                "archive manifest sequence is discontinuous",
+            ));
+        }
+        let path = archive_root.join(&item.relative_name);
+        let signed = verify_audit_segment_file(&path)?;
+        let candidate = &signed.segment.candidate;
+        if candidate.segment_sequence != item.segment_sequence
+            || candidate.first_audit_sequence != item.first_audit_sequence
+            || candidate.last_audit_sequence != item.last_audit_sequence
+            || candidate.previous_segment_digest != previous_segment_digest
+            || candidate.previous_audit_hash != previous_audit_hash
+            || signed.digest()?.0 != item.segment_digest
+        {
+            return Err(AuditExportError::Invalid(
+                "archive file does not match its manifest chain",
+            ));
+        }
+        previous_segment_digest = item.segment_digest;
+        previous_audit_hash = candidate.last_audit_hash;
+        expected_segment = expected_segment
+            .checked_add(1)
+            .ok_or(AuditExportError::Invalid(
+                "archive segment sequence overflow",
+            ))?;
+        expected_audit_sequence = candidate
+            .last_audit_sequence
+            .checked_add(1)
+            .ok_or(AuditExportError::Invalid("archive audit sequence overflow"))?;
+    }
+    if checkpoint.segment_sequence != metadata.len() as u64
+        || checkpoint.archived_sequence != expected_audit_sequence.saturating_sub(1)
+        || checkpoint.segment_digest != previous_segment_digest
+        || checkpoint.archived_audit_hash != previous_audit_hash
+    {
+        return Err(AuditExportError::Invalid(
+            "archive checkpoint does not match verified files",
+        ));
+    }
+    Ok(AuditArchiveVerification {
+        verification: "verified",
+        segment_count: checkpoint.segment_sequence,
+        archived_event_count: checkpoint.archived_sequence,
+        final_segment_digest_sha256: hex::encode(checkpoint.segment_digest),
+        final_audit_hash_sha256: hex::encode(checkpoint.archived_audit_hash),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,6 +1052,203 @@ mod tests {
         ] {
             assert!(!json.contains(excluded), "export leaked {excluded}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn signed_segments_bound_the_archive_chain_and_active_tail() -> TestResult {
+        let directory = tempfile::TempDir::new()?;
+        let identity_root = directory.path().join("identity");
+        let archive_root = directory.path().join("archive");
+        let (identity, _) = NodeIdentity::load_or_initialize(
+            &identity_root,
+            "audit-segment-test",
+            UnixMillis(1_000),
+        )?;
+        let store = StateStore::open(directory.path().join("state.sqlite3"))?;
+        for time in 1_001..=1_003 {
+            store.append_audit(AuditEventDraft {
+                occurred_at_unix_ms: time,
+                kind: AuditKind::AuthorizationRejected,
+                outcome: AuditOutcome::Rejected,
+                request_id: None,
+                actor_digest: Some(sha256(b"peer")),
+                subject_digest: None,
+                context_digest: Some(sha256(b"bounded-rejection-class")),
+            })?;
+        }
+
+        let first = seal_eligible_audit_segment(
+            &store,
+            &identity,
+            &archive_root,
+            2_000,
+            2,
+            UnixMillis(2_001),
+        )?
+        .ok_or("expected first audit segment")?;
+        assert_eq!(first.archived_events, 2);
+        let first_segment = verify_audit_segment_file(&archive_root.join(&first.relative_name))?;
+        assert_eq!(
+            first_segment.segment.candidate.previous_segment_digest,
+            [0; 32]
+        );
+        assert_eq!(store.verify_audit_chain()?.event_count, 3);
+
+        let second = seal_eligible_audit_segment(
+            &store,
+            &identity,
+            &archive_root,
+            2_000,
+            2,
+            UnixMillis(2_002),
+        )?
+        .ok_or("expected second audit segment")?;
+        let second_segment = verify_audit_segment_file(&archive_root.join(&second.relative_name))?;
+        assert_eq!(
+            second_segment.segment.candidate.previous_segment_digest,
+            first_segment.digest()?.0
+        );
+        assert_eq!(store.audit_archive_checkpoint()?.archived_sequence, 3);
+        assert_eq!(store.verify_audit_chain()?.event_count, 3);
+        let verification = verify_complete_audit_archive(&store, &archive_root)?;
+        assert_eq!(verification.segment_count, 2);
+        assert_eq!(verification.archived_event_count, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn archive_restart_reconciliation_finishes_every_durable_boundary() -> TestResult {
+        for fault in [
+            "pending-state",
+            "temporary-write",
+            "rename",
+            "database-commit",
+        ] {
+            let directory = tempfile::TempDir::new()?;
+            let archive_root = directory.path().join("archive");
+            let (identity, _) = NodeIdentity::load_or_initialize(
+                &directory.path().join("identity"),
+                "archive-reconcile-test",
+                UnixMillis(1_000),
+            )?;
+            let store = StateStore::open(directory.path().join("state.sqlite3"))?;
+            store.append_audit(AuditEventDraft {
+                occurred_at_unix_ms: 1_001,
+                kind: AuditKind::AuthorizationRejected,
+                outcome: AuditOutcome::Rejected,
+                request_id: None,
+                actor_digest: None,
+                subject_digest: None,
+                context_digest: Some(sha256(b"bounded-class")),
+            })?;
+            assert!(matches!(
+                seal_eligible_audit_segment_inner(
+                    &store,
+                    &identity,
+                    &archive_root,
+                    2_000,
+                    10,
+                    UnixMillis(2_001),
+                    Some(fault),
+                ),
+                Err(AuditExportError::InjectedFault(_))
+            ));
+            drop(store);
+
+            let reopened = StateStore::open(directory.path().join("state.sqlite3"))?;
+            let completed = seal_eligible_audit_segment(
+                &reopened,
+                &identity,
+                &archive_root,
+                2_000,
+                10,
+                UnixMillis(2_002),
+            )?
+            .ok_or("reconciliation did not complete pending segment")?;
+            assert_eq!(completed.archived_events, 1);
+            assert_eq!(reopened.verify_audit_chain()?.event_count, 1);
+            assert_eq!(
+                verify_complete_audit_archive(&reopened, &archive_root)?.segment_count,
+                1
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_root_symlink_is_rejected() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::TempDir::new()?;
+        let real = directory.path().join("real-archive");
+        std::fs::create_dir(&real)?;
+        let link = directory.path().join("archive-link");
+        symlink(&real, &link)?;
+        let (identity, _) = NodeIdentity::load_or_initialize(
+            &directory.path().join("identity"),
+            "archive-symlink-test",
+            UnixMillis(1_000),
+        )?;
+        let store = StateStore::open(directory.path().join("state.sqlite3"))?;
+        store.append_audit(AuditEventDraft {
+            occurred_at_unix_ms: 1_001,
+            kind: AuditKind::AuthorizationRejected,
+            outcome: AuditOutcome::Rejected,
+            request_id: None,
+            actor_digest: None,
+            subject_digest: None,
+            context_digest: None,
+        })?;
+        assert!(
+            seal_eligible_audit_segment(&store, &identity, &link, 2_000, 10, UnixMillis(2_001),)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_or_trailing_archive_bytes_are_rejected() -> TestResult {
+        let directory = tempfile::TempDir::new()?;
+        let identity_root = directory.path().join("identity");
+        let archive_root = directory.path().join("archive");
+        let (identity, _) = NodeIdentity::load_or_initialize(
+            &identity_root,
+            "audit-corruption-test",
+            UnixMillis(1_000),
+        )?;
+        let store = StateStore::open(directory.path().join("state.sqlite3"))?;
+        store.append_audit(AuditEventDraft {
+            occurred_at_unix_ms: 1_001,
+            kind: AuditKind::AuthorizationRejected,
+            outcome: AuditOutcome::Rejected,
+            request_id: None,
+            actor_digest: None,
+            subject_digest: None,
+            context_digest: Some(sha256(b"reason")),
+        })?;
+        let sealed = seal_eligible_audit_segment(
+            &store,
+            &identity,
+            &archive_root,
+            2_000,
+            10,
+            UnixMillis(2_001),
+        )?
+        .ok_or("expected audit segment")?;
+        let original = read_private_file(&archive_root.join(&sealed.relative_name))?;
+        let corrupt = archive_root.join("corrupt.postcard");
+        let mut changed = original.clone();
+        let midpoint = changed.len() / 2;
+        changed[midpoint] ^= 0x01;
+        create_private_file(&corrupt, &changed)?;
+        assert!(verify_audit_segment_file(&corrupt).is_err());
+        let trailing = archive_root.join("trailing.postcard");
+        let mut extended = original;
+        extended.push(0);
+        create_private_file(&trailing, &extended)?;
+        assert!(verify_audit_segment_file(&trailing).is_err());
         Ok(())
     }
 }

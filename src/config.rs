@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::protocol::Capability;
+use crate::security::{SecureFileError, read_configuration_file};
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_CONCURRENT_ACTIONS: usize = 4;
@@ -17,6 +18,7 @@ pub const DEFAULT_MAX_ACTION_TTL_SECS: i64 = 300;
 pub const DEFAULT_MAX_CLOCK_ROLLBACK_SECS: u64 = 5;
 pub const DEFAULT_MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 120;
 pub const DEFAULT_MAX_REQUESTS_GLOBAL_PER_MINUTE: u32 = 1_000;
+pub const MAX_CONFIGURATION_BYTES: u64 = 1_048_576;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +32,8 @@ pub struct NodeConfig {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
     #[serde(default)]
     pub file_roots: BTreeMap<String, PathBuf>,
     /// Dedicated read-only publication roots with exact relative-file allowlists.
@@ -54,6 +58,36 @@ pub struct NodeConfig {
     /// Optional pinned offline-update authorities. Absence disables staging.
     #[serde(default)]
     pub updates: Option<UpdateConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    pub max_total_replays: u64,
+    pub max_active_audit_events: u64,
+    pub database_soft_bytes: u64,
+    pub database_hard_bytes: u64,
+    pub wal_hard_bytes: u64,
+    pub minimum_free_bytes: u64,
+    pub maintenance_reserve_bytes: u64,
+    pub replay_retention_secs: u64,
+    pub archive_max_events: u32,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            max_total_replays: 65_536,
+            max_active_audit_events: 131_072,
+            database_soft_bytes: 256 * 1_048_576,
+            database_hard_bytes: 512 * 1_048_576,
+            wal_hard_bytes: 64 * 1_048_576,
+            minimum_free_bytes: 512 * 1_048_576,
+            maintenance_reserve_bytes: 64 * 1_048_576,
+            replay_retention_secs: 3_900,
+            archive_max_events: 10_000,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,30 +270,6 @@ struct PolicyDigestV1<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct PolicyDigestV2<'a> {
-    schema_version: u16,
-    base: PolicyDigestV1<'a>,
-    process_reporting: &'a ProcessReportingConfig,
-}
-
-#[derive(Debug, Serialize)]
-struct PolicyDigestV3<'a> {
-    schema_version: u16,
-    base: PolicyDigestV1<'a>,
-    process_reporting: &'a ProcessReportingConfig,
-    service_reporting: &'a ServiceReportingConfig,
-}
-
-#[derive(Debug, Serialize)]
-struct PolicyDigestV4<'a> {
-    schema_version: u16,
-    base: PolicyDigestV1<'a>,
-    process_reporting: &'a ProcessReportingConfig,
-    service_reporting: &'a ServiceReportingConfig,
-    repository_reporting: &'a RepositoryReportingConfig,
-}
-
-#[derive(Debug, Serialize)]
 struct PolicyDigestV5<'a> {
     schema_version: u16,
     base: PolicyDigestV1<'a>,
@@ -267,6 +277,13 @@ struct PolicyDigestV5<'a> {
     service_reporting: &'a ServiceReportingConfig,
     repository_reporting: &'a RepositoryReportingConfig,
     read_roots: &'a BTreeMap<String, ReadRootConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyDigestV6<'a> {
+    schema_version: u16,
+    base: PolicyDigestV5<'a>,
+    storage: &'a StorageConfig,
 }
 
 const fn default_max_update_artifact_bytes() -> u64 {
@@ -277,6 +294,8 @@ const fn default_max_update_artifact_bytes() -> u64 {
 pub enum ConfigError {
     #[error("could not read configuration: {0}")]
     Read(#[from] std::io::Error),
+    #[error("configuration security policy rejected the file: {0}")]
+    Security(#[from] SecureFileError),
     #[error("configuration is not valid TOML: {0}")]
     Parse(#[from] toml::de::Error),
     #[error("invalid configuration: {0}")]
@@ -297,49 +316,27 @@ impl NodeConfig {
             resource_reporting: &self.resource_reporting,
             updates: &self.updates,
         };
-        let encoded = if !self.read_roots.is_empty() {
-            postcard::to_allocvec(&PolicyDigestV5 {
+        let encoded = postcard::to_allocvec(&PolicyDigestV6 {
+            schema_version: 6,
+            base: PolicyDigestV5 {
                 schema_version: 5,
                 base,
                 process_reporting: &self.process_reporting,
                 service_reporting: &self.service_reporting,
                 repository_reporting: &self.repository_reporting,
                 read_roots: &self.read_roots,
-            })
-        } else if self.repository_reporting.snapshot.is_some() {
-            postcard::to_allocvec(&PolicyDigestV4 {
-                schema_version: 4,
-                base,
-                process_reporting: &self.process_reporting,
-                service_reporting: &self.service_reporting,
-                repository_reporting: &self.repository_reporting,
-            })
-        } else {
-            match (
-                self.process_reporting.snapshot.is_some(),
-                self.service_reporting.snapshot.is_some(),
-            ) {
-                (false, false) => postcard::to_allocvec(&base),
-                (true, false) => postcard::to_allocvec(&PolicyDigestV2 {
-                    schema_version: 2,
-                    base,
-                    process_reporting: &self.process_reporting,
-                }),
-                (_, true) => postcard::to_allocvec(&PolicyDigestV3 {
-                    schema_version: 3,
-                    base,
-                    process_reporting: &self.process_reporting,
-                    service_reporting: &self.service_reporting,
-                }),
-            }
-        }
+            },
+            storage: &self.storage,
+        })
         .map_err(|_| ConfigError::Invalid("configuration cannot be encoded".to_owned()))?;
         Ok(Sha256::digest(encoded).into())
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let raw = fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&raw)?;
+        let bytes = read_configuration_file(path, MAX_CONFIGURATION_BYTES)?;
+        let raw = std::str::from_utf8(&bytes)
+            .map_err(|_| ConfigError::Invalid("configuration is not valid UTF-8".to_owned()))?;
+        let config: Self = toml::from_str(raw)?;
         config.validate()?;
         Ok(config)
     }
@@ -432,6 +429,27 @@ impl NodeConfig {
         if policy.max_clock_rollback_secs > 60 {
             return Err(ConfigError::Invalid(
                 "max_clock_rollback_secs must be between 0 and 60".to_owned(),
+            ));
+        }
+        let storage = &self.storage;
+        let minimum_retention = u64::try_from(policy.max_action_ttl_secs)
+            .map_err(|_| ConfigError::Invalid("action TTL cannot be negative".to_owned()))?
+            .saturating_add(policy.max_clock_rollback_secs)
+            .saturating_add(60);
+        if storage.max_total_replays < 4_096
+            || storage.max_active_audit_events < storage.max_total_replays.saturating_mul(2)
+            || storage.database_soft_bytes < 16 * 1_048_576
+            || storage.database_hard_bytes <= storage.database_soft_bytes
+            || storage.wal_hard_bytes < 4 * 1_048_576
+            || storage.wal_hard_bytes >= storage.database_hard_bytes
+            || storage.maintenance_reserve_bytes < 8 * 1_048_576
+            || storage.minimum_free_bytes <= storage.maintenance_reserve_bytes
+            || storage.replay_retention_secs < minimum_retention
+            || storage.archive_max_events == 0
+            || storage.archive_max_events > 10_000
+        {
+            return Err(ConfigError::Invalid(
+                "storage limits cannot preserve replay safety and maintenance reserve".to_owned(),
             ));
         }
         if !policy.require_owner_signature_for_all_actions {
@@ -1019,7 +1037,9 @@ fn validate_read_root(root_id: &str, root: &ReadRootConfig) -> Result<(), Config
     Ok(())
 }
 
-fn validate_public_read_path(value: &str) -> Result<(), ConfigError> {
+/// Validate the exact relative-file grammar shared by configuration, property
+/// tests, and the offline fuzz boundary. This does not open a filesystem path.
+pub fn validate_public_read_path(value: &str) -> Result<(), ConfigError> {
     if value.is_empty() || value.len() > 1_024 || value.contains('\\') {
         return Err(ConfigError::Invalid(
             "read-root allowed files must be bounded relative paths".to_owned(),
@@ -1234,6 +1254,7 @@ mod tests {
             listen: None,
             tls: None,
             policy: PolicyConfig::default(),
+            storage: StorageConfig::default(),
             file_roots: BTreeMap::new(),
             read_roots: BTreeMap::new(),
             approved_actions: BTreeMap::new(),
@@ -1252,6 +1273,42 @@ mod tests {
         let config: NodeConfig =
             toml::from_str(include_str!("../config/sovereign-node.example.toml"))?;
         assert!(config.validate().is_ok());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configuration_load_is_bounded_descriptor_based_and_nofollow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::TempDir::new()?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let path = directory.path().join("node.toml");
+        fs::write(&path, toml::to_string(&minimal_config())?)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        NodeConfig::load(&path)?;
+
+        let link = directory.path().join("linked.toml");
+        symlink(&path, &link)?;
+        assert!(matches!(
+            NodeConfig::load(&link),
+            Err(ConfigError::Security(_))
+        ));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        assert!(matches!(
+            NodeConfig::load(&path),
+            Err(ConfigError::Security(_))
+        ));
+
+        let oversized = directory.path().join("oversized.toml");
+        fs::write(&oversized, vec![b'x'; MAX_CONFIGURATION_BYTES as usize + 1])?;
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o600))?;
+        assert!(matches!(
+            NodeConfig::load(&oversized),
+            Err(ConfigError::Security(_))
+        ));
         Ok(())
     }
 
@@ -1394,7 +1451,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn optional_file_read_roots_use_policy_digest_v5() -> Result<(), Box<dyn std::error::Error>> {
+    fn optional_file_read_roots_change_current_policy_digest()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::TempDir::new()?;
         let data_dir = directory.path().join("node-state");
         let read_root = directory.path().join("published-reports");
@@ -1420,6 +1478,23 @@ mod tests {
         config.read_roots.clear();
         assert_eq!(config.policy_digest()?, original);
         Ok(())
+    }
+
+    #[test]
+    fn storage_lifecycle_limits_are_validated_and_policy_bound() {
+        let mut config = minimal_config();
+        let original = config.policy_digest().unwrap_or([0_u8; 32]);
+        config.storage.max_total_replays = config.storage.max_total_replays.saturating_add(1);
+        assert_ne!(config.policy_digest().unwrap_or([0_u8; 32]), original);
+        config.storage.max_total_replays = 0;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        let mut invalid = minimal_config();
+        invalid.storage.replay_retention_secs = 1;
+        assert!(matches!(invalid.validate(), Err(ConfigError::Invalid(_))));
+        invalid = minimal_config();
+        invalid.storage.minimum_free_bytes = invalid.storage.maintenance_reserve_bytes;
+        assert!(matches!(invalid.validate(), Err(ConfigError::Invalid(_))));
     }
 
     #[test]
@@ -1688,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_service_adapter_uses_the_next_policy_digest_schema() {
+    fn optional_service_adapter_changes_current_policy_digest() {
         let process_key = SigningKey::from_bytes(&[0x6d; 32]);
         let service_key = SigningKey::from_bytes(&[0x6e; 32]);
         let mut config = minimal_config();
@@ -1749,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_repository_adapter_uses_policy_digest_v4() {
+    fn optional_repository_adapter_changes_current_policy_digest() {
         let service_key = SigningKey::from_bytes(&[0x73; 32]);
         let repository_key = SigningKey::from_bytes(&[0x74; 32]);
         let mut config = minimal_config();

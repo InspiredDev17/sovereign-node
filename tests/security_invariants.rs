@@ -826,6 +826,7 @@ async fn process_status_uses_signed_logical_identity_and_denies_raw_pid() -> Tes
         listen: None,
         tls: None,
         policy,
+        storage: Default::default(),
         file_roots: Default::default(),
         read_roots: Default::default(),
         approved_actions: Default::default(),
@@ -976,6 +977,7 @@ async fn service_status_uses_signed_logical_identity_without_manager_control() -
         listen: None,
         tls: None,
         policy,
+        storage: Default::default(),
         file_roots: Default::default(),
         read_roots: Default::default(),
         approved_actions: Default::default(),
@@ -1117,6 +1119,7 @@ async fn repository_status_uses_signed_logical_identity_without_git_access() -> 
         listen: None,
         tls: None,
         policy,
+        storage: Default::default(),
         file_roots: Default::default(),
         read_roots: Default::default(),
         approved_actions: Default::default(),
@@ -1279,6 +1282,7 @@ async fn file_read_uses_exact_pinned_read_only_root_without_write_authority() ->
         listen: None,
         tls: None,
         policy,
+        storage: Default::default(),
         file_roots: Default::default(),
         read_roots: std::collections::BTreeMap::from([(
             "reports".to_owned(),
@@ -1612,10 +1616,39 @@ fn version_mismatch_and_path_traversal_are_rejected_before_replay_reservation() 
         wrong_version.validate_for_node(harness.identity.node_id(), UnixMillis(NOW + 10), 1),
         Err(ValidationError::UnsupportedProtocolVersion(2))
     ));
+    let protocol_error = match engine.verify_and_reserve(wrong_version, &transport) {
+        Ok(_) => return Err(test_error("unsupported protocol was accepted")),
+        Err(error) => error,
+    };
     assert!(matches!(
-        engine.verify_and_reserve(wrong_version, &transport),
-        Err(AuthorizationError::Encoding)
+        protocol_error,
+        AuthorizationError::UnsupportedProtocolVersion
     ));
+    assert_eq!(protocol_error.code(), ActionErrorCode::VersionMismatch);
+
+    let mut wrong_schema_request = valid_version.request.clone();
+    wrong_schema_request.schema_version = 2;
+    wrong_schema_request.request_id = RequestId(Uuid::new_v4());
+    let wrong_schema = sign_request(
+        wrong_schema_request.clone(),
+        &harness.owner_key,
+        &harness.broker_key,
+    )?;
+    let schema_error = match engine.verify_and_reserve(wrong_schema, &transport) {
+        Ok(_) => return Err(test_error("unsupported schema was accepted")),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        schema_error,
+        AuthorizationError::UnsupportedSchemaVersion
+    ));
+    assert_eq!(schema_error.code(), ActionErrorCode::VersionMismatch);
+    assert!(
+        harness
+            .store
+            .action_audit_record(wrong_schema_request.request_id.0)?
+            .is_none()
+    );
     assert!(matches!(
         engine.verify_and_reserve(valid_version, &transport)?,
         AuthorizationOutcome::Fresh(_)
@@ -1685,6 +1718,8 @@ fn replay_capacity_exhaustion_fails_closed_with_resource_error() -> TestResult {
         max_pending_pairings: 1,
         max_trusted_peers: 1,
         max_open_replays: 1,
+        max_total_replays: 2,
+        max_active_audit_events: 8,
     })?;
     let engine = harness.engine();
     let transport = harness.transport_peer();

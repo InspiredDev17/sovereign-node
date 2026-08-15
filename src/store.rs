@@ -7,13 +7,13 @@
 //! audited but never consumes a replay identifier.
 
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 use postcard::to_stdvec;
 use rusqlite::{
@@ -27,11 +27,12 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::lifecycle::{LeaseKind, LifecycleLease};
+use crate::security::validate_sensitive_ancestors;
 
 /// SHA-256 digests are used to bind data that must not be stored in plaintext.
 pub type Sha256Digest = [u8; 32];
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const PEER_RATE_WINDOW_MS: i64 = 60_000;
 const ZERO_HASH: Sha256Digest = [0_u8; 32];
 const MAX_ID_BYTES: usize = 255;
@@ -51,6 +52,47 @@ pub struct StoreLimits {
     pub max_pending_pairings: u64,
     pub max_trusted_peers: u64,
     pub max_open_replays: u64,
+    /// Hard ceiling for all live replay rows, including terminal history that
+    /// has not yet reached the safe archival horizon.
+    pub max_total_replays: u64,
+    /// Hard ceiling for the unsealed audit tail. Owner-local archival remains
+    /// available when this ceiling stops remote writes.
+    pub max_active_audit_events: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoragePolicy {
+    pub database_soft_bytes: u64,
+    pub database_hard_bytes: u64,
+    pub wal_hard_bytes: u64,
+    pub minimum_free_bytes: u64,
+    pub maintenance_reserve_bytes: u64,
+}
+
+impl Default for StoragePolicy {
+    fn default() -> Self {
+        Self {
+            database_soft_bytes: 256 * 1_048_576,
+            database_hard_bytes: 512 * 1_048_576,
+            wal_hard_bytes: 64 * 1_048_576,
+            minimum_free_bytes: 512 * 1_048_576,
+            maintenance_reserve_bytes: 64 * 1_048_576,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct StorageObservation {
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+    pub available_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum StoragePressure {
+    Healthy,
+    Soft,
+    Hard,
 }
 
 impl Default for StoreLimits {
@@ -59,6 +101,8 @@ impl Default for StoreLimits {
             max_pending_pairings: 64,
             max_trusted_peers: 1024,
             max_open_replays: 4096,
+            max_total_replays: 65_536,
+            max_active_audit_events: 131_072,
         }
     }
 }
@@ -81,6 +125,8 @@ pub enum StoreError {
     CorruptData(&'static str),
     #[error("resource limit reached: {0}")]
     ResourceLimit(&'static str),
+    #[error("remote work is unavailable because local audit storage is under pressure")]
+    StoragePressure,
     #[error("pairing challenge was not found")]
     PairingNotFound,
     #[error("pairing challenge has expired")]
@@ -922,6 +968,82 @@ pub struct AuditReadSnapshot {
     pub actions: Vec<ActionAuditRecord>,
 }
 
+/// Immutable input selected transactionally for one audit archive segment.
+/// Raw authorization material and action data are absent by construction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditArchiveCandidateV1 {
+    pub schema_version: u16,
+    pub candidate_id: Uuid,
+    pub segment_sequence: u64,
+    pub previous_segment_digest: Sha256Digest,
+    pub previous_audit_hash: Sha256Digest,
+    pub first_audit_sequence: u64,
+    pub last_audit_sequence: u64,
+    pub last_audit_hash: Sha256Digest,
+    pub eligible_before_unix_ms: i64,
+    pub created_at_unix_ms: i64,
+    pub events: Vec<AuditEvent>,
+    pub actions: Vec<ActionAuditContextV1>,
+}
+
+impl AuditArchiveCandidateV1 {
+    pub fn digest(&self) -> Result<Sha256Digest, StoreError> {
+        Ok(sha256(&encode(self)?))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuditArchiveCheckpoint {
+    pub archived_sequence: u64,
+    pub archived_audit_hash: Sha256Digest,
+    pub segment_sequence: u64,
+    pub segment_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SealedAuditSegmentMetadata {
+    pub segment_sequence: u64,
+    pub first_audit_sequence: u64,
+    pub last_audit_sequence: u64,
+    pub segment_digest: Sha256Digest,
+    pub relative_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingDeviceRotationV1 {
+    pub schema_version: u16,
+    pub transaction_id: Uuid,
+    pub node_id: String,
+    pub previous_key_id: Sha256Digest,
+    pub next_key_id: Sha256Digest,
+    pub rotation_counter: u64,
+    pub continuity_binding: Vec<u8>,
+    pub continuity_digest: Sha256Digest,
+    pub started_at_unix_ms: i64,
+}
+
+impl PendingDeviceRotationV1 {
+    fn validate(&self) -> Result<(), StoreError> {
+        validate_identifier(&self.node_id)?;
+        if self.schema_version != 1
+            || self.transaction_id.is_nil()
+            || self.rotation_counter == 0
+            || self.continuity_binding.is_empty()
+            || self.continuity_binding.len() > 16_384
+            || self.continuity_digest != sha256(&self.continuity_binding)
+            || self.previous_key_id == self.next_key_id
+            || self.started_at_unix_ms < 0
+        {
+            return Err(StoreError::InvalidInput(
+                "device rotation record is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActivePolicyBinding {
     pub version: u64,
@@ -940,16 +1062,25 @@ pub struct StateStore {
     connection: Mutex<Connection>,
     path: PathBuf,
     limits: StoreLimits,
+    storage_policy: StoragePolicy,
 }
 
 impl StateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::open_with_limits(path, StoreLimits::default())
+        Self::open_with_policies(path, StoreLimits::default(), StoragePolicy::default())
     }
 
     pub fn open_with_limits(
         path: impl AsRef<Path>,
         limits: StoreLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_policies(path, limits, StoragePolicy::default())
+    }
+
+    pub fn open_with_policies(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        storage_policy: StoragePolicy,
     ) -> Result<Self, StoreError> {
         if !cfg!(unix) {
             return Err(StoreError::InvalidInput(
@@ -957,28 +1088,64 @@ impl StateStore {
             ));
         }
         validate_limits(limits)?;
+        validate_storage_policy(storage_policy)?;
         let path = path.as_ref().to_path_buf();
-        prepare_private_database_file(&path)?;
+        let prepared_identity = prepare_private_database_file(&path)?;
 
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let mut connection = Connection::open_with_flags(&path, flags)?;
+        verify_database_identity(&path, prepared_identity)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         configure_connection(&connection)?;
         migrate(&mut connection)?;
+        install_store_limits(&connection, limits)?;
         tighten_private_permissions(&path)?;
 
         Ok(Self {
             connection: Mutex::new(connection),
             path,
             limits,
+            storage_policy,
         })
     }
 
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn storage_observation(&self) -> Result<StorageObservation, StoreError> {
+        let database_bytes = file_length_if_present(&self.path)?;
+        let wal_path = PathBuf::from(format!("{}-wal", self.path.as_os_str().to_string_lossy()));
+        let wal_bytes = file_length_if_present(&wal_path)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or(StoreError::InvalidInput("database path has no parent"))?;
+        let filesystem = rustix::fs::statvfs(parent).map_err(std::io::Error::from)?;
+        let available_bytes = filesystem.f_bavail.saturating_mul(filesystem.f_frsize);
+        Ok(StorageObservation {
+            database_bytes,
+            wal_bytes,
+            available_bytes,
+        })
+    }
+
+    pub fn assess_storage(&self, observation: StorageObservation) -> StoragePressure {
+        assess_storage_pressure(self.storage_policy, observation)
+    }
+
+    pub fn storage_pressure(&self) -> Result<StoragePressure, StoreError> {
+        Ok(self.assess_storage(self.storage_observation()?))
+    }
+
+    pub fn checkpoint_wal_passive(&self) -> Result<(), StoreError> {
+        let connection = self.lock()?;
+        connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        drop(connection);
+        self.tighten_permissions()
     }
 
     /// Atomically admit an authenticated request against both its durable per-peer window and the
@@ -1039,6 +1206,9 @@ impl StateStore {
         now_unix_ms: i64,
         maximum_rollback_ms: i64,
     ) -> Result<RemoteRequestAdmission, StoreError> {
+        if self.storage_pressure()? != StoragePressure::Healthy {
+            return Err(StoreError::StoragePressure);
+        }
         validate_identifier(peer_id)?;
         validate_clock_policy(now_unix_ms, maximum_rollback_ms)?;
         if peer_maximum_per_minute == 0 || global_maximum_per_minute < peer_maximum_per_minute {
@@ -2836,6 +3006,12 @@ impl StateStore {
                 self.limits.max_open_replays,
                 "open replay reservation capacity",
             )?;
+            enforce_count_limit(
+                &transaction,
+                "SELECT COUNT(*) FROM request_replays",
+                self.limits.max_total_replays,
+                "total replay retention capacity",
+            )?;
             transaction.execute(
                 "INSERT INTO request_replays
                     (request_id, pairing_id, trust_epoch, replay_sequence,
@@ -3173,6 +3349,390 @@ impl StateStore {
         Ok(event)
     }
 
+    pub fn begin_device_rotation(
+        &self,
+        pending: &PendingDeviceRotationV1,
+        local_actor_digest: Sha256Digest,
+    ) -> Result<(), StoreError> {
+        pending.validate()?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT record FROM pending_device_rotation WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            if decode::<PendingDeviceRotationV1>(&existing)? == *pending {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::ResourceLimit("device rotation already pending"));
+        }
+        transaction.execute(
+            "INSERT INTO pending_device_rotation(singleton, transaction_id, record)
+             VALUES (1, ?1, ?2)",
+            params![pending.transaction_id.to_string(), encode(pending)?],
+        )?;
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: pending.started_at_unix_ms,
+                kind: AuditKind::NodeIdentityRotationStarted,
+                outcome: AuditOutcome::Observed,
+                request_id: None,
+                actor_digest: Some(local_actor_digest),
+                subject_digest: Some(pending.previous_key_id),
+                context_digest: Some(pending.continuity_digest),
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_device_rotation(&self) -> Result<Option<PendingDeviceRotationV1>, StoreError> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT record FROM pending_device_rotation WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|record| decode(&record))
+            .transpose()
+    }
+
+    pub fn complete_device_rotation(
+        &self,
+        transaction_id: Uuid,
+        observed_next_key: Sha256Digest,
+        local_actor_digest: Sha256Digest,
+        completed_at_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: Vec<u8> = transaction.query_row(
+            "SELECT record FROM pending_device_rotation
+             WHERE singleton = 1 AND transaction_id = ?1",
+            [transaction_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let pending = decode::<PendingDeviceRotationV1>(&record)?;
+        pending.validate()?;
+        if pending.next_key_id != observed_next_key
+            || completed_at_unix_ms < pending.started_at_unix_ms
+        {
+            return Err(StoreError::InvalidInput(
+                "device rotation completion mismatch",
+            ));
+        }
+        append_audit_in_transaction(
+            &transaction,
+            AuditEventDraft {
+                occurred_at_unix_ms: completed_at_unix_ms,
+                kind: AuditKind::NodeIdentityRotated,
+                outcome: AuditOutcome::Accepted,
+                request_id: None,
+                actor_digest: Some(local_actor_digest),
+                subject_digest: Some(pending.previous_key_id),
+                context_digest: Some(pending.next_key_id),
+            },
+        )?;
+        transaction.execute(
+            "DELETE FROM pending_device_rotation WHERE singleton = 1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Select and durably pin an eligible audit prefix. Repeated calls return
+    /// the same candidate until it is sealed or explicitly reconciled.
+    pub fn prepare_audit_archive(
+        &self,
+        eligible_before_unix_ms: i64,
+        maximum_events: u32,
+        created_at_unix_ms: i64,
+    ) -> Result<Option<AuditArchiveCandidateV1>, StoreError> {
+        if eligible_before_unix_ms < 0
+            || created_at_unix_ms < eligible_before_unix_ms
+            || maximum_events == 0
+            || maximum_events > 10_000
+        {
+            return Err(StoreError::InvalidInput("audit archive bounds are invalid"));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(record) = transaction
+            .query_row(
+                "SELECT record FROM pending_audit_archive WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            let candidate = decode::<AuditArchiveCandidateV1>(&record)?;
+            validate_archive_candidate(&candidate)?;
+            transaction.commit()?;
+            return Ok(Some(candidate));
+        }
+        let checkpoint = audit_archive_checkpoint_in_connection(&transaction)?;
+        let mut statement = transaction.prepare(
+            "SELECT record FROM audit_events WHERE sequence > ?1 ORDER BY sequence ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![
+                i64::try_from(checkpoint.archived_sequence)
+                    .map_err(|_| StoreError::CorruptData("archive sequence overflow"))?,
+                maximum_events
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut events = Vec::new();
+        for row in rows {
+            let event = decode::<AuditEvent>(&row?)?;
+            if event.occurred_at_unix_ms > eligible_before_unix_ms
+                || !archive_event_is_terminal_and_expired(
+                    &transaction,
+                    &event,
+                    eligible_before_unix_ms,
+                )?
+            {
+                break;
+            }
+            events.push(event);
+        }
+        drop(statement);
+        if events.is_empty() {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let first = events
+            .first()
+            .ok_or(StoreError::CorruptData("archive selection is empty"))?;
+        let last = events
+            .last()
+            .ok_or(StoreError::CorruptData("archive selection is empty"))?;
+        let mut actions = Vec::new();
+        let request_ids = events
+            .iter()
+            .filter_map(|event| event.request_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for request_id in request_ids {
+            if let Some(record) = action_audit_record_in_connection(&transaction, request_id)? {
+                actions.push(record.context);
+            }
+        }
+        let candidate = AuditArchiveCandidateV1 {
+            schema_version: 1,
+            candidate_id: Uuid::new_v4(),
+            segment_sequence: checkpoint
+                .segment_sequence
+                .checked_add(1)
+                .ok_or(StoreError::CorruptData("archive segment sequence overflow"))?,
+            previous_segment_digest: checkpoint.segment_digest,
+            previous_audit_hash: checkpoint.archived_audit_hash,
+            first_audit_sequence: first.sequence,
+            last_audit_sequence: last.sequence,
+            last_audit_hash: last.event_hash,
+            eligible_before_unix_ms,
+            created_at_unix_ms,
+            events,
+            actions,
+        };
+        validate_archive_candidate(&candidate)?;
+        transaction.execute(
+            "INSERT INTO pending_audit_archive(singleton, candidate_digest, record)
+             VALUES (1, ?1, ?2)",
+            params![&candidate.digest()?[..], encode(&candidate)?],
+        )?;
+        transaction.commit()?;
+        Ok(Some(candidate))
+    }
+
+    /// Commit metadata only after the caller has durably written and verified
+    /// the signed segment. Audit rows remain until a separate prune step.
+    pub fn record_sealed_audit_segment(
+        &self,
+        candidate: &AuditArchiveCandidateV1,
+        segment_digest: Sha256Digest,
+        relative_name: &str,
+    ) -> Result<(), StoreError> {
+        validate_archive_candidate(candidate)?;
+        validate_bounded_text(relative_name, 255, "archive segment name")?;
+        if Path::new(relative_name).components().count() != 1 {
+            return Err(StoreError::InvalidInput(
+                "archive segment name is not a basename",
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending: Vec<u8> = transaction.query_row(
+            "SELECT candidate_digest FROM pending_audit_archive WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if !constant_time_digest_eq(&digest_from_blob(pending)?, &candidate.digest()?) {
+            return Err(StoreError::CorruptData("pending archive candidate changed"));
+        }
+        let checkpoint = audit_archive_checkpoint_in_connection(&transaction)?;
+        if candidate.segment_sequence == checkpoint.segment_sequence
+            && candidate.last_audit_sequence == checkpoint.archived_sequence
+            && candidate.last_audit_hash == checkpoint.archived_audit_hash
+            && segment_digest == checkpoint.segment_digest
+        {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if candidate.segment_sequence != checkpoint.segment_sequence.saturating_add(1)
+            || candidate.first_audit_sequence != checkpoint.archived_sequence.saturating_add(1)
+            || candidate.previous_audit_hash != checkpoint.archived_audit_hash
+            || candidate.previous_segment_digest != checkpoint.segment_digest
+        {
+            return Err(StoreError::CorruptData(
+                "archive checkpoint does not match candidate",
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO sealed_audit_segments
+                (segment_sequence, first_audit_sequence, last_audit_sequence,
+                 segment_digest, relative_name, record)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                i64::try_from(candidate.segment_sequence)
+                    .map_err(|_| StoreError::CorruptData("archive sequence overflow"))?,
+                i64::try_from(candidate.first_audit_sequence)
+                    .map_err(|_| StoreError::CorruptData("archive sequence overflow"))?,
+                i64::try_from(candidate.last_audit_sequence)
+                    .map_err(|_| StoreError::CorruptData("archive sequence overflow"))?,
+                &segment_digest[..],
+                relative_name,
+                encode(candidate)?
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE audit_archive_state SET
+                archived_sequence = ?1, archived_audit_hash = ?2,
+                segment_sequence = ?3, segment_digest = ?4
+             WHERE singleton = 1",
+            params![
+                i64::try_from(candidate.last_audit_sequence)
+                    .map_err(|_| StoreError::CorruptData("archive sequence overflow"))?,
+                &candidate.last_audit_hash[..],
+                i64::try_from(candidate.segment_sequence)
+                    .map_err(|_| StoreError::CorruptData("archive sequence overflow"))?,
+                &segment_digest[..]
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Remove only the already-sealed audit prefix and terminal replay rows
+    /// whose authorization window is durably behind the archival horizon.
+    pub fn prune_sealed_audit_segment(&self, candidate_id: Uuid) -> Result<(u64, u64), StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: Vec<u8> = transaction.query_row(
+            "SELECT record FROM pending_audit_archive WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let candidate = decode::<AuditArchiveCandidateV1>(&record)?;
+        if candidate.candidate_id != candidate_id {
+            return Err(StoreError::InvalidInput(
+                "archive candidate identifier mismatch",
+            ));
+        }
+        let checkpoint = audit_archive_checkpoint_in_connection(&transaction)?;
+        if checkpoint.archived_sequence < candidate.last_audit_sequence {
+            return Err(StoreError::InvalidInput("archive segment is not sealed"));
+        }
+        let audit_rows = transaction.execute(
+            "DELETE FROM audit_events WHERE sequence <= ?1",
+            [i64::try_from(candidate.last_audit_sequence)
+                .map_err(|_| StoreError::CorruptData("archive sequence overflow"))?],
+        )?;
+        let request_ids = candidate
+            .events
+            .iter()
+            .filter_map(|event| event.request_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut replay_rows = 0_u64;
+        for request_id in request_ids {
+            let remaining = active_audit_references_request(&transaction, request_id)?;
+            if !remaining {
+                transaction.execute(
+                    "DELETE FROM action_audit_contexts WHERE request_id = ?1
+                       AND EXISTS (
+                           SELECT 1 FROM request_replays
+                           WHERE request_id = ?1 AND terminal_record IS NOT NULL
+                             AND expires_at_unix_ms <= ?2
+                       )",
+                    params![request_id.to_string(), candidate.eligible_before_unix_ms],
+                )?;
+                let deleted = transaction.execute(
+                    "DELETE FROM request_replays
+                     WHERE request_id = ?1 AND terminal_record IS NOT NULL
+                       AND expires_at_unix_ms <= ?2",
+                    params![request_id.to_string(), candidate.eligible_before_unix_ms],
+                )?;
+                replay_rows = replay_rows.saturating_add(deleted as u64);
+            }
+        }
+        transaction.execute("DELETE FROM pending_audit_archive WHERE singleton = 1", [])?;
+        transaction.commit()?;
+        drop(connection);
+        self.tighten_permissions()?;
+        Ok((audit_rows as u64, replay_rows))
+    }
+
+    pub fn audit_archive_checkpoint(&self) -> Result<AuditArchiveCheckpoint, StoreError> {
+        let connection = self.lock()?;
+        audit_archive_checkpoint_in_connection(&connection)
+    }
+
+    pub fn sealed_audit_segments(&self) -> Result<Vec<SealedAuditSegmentMetadata>, StoreError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT segment_sequence, first_audit_sequence, last_audit_sequence,
+                    segment_digest, relative_name
+             FROM sealed_audit_segments ORDER BY segment_sequence ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut segments = Vec::new();
+        for row in rows {
+            let (segment_sequence, first, last, digest, relative_name) = row?;
+            if Path::new(&relative_name).components().count() != 1 {
+                return Err(StoreError::CorruptData(
+                    "sealed archive name is not a basename",
+                ));
+            }
+            segments.push(SealedAuditSegmentMetadata {
+                segment_sequence: u64::try_from(segment_sequence)
+                    .map_err(|_| StoreError::CorruptData("negative segment sequence"))?,
+                first_audit_sequence: u64::try_from(first)
+                    .map_err(|_| StoreError::CorruptData("negative audit sequence"))?,
+                last_audit_sequence: u64::try_from(last)
+                    .map_err(|_| StoreError::CorruptData("negative audit sequence"))?,
+                segment_digest: digest_from_blob(digest)?,
+                relative_name,
+            });
+        }
+        Ok(segments)
+    }
+
     pub fn audit_events_after(
         &self,
         sequence: u64,
@@ -3355,6 +3915,101 @@ fn action_audit_record_in_connection(
     }))
 }
 
+fn audit_archive_checkpoint_in_connection(
+    connection: &Connection,
+) -> Result<AuditArchiveCheckpoint, StoreError> {
+    let (archived_sequence, archived_hash, segment_sequence, segment_digest): (
+        i64,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+    ) = connection.query_row(
+        "SELECT archived_sequence, archived_audit_hash, segment_sequence, segment_digest
+         FROM audit_archive_state WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    Ok(AuditArchiveCheckpoint {
+        archived_sequence: u64::try_from(archived_sequence)
+            .map_err(|_| StoreError::CorruptData("negative archive sequence"))?,
+        archived_audit_hash: digest_from_blob(archived_hash)?,
+        segment_sequence: u64::try_from(segment_sequence)
+            .map_err(|_| StoreError::CorruptData("negative segment sequence"))?,
+        segment_digest: digest_from_blob(segment_digest)?,
+    })
+}
+
+fn validate_archive_candidate(candidate: &AuditArchiveCandidateV1) -> Result<(), StoreError> {
+    if candidate.schema_version != 1
+        || candidate.candidate_id.is_nil()
+        || candidate.segment_sequence == 0
+        || candidate.events.is_empty()
+        || candidate.events.len() > 10_000
+        || candidate.created_at_unix_ms < candidate.eligible_before_unix_ms
+    {
+        return Err(StoreError::CorruptData(
+            "archive candidate metadata is invalid",
+        ));
+    }
+    let mut expected_sequence = candidate.first_audit_sequence;
+    let mut previous_hash = candidate.previous_audit_hash;
+    for event in &candidate.events {
+        if event.sequence != expected_sequence || event.previous_hash != previous_hash {
+            return Err(StoreError::AuditChainInvalid {
+                sequence: event.sequence,
+            });
+        }
+        event.verify_hash()?;
+        previous_hash = event.event_hash;
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData("archive sequence overflow"))?;
+    }
+    if candidate.last_audit_sequence != expected_sequence.saturating_sub(1)
+        || candidate.last_audit_hash != previous_hash
+    {
+        return Err(StoreError::CorruptData("archive candidate tail is invalid"));
+    }
+    for action in &candidate.actions {
+        action.digest()?;
+    }
+    Ok(())
+}
+
+fn archive_event_is_terminal_and_expired(
+    connection: &Connection,
+    event: &AuditEvent,
+    eligible_before_unix_ms: i64,
+) -> Result<bool, StoreError> {
+    let Some(request_id) = event.request_id else {
+        return Ok(true);
+    };
+    let status: Option<(i64, bool)> = connection
+        .query_row(
+            "SELECT expires_at_unix_ms, terminal_record IS NOT NULL
+             FROM request_replays WHERE request_id = ?1",
+            [request_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(status
+        .is_none_or(|(expires_at, terminal)| terminal && expires_at <= eligible_before_unix_ms))
+}
+
+fn active_audit_references_request(
+    connection: &Connection,
+    request_id: Uuid,
+) -> Result<bool, StoreError> {
+    let mut statement = connection.prepare("SELECT record FROM audit_events ORDER BY sequence")?;
+    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    for row in rows {
+        if decode::<AuditEvent>(&row?)?.request_id == Some(request_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn verify_audit_chain_in_connection(
     connection: &Connection,
 ) -> Result<AuditChainState, StoreError> {
@@ -3363,8 +4018,9 @@ fn verify_audit_chain_in_connection(
          FROM audit_events ORDER BY sequence ASC",
     )?;
     let mut rows = statement.query([])?;
-    let mut expected_sequence = 1_u64;
-    let mut previous_hash = ZERO_HASH;
+    let checkpoint = audit_archive_checkpoint_in_connection(connection)?;
+    let mut expected_sequence = checkpoint.archived_sequence.saturating_add(1);
+    let mut previous_hash = checkpoint.archived_audit_hash;
     while let Some(row) = rows.next()? {
         let stored_sequence: i64 = row.get(0)?;
         let stored_previous = digest_from_blob(row.get(1)?)?;
@@ -3398,7 +4054,7 @@ fn verify_audit_chain_in_connection(
     let tail_sequence = u64::try_from(tail_sequence)
         .map_err(|_| StoreError::CorruptData("negative audit tail sequence"))?;
     let tail_hash = digest_from_blob(tail_hash)?;
-    let event_count = expected_sequence - 1;
+    let event_count = expected_sequence.saturating_sub(1);
     if tail_sequence != event_count || !constant_time_digest_eq(&tail_hash, &previous_hash) {
         return Err(StoreError::AuditChainInvalid {
             sequence: event_count.saturating_add(1),
@@ -3589,7 +4245,47 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
          INSERT INTO audit_chain_tail(singleton, tail_sequence, tail_hash)
              VALUES (1, 0, zeroblob(32))
              ON CONFLICT(singleton) DO NOTHING;
-         PRAGMA user_version = 9;",
+
+         CREATE TABLE IF NOT EXISTS audit_archive_state (
+             singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+             archived_sequence INTEGER NOT NULL CHECK (archived_sequence >= 0),
+             archived_audit_hash BLOB NOT NULL CHECK (length(archived_audit_hash) = 32),
+             segment_sequence INTEGER NOT NULL CHECK (segment_sequence >= 0),
+             segment_digest BLOB NOT NULL CHECK (length(segment_digest) = 32)
+         ) STRICT;
+         INSERT INTO audit_archive_state
+             (singleton, archived_sequence, archived_audit_hash,
+              segment_sequence, segment_digest)
+             VALUES (1, 0, zeroblob(32), 0, zeroblob(32))
+             ON CONFLICT(singleton) DO NOTHING;
+
+         CREATE TABLE IF NOT EXISTS pending_audit_archive (
+             singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+             candidate_digest BLOB NOT NULL CHECK (length(candidate_digest) = 32),
+             record BLOB NOT NULL
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS pending_device_rotation (
+             singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+             transaction_id TEXT NOT NULL UNIQUE,
+             record BLOB NOT NULL
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS sealed_audit_segments (
+             segment_sequence INTEGER PRIMARY KEY NOT NULL CHECK (segment_sequence > 0),
+             first_audit_sequence INTEGER NOT NULL CHECK (first_audit_sequence > 0),
+             last_audit_sequence INTEGER NOT NULL CHECK (last_audit_sequence >= first_audit_sequence),
+             segment_digest BLOB NOT NULL UNIQUE CHECK (length(segment_digest) = 32),
+             relative_name TEXT NOT NULL UNIQUE,
+             record BLOB NOT NULL
+         ) STRICT;
+
+         CREATE TABLE IF NOT EXISTS store_limits (
+             singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+             max_total_replays INTEGER NOT NULL CHECK (max_total_replays > 0),
+             max_active_audit_events INTEGER NOT NULL CHECK (max_active_audit_events > 0)
+         ) STRICT;
+         PRAGMA user_version = 10;",
     )?;
     // Pending ceremonies are authorization-free, short-lived bootstrap state.
     // Schema 5 adds the certificate chain needed to revalidate X.509 at local
@@ -3678,6 +4374,15 @@ fn append_audit_in_transaction(
     transaction: &Transaction<'_>,
     draft: AuditEventDraft,
 ) -> Result<AuditEvent, StoreError> {
+    let (active_events, maximum_events): (i64, i64) = transaction.query_row(
+        "SELECT (SELECT COUNT(*) FROM audit_events), max_active_audit_events
+         FROM store_limits WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if active_events >= maximum_events {
+        return Err(StoreError::ResourceLimit("active audit tail capacity"));
+    }
     let (tail_sequence, tail_hash): (i64, Vec<u8>) = transaction.query_row(
         "SELECT tail_sequence, tail_hash FROM audit_chain_tail WHERE singleton = 1",
         [],
@@ -3973,9 +4678,73 @@ fn validate_limits(limits: StoreLimits) -> Result<(), StoreError> {
     if limits.max_pending_pairings == 0
         || limits.max_trusted_peers == 0
         || limits.max_open_replays == 0
+        || limits.max_total_replays < limits.max_open_replays
+        || limits.max_active_audit_events < limits.max_open_replays.saturating_mul(2)
     {
-        return Err(StoreError::InvalidInput("store limits must be non-zero"));
+        return Err(StoreError::InvalidInput(
+            "store limits are zero or cannot preserve live replay audit evidence",
+        ));
     }
+    Ok(())
+}
+
+fn validate_storage_policy(policy: StoragePolicy) -> Result<(), StoreError> {
+    if policy.database_soft_bytes < 16 * 1_048_576
+        || policy.database_hard_bytes <= policy.database_soft_bytes
+        || policy.wal_hard_bytes < 4 * 1_048_576
+        || policy.wal_hard_bytes >= policy.database_hard_bytes
+        || policy.maintenance_reserve_bytes < 8 * 1_048_576
+        || policy.minimum_free_bytes <= policy.maintenance_reserve_bytes
+    {
+        return Err(StoreError::InvalidInput("storage policy limits are unsafe"));
+    }
+    Ok(())
+}
+
+fn assess_storage_pressure(
+    policy: StoragePolicy,
+    observation: StorageObservation,
+) -> StoragePressure {
+    if observation.database_bytes >= policy.database_hard_bytes
+        || observation.wal_bytes >= policy.wal_hard_bytes
+        || observation.available_bytes <= policy.maintenance_reserve_bytes
+    {
+        StoragePressure::Hard
+    } else if observation.database_bytes >= policy.database_soft_bytes
+        || observation.wal_bytes >= policy.wal_hard_bytes.saturating_mul(3) / 4
+        || observation.available_bytes <= policy.minimum_free_bytes
+    {
+        StoragePressure::Soft
+    } else {
+        StoragePressure::Healthy
+    }
+}
+
+fn file_length_if_present(path: &Path) -> Result<u64, StoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            StoreError::InvalidInput("database sidecar is not a regular file"),
+        ),
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_store_limits(connection: &Connection, limits: StoreLimits) -> Result<(), StoreError> {
+    let max_total_replays = i64::try_from(limits.max_total_replays)
+        .map_err(|_| StoreError::InvalidInput("total replay limit exceeds SQLite range"))?;
+    let max_active_audit_events = i64::try_from(limits.max_active_audit_events)
+        .map_err(|_| StoreError::InvalidInput("audit event limit exceeds SQLite range"))?;
+    connection.execute(
+        "INSERT INTO store_limits
+            (singleton, max_total_replays, max_active_audit_events)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET
+             max_total_replays = excluded.max_total_replays,
+             max_active_audit_events = excluded.max_active_audit_events",
+        params![max_total_replays, max_active_audit_events],
+    )?;
     Ok(())
 }
 
@@ -4053,7 +4822,18 @@ fn unix_time_ms() -> Result<i64, StoreError> {
         .map_err(|_| StoreError::CorruptData("system time is out of range"))
 }
 
-fn prepare_private_database_file(path: &Path) -> Result<(), StoreError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DatabaseFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn prepare_private_database_file(path: &Path) -> Result<DatabaseFileIdentity, StoreError> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("state.sqlite3") {
+        return Err(StoreError::InvalidInput(
+            "database must use the fixed state.sqlite3 basename",
+        ));
+    }
     let parent = path
         .parent()
         .ok_or(StoreError::InvalidInput("database path has no parent"))?;
@@ -4077,51 +4857,102 @@ fn prepare_private_database_file(path: &Path) -> Result<(), StoreError> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let resolved_parent = fs::canonicalize(parent)?;
+        validate_sensitive_ancestors(&resolved_parent, true)
+            .map_err(|_| StoreError::InvalidInput("database ancestor security failed"))?;
         if parent_metadata.uid() != rustix::process::geteuid().as_raw() {
             return Err(StoreError::InvalidInput(
                 "database parent must be owned by the daemon account",
             ));
         }
-    }
-
-    if path.exists() {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if parent_metadata.permissions().mode() & 0o022 != 0 {
             return Err(StoreError::InvalidInput(
-                "database path must be a real regular file",
+                "database parent must not be group- or world-writable",
             ));
         }
-        #[cfg(unix)]
+        let directory = rustix::fs::open(
+            parent,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let descriptor = rustix::fs::openat(
+            &directory,
+            "state.sqlite3",
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(std::io::Error::from)?;
+        let file = fs::File::from(descriptor);
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o077 != 0
         {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.uid() != rustix::process::geteuid().as_raw() {
-                return Err(StoreError::InvalidInput(
-                    "database file must be owned by the daemon account",
-                ));
-            }
+            return Err(StoreError::InvalidInput(
+                "database file must be regular, owner-only, singly linked, and service-owned",
+            ));
         }
-    } else {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        match options.open(path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+        return Ok(DatabaseFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+    }
+    #[allow(unreachable_code)]
+    Err(StoreError::InvalidInput(
+        "database descriptor security requires Unix",
+    ))
+}
+
+fn verify_database_identity(path: &Path, expected: DatabaseFileIdentity) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(StoreError::InvalidInput(
+                "database file identity changed while opening",
+            ));
         }
     }
-    tighten_private_permissions(path)
+    Ok(())
 }
 
 fn tighten_private_permissions(path: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         for candidate in sqlite_files(path) {
-            if candidate.exists() {
-                fs::set_permissions(candidate, fs::Permissions::from_mode(0o600))?;
+            let metadata = match fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            use std::os::unix::fs::MetadataExt;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.nlink() != 1
+            {
+                return Err(StoreError::InvalidInput(
+                    "SQLite file or sidecar failed identity validation",
+                ));
             }
+            fs::set_permissions(candidate, fs::Permissions::from_mode(0o600))?;
         }
     }
     Ok(())
@@ -4143,6 +4974,196 @@ mod tests {
     use tempfile::TempDir;
 
     const NOW: i64 = 2_000_000_000_000;
+
+    #[test]
+    fn storage_pressure_transitions_before_reserved_space_is_consumed() -> Result<(), StoreError> {
+        let directory = TempDir::new()?;
+        let policy = StoragePolicy {
+            database_soft_bytes: 16 * 1_048_576,
+            database_hard_bytes: 32 * 1_048_576,
+            wal_hard_bytes: 8 * 1_048_576,
+            minimum_free_bytes: 32 * 1_048_576,
+            maintenance_reserve_bytes: 16 * 1_048_576,
+        };
+        let store = StateStore::open_with_policies(
+            directory.path().join("state.sqlite3"),
+            StoreLimits::default(),
+            policy,
+        )?;
+        assert_eq!(
+            store.assess_storage(StorageObservation {
+                database_bytes: 1,
+                wal_bytes: 1,
+                available_bytes: 64 * 1_048_576,
+            }),
+            StoragePressure::Healthy
+        );
+        assert_eq!(
+            store.assess_storage(StorageObservation {
+                database_bytes: policy.database_soft_bytes,
+                wal_bytes: 1,
+                available_bytes: 64 * 1_048_576,
+            }),
+            StoragePressure::Soft
+        );
+        assert_eq!(
+            store.assess_storage(StorageObservation {
+                database_bytes: 1,
+                wal_bytes: policy.wal_hard_bytes,
+                available_bytes: 64 * 1_048_576,
+            }),
+            StoragePressure::Hard
+        );
+        assert_eq!(
+            store.assess_storage(StorageObservation {
+                database_bytes: 1,
+                wal_bytes: 1,
+                available_bytes: policy.maintenance_reserve_bytes,
+            }),
+            StoragePressure::Hard
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn archival_never_retires_live_or_still_valid_replay_state() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let mut request = replay(&store, Uuid::new_v4())?;
+        request.expires_at_unix_ms = NOW + 100;
+        let fingerprint = request.fingerprint()?;
+        store.reserve_validated_replay_at(&request, NOW)?;
+        store.record_terminal_response(
+            request.request_id,
+            fingerprint,
+            &TerminalResponseMetadata {
+                status: TerminalStatus::Succeeded,
+                response_digest: sha256(b"result"),
+                redacted_error_digest: None,
+                response_size_bytes: 6,
+                completed_at_unix_ms: NOW + 1,
+            },
+        )?;
+
+        if let Some(candidate) = store.prepare_audit_archive(NOW + 50, 10_000, NOW + 51)? {
+            let digest = sha256(b"pre-expiry-segment");
+            store.record_sealed_audit_segment(&candidate, digest, "pre-expiry.postcard")?;
+            store.prune_sealed_audit_segment(candidate.candidate_id)?;
+        }
+        assert!(store.replay_outcome(&request)?.is_some());
+
+        let candidate = store
+            .prepare_audit_archive(NOW + 101, 10_000, NOW + 102)?
+            .ok_or(StoreError::CorruptData(
+                "expired replay was not archive eligible",
+            ))?;
+        store.record_sealed_audit_segment(
+            &candidate,
+            sha256(b"post-expiry-segment"),
+            "post-expiry.postcard",
+        )?;
+        let (_, retired) = store.prune_sealed_audit_segment(candidate.candidate_id)?;
+        assert_eq!(retired, 1);
+        assert!(store.replay_outcome(&request)?.is_none());
+        store.verify_audit_chain()?;
+        Ok(())
+    }
+
+    #[test]
+    fn nonterminal_replay_remains_spent_after_expiry_and_archive() -> Result<(), StoreError> {
+        let (_directory, _path, store) = test_store()?;
+        let mut request = replay(&store, Uuid::new_v4())?;
+        request.expires_at_unix_ms = NOW + 10;
+        store.reserve_validated_replay_at(&request, NOW)?;
+        if let Some(candidate) = store.prepare_audit_archive(NOW + 100, 10_000, NOW + 101)? {
+            store.record_sealed_audit_segment(
+                &candidate,
+                sha256(b"live-replay-prefix"),
+                "live-replay-prefix.postcard",
+            )?;
+            store.prune_sealed_audit_segment(candidate.candidate_id)?;
+        }
+        assert!(matches!(
+            store.replay_outcome(&request)?,
+            Some(ReplayOutcome::DuplicateSame { terminal: None, .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn live_replay_and_audit_tail_have_hard_row_ceilings() -> Result<(), StoreError> {
+        let directory = TempDir::new()?;
+        let store = StateStore::open_with_policies(
+            directory.path().join("state.sqlite3"),
+            StoreLimits {
+                max_pending_pairings: 8,
+                max_trusted_peers: 8,
+                max_open_replays: 1,
+                max_total_replays: 1,
+                max_active_audit_events: 100,
+            },
+            StoragePolicy::default(),
+        )?;
+        let first = replay(&store, Uuid::new_v4())?;
+        let first_fingerprint = first.fingerprint()?;
+        store.reserve_validated_replay_at(&first, NOW)?;
+        store.record_terminal_response(
+            first.request_id,
+            first_fingerprint,
+            &TerminalResponseMetadata {
+                status: TerminalStatus::Succeeded,
+                response_digest: sha256(b"first"),
+                redacted_error_digest: None,
+                response_size_bytes: 5,
+                completed_at_unix_ms: NOW + 1,
+            },
+        )?;
+        let mut second = first.clone();
+        second.request_id = Uuid::new_v4();
+        second.task_id = Uuid::new_v4();
+        second.replay_sequence = 2;
+        second.replay_nonce = sha256(second.request_id.as_bytes());
+        assert!(matches!(
+            store.reserve_validated_replay_at(&second, NOW + 2),
+            Err(StoreError::ResourceLimit("total replay retention capacity"))
+        ));
+
+        let audit_directory = TempDir::new()?;
+        let audit_store = StateStore::open_with_policies(
+            audit_directory.path().join("state.sqlite3"),
+            StoreLimits {
+                max_pending_pairings: 1,
+                max_trusted_peers: 1,
+                max_open_replays: 1,
+                max_total_replays: 1,
+                max_active_audit_events: 2,
+            },
+            StoragePolicy::default(),
+        )?;
+        for time in [NOW, NOW + 1] {
+            audit_store.append_audit(AuditEventDraft {
+                occurred_at_unix_ms: time,
+                kind: AuditKind::AuthorizationRejected,
+                outcome: AuditOutcome::Rejected,
+                request_id: None,
+                actor_digest: None,
+                subject_digest: None,
+                context_digest: Some(sha256(b"coalesced-class")),
+            })?;
+        }
+        assert!(matches!(
+            audit_store.append_audit(AuditEventDraft {
+                occurred_at_unix_ms: NOW + 2,
+                kind: AuditKind::AuthorizationRejected,
+                outcome: AuditOutcome::Rejected,
+                request_id: None,
+                actor_digest: None,
+                subject_digest: None,
+                context_digest: Some(sha256(b"coalesced-class")),
+            }),
+            Err(StoreError::ResourceLimit("active audit tail capacity"))
+        ));
+        Ok(())
+    }
 
     fn test_store() -> Result<(TempDir, PathBuf, StateStore), StoreError> {
         let directory = TempDir::new()?;
@@ -5205,6 +6226,8 @@ mod tests {
                 max_pending_pairings: 1,
                 max_trusted_peers: 1,
                 max_open_replays: 1,
+                max_total_replays: 2,
+                max_active_audit_events: 8,
             },
         )?;
         store.put_pending_pairing(&pending(b"0123456789abcdef0123456789abcdef")?)?;

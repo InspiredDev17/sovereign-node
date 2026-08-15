@@ -110,6 +110,10 @@ pub enum AuthorizationError {
     OwnerMismatch,
     #[error("authorization policy version is unsupported")]
     PolicyVersion,
+    #[error("action schema version is unsupported")]
+    UnsupportedSchemaVersion,
+    #[error("action protocol version is unsupported")]
+    UnsupportedProtocolVersion,
     #[error("authorization uses a duplicate request")]
     Duplicate,
     #[error("authorization replay identifier collides with prior work")]
@@ -138,11 +142,15 @@ impl AuthorizationError {
             }
             Self::Store(StoreError::ResourceLimit(_)) => ActionErrorCode::ResourceExhausted,
             Self::Store(StoreError::ClockRollback) => ActionErrorCode::ClockRollback,
+            Self::Store(StoreError::StoragePressure) => ActionErrorCode::StoragePressure,
             Self::Store(_) | Self::Clock => ActionErrorCode::Internal,
             Self::Forged | Self::OwnerMismatch | Self::TransportBinding => {
                 ActionErrorCode::ForgedAuthorization
             }
-            Self::TtlExceeded | Self::PolicyVersion | Self::Encoding | Self::PairingMaterial => {
+            Self::UnsupportedSchemaVersion
+            | Self::UnsupportedProtocolVersion
+            | Self::PolicyVersion => ActionErrorCode::VersionMismatch,
+            Self::TtlExceeded | Self::Encoding | Self::PairingMaterial => {
                 ActionErrorCode::InvalidRequest
             }
         }
@@ -388,6 +396,12 @@ fn verify_signature(
 
 fn map_validation(error: ValidationError) -> AuthorizationError {
     match error {
+        ValidationError::UnsupportedSchemaVersion(_) => {
+            AuthorizationError::UnsupportedSchemaVersion
+        }
+        ValidationError::UnsupportedProtocolVersion(_) => {
+            AuthorizationError::UnsupportedProtocolVersion
+        }
         ValidationError::WrongNode { .. } => AuthorizationError::WrongNode,
         ValidationError::Expired => AuthorizationError::Expired,
         ValidationError::NotYetValid => AuthorizationError::NotYetValid,

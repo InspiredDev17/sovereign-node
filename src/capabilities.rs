@@ -1,29 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 
-use sha2::{Digest, Sha256};
-use thiserror::Error;
-use tokio::io::AsyncReadExt;
-
 use crate::authz::VerifiedAction;
-use crate::config::{ApprovedActionConfig, NodeConfig};
+use crate::config::NodeConfig;
 use crate::process_status::{ProcessStatusError, ProcessStatusReporter};
 use crate::protocol::{
-    ActionArguments, ActionErrorCode, ActionResultV1, ActionTarget, ApprovedActionOutcome,
-    ApprovedActionResultV1, FileReadResultV1, GpuResourceV1, InferenceEngineStatusV1,
-    LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
+    ActionArguments, ActionErrorCode, ActionResultV1, ActionTarget, FileReadResultV1,
+    GpuResourceV1, InferenceEngineStatusV1, LoadedModelV1, Sha256Digest, TrustStatus, UnixMillis,
 };
 use crate::repository_status::{RepositoryStatusError, RepositoryStatusReporter};
 use crate::resources::{HealthReporter, QueueSnapshot, ResourceReporter, ResourceSnapshotReporter};
 use crate::service_status::{ServiceStatusError, ServiceStatusReporter};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 #[derive(Debug, Eq, Error, PartialEq)]
 pub enum CapabilityError {
@@ -35,8 +29,6 @@ pub enum CapabilityError {
     ArgumentMismatch,
     #[error("capability is not implemented by a configured local adapter")]
     Unsupported,
-    #[error("approved action executable does not match local policy")]
-    ExecutablePolicy,
     #[error("local execution failed")]
     Execution,
     #[error("capability result exceeded a local resource limit")]
@@ -47,7 +39,7 @@ impl CapabilityError {
     #[must_use]
     pub const fn code(&self) -> ActionErrorCode {
         match self {
-            Self::TargetNotAllowed | Self::ExecutablePolicy => ActionErrorCode::TargetNotAllowed,
+            Self::TargetNotAllowed => ActionErrorCode::TargetNotAllowed,
             Self::UnauthorizedFileAccess => ActionErrorCode::UnauthorizedFileAccess,
             Self::ArgumentMismatch => ActionErrorCode::CapabilityMismatch,
             Self::Unsupported => ActionErrorCode::CapabilityNotAdvertised,
@@ -165,12 +157,9 @@ impl CapabilityExecutor {
                     RepositoryStatusError::TargetNotFound => CapabilityError::TargetNotAllowed,
                 }),
             (
-                ActionTarget::ApprovedAction { action_id },
-                ActionArguments::ExecuteApprovedAction { parameters },
-            ) => self
-                .execute_approved_action(action_id, parameters)
-                .await
-                .map(ActionResultV1::ExecuteApprovedAction),
+                ActionTarget::ApprovedAction { .. },
+                ActionArguments::ExecuteApprovedAction { .. },
+            ) => Err(CapabilityError::Unsupported),
             (ActionTarget::Gpu { index }, ActionArguments::GpuStatus) => {
                 let snapshot = self
                     .resources
@@ -247,69 +236,6 @@ impl CapabilityExecutor {
             content_digest: Sha256Digest(Sha256::digest(&contents).into()),
             contents,
             end_of_file,
-        })
-    }
-
-    async fn execute_approved_action(
-        &self,
-        action_id: &str,
-        parameters: &BTreeMap<String, String>,
-    ) -> Result<ApprovedActionResultV1, CapabilityError> {
-        // v1 intentionally defines no caller-controlled parameter schema. A future schema may map
-        // typed values to a local adapter, but values must never become argv or environment input.
-        if !parameters.is_empty() {
-            return Err(CapabilityError::ArgumentMismatch);
-        }
-        let action = self
-            .config
-            .approved_actions
-            .get(action_id)
-            .ok_or(CapabilityError::TargetNotAllowed)?;
-        validate_executable(action)?;
-        let timeout_seconds = action
-            .timeout_secs
-            .unwrap_or(self.config.policy.max_action_runtime_secs);
-        let mut command = tokio::process::Command::new(&action.executable);
-        command
-            .args(&action.fixed_arguments)
-            .current_dir(&action.working_directory)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|_| CapabilityError::Execution)?;
-        let stdout = child.stdout.take().ok_or(CapabilityError::Execution)?;
-        let stderr = child.stderr.take().ok_or(CapabilityError::Execution)?;
-        let output_limit = self.config.policy.max_action_output_bytes;
-        let stdout_task = tokio::spawn(read_bounded_and_drain(stdout, output_limit));
-        let stderr_task = tokio::spawn(read_bounded_and_drain(stderr, 0));
-
-        let outcome =
-            match tokio::time::timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
-                Ok(Ok(status)) if status.success() => ApprovedActionOutcome::Completed,
-                Ok(Ok(_)) | Ok(Err(_)) => ApprovedActionOutcome::Failed,
-                Err(_) => {
-                    child.kill().await.map_err(|_| CapabilityError::Execution)?;
-                    let _ = child.wait().await;
-                    ApprovedActionOutcome::TimedOut
-                }
-            };
-        let drain_deadline = Duration::from_secs(2);
-        let (output, output_truncated) = tokio::time::timeout(drain_deadline, stdout_task)
-            .await
-            .map_err(|_| CapabilityError::Execution)?
-            .map_err(|_| CapabilityError::Execution)?
-            .map_err(|_| CapabilityError::Execution)?;
-        tokio::time::timeout(drain_deadline, stderr_task)
-            .await
-            .map_err(|_| CapabilityError::Execution)?
-            .map_err(|_| CapabilityError::Execution)?
-            .map_err(|_| CapabilityError::Execution)?;
-        Ok(ApprovedActionResultV1 {
-            outcome,
-            output,
-            output_truncated,
         })
     }
 }
@@ -521,83 +447,6 @@ fn filter_model_status(
     }
 }
 
-async fn read_bounded_and_drain<R>(
-    mut reader: R,
-    retain_limit: usize,
-) -> Result<(Vec<u8>, bool), std::io::Error>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut retained = Vec::with_capacity(retain_limit.min(65_536));
-    let mut truncated = false;
-    let mut buffer = [0_u8; 8_192];
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            break;
-        }
-        let remaining = retain_limit.saturating_sub(retained.len());
-        let keep = remaining.min(count);
-        retained.extend_from_slice(&buffer[..keep]);
-        truncated |= keep < count;
-    }
-    Ok((retained, truncated))
-}
-
-fn validate_executable(action: &ApprovedActionConfig) -> Result<(), CapabilityError> {
-    if is_shell_or_interpreter(&action.executable) {
-        return Err(CapabilityError::ExecutablePolicy);
-    }
-    let metadata = std::fs::symlink_metadata(&action.executable)
-        .map_err(|_| CapabilityError::ExecutablePolicy)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(CapabilityError::ExecutablePolicy);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.mode() & 0o022 != 0 || metadata.mode() & 0o111 == 0 {
-            return Err(CapabilityError::ExecutablePolicy);
-        }
-    }
-    if let Some(expected_hex) = &action.executable_sha256 {
-        let contents =
-            std::fs::read(&action.executable).map_err(|_| CapabilityError::ExecutablePolicy)?;
-        if contents.len() > 512 * 1_048_576 {
-            return Err(CapabilityError::ExecutablePolicy);
-        }
-        let actual = hex::encode(Sha256::digest(contents));
-        if !actual.eq_ignore_ascii_case(expected_hex) {
-            return Err(CapabilityError::ExecutablePolicy);
-        }
-    }
-    Ok(())
-}
-
-fn is_shell_or_interpreter(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-        return true;
-    };
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "sh" | "bash"
-            | "zsh"
-            | "fish"
-            | "dash"
-            | "ksh"
-            | "cmd"
-            | "cmd.exe"
-            | "powershell"
-            | "powershell.exe"
-            | "pwsh"
-            | "python"
-            | "python3"
-            | "node"
-            | "deno"
-            | "bun"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -610,13 +459,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_and_script_interpreters_are_never_catalog_executables() {
-        for path in ["/bin/sh", "/bin/bash", "/usr/bin/python3", "/usr/bin/node"] {
-            assert!(is_shell_or_interpreter(Path::new(path)));
+    fn shipping_executor_contains_no_process_spawn_api() {
+        let source = include_str!("capabilities.rs");
+        for needle in [
+            ["process::", "Command"].concat(),
+            ["Command", "::new"].concat(),
+            [".spa", "wn()"].concat(),
+        ] {
+            assert!(!source.contains(&needle));
         }
-        assert!(!is_shell_or_interpreter(Path::new(
-            "/usr/local/libexec/fixed-action"
-        )));
     }
 
     #[test]

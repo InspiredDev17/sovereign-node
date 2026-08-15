@@ -20,11 +20,12 @@ use crate::protocol::{
 };
 use crate::resources::ResourceReporter;
 use crate::security::{
-    SecureFileError, create_private_file, ensure_private_directory, read_private_file,
+    SecureFileError, create_private_file, ensure_private_directory, read_private_file_bounded,
 };
 use crate::store::{ActivePolicyBinding, StoreError, TrustedPeer};
 
 const IDENTITY_FILENAME: &str = "identity.json";
+const PENDING_IDENTITY_FILENAME: &str = "identity.rotation.pending.json";
 const IDENTITY_ROTATION_DOMAIN: &[u8] = b"sovereign-node/device-identity-rotation/v1\0";
 const ACTIVE_TRUST_SET_DOMAIN: &[u8] = b"sovereign-node/active-trust-set/v1\0";
 pub const MAX_IDENTITY_PROOF_JSON_BYTES: u64 = 1_048_576;
@@ -194,7 +195,7 @@ impl NodeIdentity {
         }
         ensure_private_directory(data_dir)?;
         let path = identity_path(data_dir);
-        let mut raw = read_private_file(&path)?;
+        let mut raw = read_private_file_bounded(&path, 64 * 1_024)?;
         let parsed = serde_json::from_slice::<IdentityDocument>(&raw);
         raw.zeroize();
         let mut document = parsed?;
@@ -330,6 +331,17 @@ impl NodeIdentity {
         now: UnixMillis,
         owner_confirmed: bool,
     ) -> Result<(Self, RotationBindingV1), IdentityError> {
+        let (rotated, binding) = self.prepare_local_rotation(now, owner_confirmed)?;
+        rotated.stage_pending_rotation(data_dir)?;
+        Self::activate_pending_rotation(data_dir)?;
+        Ok((rotated, binding))
+    }
+
+    pub fn prepare_local_rotation(
+        &self,
+        now: UnixMillis,
+        owner_confirmed: bool,
+    ) -> Result<(Self, RotationBindingV1), IdentityError> {
         if !owner_confirmed {
             return Err(IdentityError::Invalid(
                 "local owner confirmation is required for credential rotation".to_owned(),
@@ -361,8 +373,60 @@ impl NodeIdentity {
             rotation_counter: next_counter,
             signing_key: next_key,
         };
-        rotated.persist_atomic(&identity_path(data_dir))?;
         Ok((rotated, binding))
+    }
+
+    pub fn stage_pending_rotation(&self, data_dir: &Path) -> Result<(), IdentityError> {
+        let path = data_dir.join(PENDING_IDENTITY_FILENAME);
+        if path.exists() {
+            let existing = Self::load_from_path(&path)?;
+            if existing.key_id() == self.key_id()
+                && existing.node_id() == self.node_id()
+                && existing.rotation_counter == self.rotation_counter
+            {
+                return Ok(());
+            }
+            return Err(IdentityError::Invalid(
+                "a different device identity rotation is already pending".to_owned(),
+            ));
+        }
+        self.persist_new(&path)
+    }
+
+    pub fn load_pending_rotation(data_dir: &Path) -> Result<Option<Self>, IdentityError> {
+        let path = data_dir.join(PENDING_IDENTITY_FILENAME);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Self::load_from_path(&path).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn activate_pending_rotation(data_dir: &Path) -> Result<(), IdentityError> {
+        let pending = data_dir.join(PENDING_IDENTITY_FILENAME);
+        let target = identity_path(data_dir);
+        fs::rename(&pending, &target)?;
+        fs::File::open(data_dir)?.sync_all()?;
+        Ok(())
+    }
+
+    fn load_from_path(path: &Path) -> Result<Self, IdentityError> {
+        let mut raw = read_private_file_bounded(path, 64 * 1_024)?;
+        let parsed = serde_json::from_slice::<IdentityDocument>(&raw);
+        raw.zeroize();
+        let mut document = parsed?;
+        let result = validate_document(&document).map(|()| Self {
+            node_id: document.node_id,
+            device: DeviceIdentityV1 {
+                display_name: document.display_name.clone(),
+                installation_id: document.installation_id,
+            },
+            created_at: document.created_at,
+            rotation_counter: document.rotation_counter,
+            signing_key: SigningKey::from_bytes(&document.signing_key),
+        });
+        document.signing_key.zeroize();
+        result
     }
 
     fn persist_new(&self, path: &Path) -> Result<(), IdentityError> {
@@ -370,19 +434,6 @@ impl NodeIdentity {
         let result = create_private_file(path, &serialized);
         serialized.zeroize();
         result?;
-        Ok(())
-    }
-
-    fn persist_atomic(&self, path: &Path) -> Result<(), IdentityError> {
-        let next_path = path.with_extension(format!("next-{}", Uuid::new_v4()));
-        self.persist_new(&next_path)?;
-        if let Err(error) = fs::rename(&next_path, path) {
-            let _ = fs::remove_file(&next_path);
-            return Err(error.into());
-        }
-        if let Some(parent) = path.parent() {
-            fs::File::open(parent)?.sync_all()?;
-        }
         Ok(())
     }
 
@@ -646,7 +697,9 @@ mod tests {
 
     use super::*;
     use crate::protocol::Capability;
-    use crate::store::TrustStatus as StoreTrustStatus;
+    use crate::store::{
+        AuditKind, PendingDeviceRotationV1, StateStore, TrustStatus as StoreTrustStatus, sha256,
+    };
 
     fn manifest(generated_at: UnixMillis) -> CapabilityManifestV1 {
         CapabilityManifestV1 {
@@ -712,6 +765,56 @@ mod tests {
                 .rotate_locally(temp.path(), UnixMillis(2_000), false)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn device_rotation_recovers_across_stage_swap_and_audit_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let (identity, _) =
+            NodeIdentity::load_or_initialize(temp.path(), "test-node", UnixMillis(1_000))?;
+        let store = StateStore::open(temp.path().join("state.sqlite3"))?;
+        let (rotated, binding) = identity.prepare_local_rotation(UnixMillis(2_000), true)?;
+        rotated.stage_pending_rotation(temp.path())?;
+        let continuity_binding = postcard::to_allocvec(&binding)?;
+        let pending = PendingDeviceRotationV1 {
+            schema_version: 1,
+            transaction_id: Uuid::new_v4(),
+            node_id: identity.node_id().to_string(),
+            previous_key_id: identity.key_id().0,
+            next_key_id: rotated.key_id().0,
+            rotation_counter: 1,
+            continuity_digest: sha256(&continuity_binding),
+            continuity_binding,
+            started_at_unix_ms: 2_000,
+        };
+        let actor = sha256(b"local owner");
+        store.begin_device_rotation(&pending, actor)?;
+
+        // Crash before swap: old identity and staged key are both still coherent.
+        assert_eq!(NodeIdentity::load(temp.path())?.key_id(), identity.key_id());
+        assert_eq!(
+            NodeIdentity::load_pending_rotation(temp.path())?
+                .ok_or("pending identity missing")?
+                .key_id(),
+            rotated.key_id()
+        );
+        NodeIdentity::activate_pending_rotation(temp.path())?;
+
+        // Crash after swap but before completion: durable store evidence is retained.
+        let active = NodeIdentity::load(temp.path())?;
+        assert_eq!(active.key_id(), rotated.key_id());
+        assert_eq!(store.pending_device_rotation()?, Some(pending.clone()));
+        store.complete_device_rotation(pending.transaction_id, active.key_id().0, actor, 2_001)?;
+        assert!(store.pending_device_rotation()?.is_none());
+        let kinds = store
+            .audit_events_after(0, 100)?
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&AuditKind::NodeIdentityRotationStarted));
+        assert!(kinds.contains(&AuditKind::NodeIdentityRotated));
         Ok(())
     }
 

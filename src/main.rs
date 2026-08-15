@@ -12,7 +12,8 @@ use rustls_pki_types::pem::PemObject;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sovereign_node::audit::{
-    MAX_AUDIT_EXPORT_EVENTS, export_local_audit, verify_audit_export_file,
+    MAX_AUDIT_EXPORT_EVENTS, export_local_audit, seal_eligible_audit_segment,
+    verify_audit_export_file, verify_audit_segment_file, verify_complete_audit_archive,
 };
 use sovereign_node::authz::{AuthorizationEngine, Clock, SystemClock};
 use sovereign_node::capabilities::CapabilityExecutor;
@@ -21,7 +22,8 @@ use sovereign_node::config::{
     ResourceReportingConfig, ServiceReportingConfig,
 };
 use sovereign_node::identity::{
-    IdentityProofRequest, NodeIdentity, require_active_policy, verify_identity_proof_file,
+    IdentityProofRequest, NodeIdentity, RotationBindingV1, require_active_policy,
+    verify_identity_proof_file,
 };
 use sovereign_node::lifecycle::{LeaseKind, LifecycleLease};
 use sovereign_node::pairing::{
@@ -35,7 +37,7 @@ use sovereign_node::protocol::{
 use sovereign_node::resources::{HealthReporter, ResourceReporter};
 use sovereign_node::runtime::{NodeRuntime, RuntimeCapacity};
 use sovereign_node::store::{
-    AuditEventDraft, AuditKind, AuditOutcome, RevocationOutcome, StateStore, sha256,
+    PendingDeviceRotationV1, RevocationOutcome, StateStore, StoragePolicy, StoreLimits, sha256,
 };
 use sovereign_node::update::{LocalUpdateStageRequest, UpdatePolicy, stage_local_update};
 use uuid::Uuid;
@@ -108,6 +110,18 @@ enum ClockCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
+    /// Inspect active database, WAL, free-space, and sealed-chain pressure state.
+    Status { config: PathBuf },
+    /// Seal and prune one replay-safe audit prefix into the fixed owner-private archive.
+    Archive {
+        config: PathBuf,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Verify one signed archive segment without mutating state.
+    VerifySegment { input: PathBuf },
+    /// Verify every sealed segment against the durable local archive manifest.
+    VerifyArchive { config: PathBuf },
     /// Verify the full chain and print one local-only signed JSON page.
     Export(AuditExportArgs),
     /// Verify one untrusted export against owner-retained identity and chain pins.
@@ -410,9 +424,74 @@ async fn main() -> Result<()> {
 
 fn audit(command: AuditCommand) -> Result<()> {
     match command {
+        AuditCommand::Status { config } => audit_storage_status(&config),
+        AuditCommand::Archive { config, confirm } => audit_archive(&config, confirm),
+        AuditCommand::VerifySegment { input } => {
+            let segment = verify_audit_segment_file(&input)?;
+            print_json(&serde_json::json!({
+                "verification": "verified",
+                "node_id": segment.segment.node_id.to_string(),
+                "segment_sequence": segment.segment.candidate.segment_sequence,
+                "first_audit_sequence": segment.segment.candidate.first_audit_sequence,
+                "last_audit_sequence": segment.segment.candidate.last_audit_sequence,
+                "segment_digest_sha256": hex::encode(segment.digest()?.0),
+            }))
+        }
+        AuditCommand::VerifyArchive { config } => {
+            let config = NodeConfig::load(&config)?;
+            let store = open_store(&config)?;
+            let verification =
+                verify_complete_audit_archive(&store, &config.data_dir.join("audit/archive"))?;
+            print_json(&verification)
+        }
         AuditCommand::Export(args) => audit_export(args),
         AuditCommand::Verify(args) => audit_verify(args),
     }
+}
+
+fn audit_storage_status(config_path: &Path) -> Result<()> {
+    let config = NodeConfig::load(config_path)?;
+    let store = open_store(&config)?;
+    let observation = store.storage_observation()?;
+    let checkpoint = store.audit_archive_checkpoint()?;
+    print_json(&serde_json::json!({
+        "pressure": store.assess_storage(observation),
+        "observation": observation,
+        "archived_audit_sequence": checkpoint.archived_sequence,
+        "archive_segment_sequence": checkpoint.segment_sequence,
+        "archive_segment_digest_sha256": hex::encode(checkpoint.segment_digest),
+        "archive_root": "audit/archive",
+    }))
+}
+
+fn audit_archive(config_path: &Path, confirm: bool) -> Result<()> {
+    if !confirm {
+        bail!("explicit local confirmation is required to archive audit history");
+    }
+    let config = NodeConfig::load(config_path)?;
+    let _lease = LifecycleLease::acquire(&config.data_dir, LeaseKind::AdminMutation)?;
+    let identity = NodeIdentity::load(&config.data_dir)?;
+    let store = open_store(&config)?;
+    store.verify_audit_chain()?;
+    let observed = now()?;
+    let retention_ms = config.storage.replay_retention_secs.saturating_mul(1_000);
+    let eligible_before = observed.0.saturating_sub(retention_ms);
+    let eligible_before = i64::try_from(eligible_before)?;
+    let archive_root = config.data_dir.join("audit/archive");
+    let result = seal_eligible_audit_segment(
+        &store,
+        &identity,
+        &archive_root,
+        eligible_before,
+        config.storage.archive_max_events,
+        observed,
+    )?;
+    store.checkpoint_wal_passive()?;
+    print_json(&serde_json::json!({
+        "result": result,
+        "pressure": store.storage_pressure()?,
+        "archive_root": "audit/archive",
+    }))
 }
 
 fn audit_export(args: AuditExportArgs) -> Result<()> {
@@ -558,6 +637,7 @@ fn config_example(data_dir: &Path) -> Result<()> {
         listen: None,
         tls: None,
         policy: PolicyConfig::default(),
+        storage: Default::default(),
         file_roots: Default::default(),
         read_roots: Default::default(),
         approved_actions: Default::default(),
@@ -947,27 +1027,63 @@ fn rotate_identity(config_path: &Path, confirm: bool) -> Result<()> {
             "device identity rotation is refused while trusted peers exist; revoke them and restart before rotating"
         );
     }
-    let old_key_id = identity.key_id();
     let local_actor = sha256(b"local-owner-confirmed-identity-rotation-v1");
-    store.append_audit(AuditEventDraft {
-        occurred_at_unix_ms: to_i64(rotation_time)?,
-        kind: AuditKind::NodeIdentityRotationStarted,
-        outcome: AuditOutcome::Observed,
-        request_id: None,
-        actor_digest: Some(local_actor),
-        subject_digest: Some(old_key_id.0),
-        context_digest: Some(sha256(identity.node_id().to_string().as_bytes())),
-    })?;
-    let (rotated, binding) = identity.rotate_locally(&config.data_dir, rotation_time, confirm)?;
-    store.append_audit(AuditEventDraft {
-        occurred_at_unix_ms: to_i64(rotation_time)?,
-        kind: AuditKind::NodeIdentityRotated,
-        outcome: AuditOutcome::Accepted,
-        request_id: None,
-        actor_digest: Some(local_actor),
-        subject_digest: Some(old_key_id.0),
-        context_digest: Some(rotated.key_id().0),
-    })?;
+    if let Some(pending) = store.pending_device_rotation()? {
+        let staged = NodeIdentity::load_pending_rotation(&config.data_dir)?;
+        let rotated = if identity.key_id().0 == pending.next_key_id {
+            identity
+        } else if identity.key_id().0 == pending.previous_key_id {
+            let staged = staged.ok_or_else(|| anyhow!("pending rotation key file is missing"))?;
+            if staged.key_id().0 != pending.next_key_id {
+                bail!("pending rotation key does not match durable continuity record");
+            }
+            NodeIdentity::activate_pending_rotation(&config.data_dir)?;
+            NodeIdentity::load(&config.data_dir)?
+        } else {
+            bail!("current identity does not match either side of pending rotation");
+        };
+        store.complete_device_rotation(
+            pending.transaction_id,
+            rotated.key_id().0,
+            local_actor,
+            to_i64(rotation_time)?,
+        )?;
+        let (binding, remainder): (RotationBindingV1, &[u8]) =
+            postcard::take_from_bytes(&pending.continuity_binding)?;
+        if !remainder.is_empty() {
+            bail!("pending rotation continuity record contains trailing bytes");
+        }
+        return print_json(&serde_json::json!({
+            "node_id": rotated.node_id().to_string(),
+            "identity_fingerprint_sha256": rotated.fingerprint(),
+            "rotation_binding": binding,
+            "recovered_pending_rotation": true,
+            "daemon_restart_required": true
+        }));
+    }
+    let (rotated, binding) = identity.prepare_local_rotation(rotation_time, confirm)?;
+    rotated.stage_pending_rotation(&config.data_dir)?;
+    let continuity_binding = postcard::to_allocvec(&binding)?;
+    let pending = PendingDeviceRotationV1 {
+        schema_version: 1,
+        transaction_id: Uuid::new_v4(),
+        node_id: identity.node_id().to_string(),
+        previous_key_id: identity.key_id().0,
+        next_key_id: rotated.key_id().0,
+        rotation_counter: rotated.cryptographic_identity().rotation_counter,
+        continuity_digest: sha256(&continuity_binding),
+        continuity_binding,
+        started_at_unix_ms: to_i64(rotation_time)?,
+    };
+    store.begin_device_rotation(&pending, local_actor)?;
+    NodeIdentity::activate_pending_rotation(&config.data_dir)?;
+    let rotated = NodeIdentity::load(&config.data_dir)?;
+    store.complete_device_rotation(
+        pending.transaction_id,
+        rotated.key_id().0,
+        local_actor,
+        to_i64(rotation_time)?,
+    )?;
     print_json(&serde_json::json!({
         "node_id": rotated.node_id().to_string(),
         "identity_fingerprint_sha256": rotated.fingerprint(),
@@ -1039,8 +1155,16 @@ async fn serve(config_path: &Path) -> Result<()> {
         },
         daemon_lease.clone(),
     ));
-    sovereign_node::transport::serve(config, store, runtime).await?;
-    Ok(())
+    tokio::select! {
+        result = sovereign_node::transport::serve(config, store, runtime) => {
+            result?;
+            Ok(())
+        }
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            Ok(())
+        }
+    }
 }
 
 fn pairing_context(
@@ -1060,7 +1184,23 @@ fn pairing_context(
 }
 
 fn open_store(config: &NodeConfig) -> Result<StateStore> {
-    StateStore::open(config.data_dir.join(STATE_DATABASE)).map_err(Into::into)
+    let defaults = StoreLimits::default();
+    StateStore::open_with_policies(
+        config.data_dir.join(STATE_DATABASE),
+        StoreLimits {
+            max_total_replays: config.storage.max_total_replays,
+            max_active_audit_events: config.storage.max_active_audit_events,
+            ..defaults
+        },
+        StoragePolicy {
+            database_soft_bytes: config.storage.database_soft_bytes,
+            database_hard_bytes: config.storage.database_hard_bytes,
+            wal_hard_bytes: config.storage.wal_hard_bytes,
+            minimum_free_bytes: config.storage.minimum_free_bytes,
+            maintenance_reserve_bytes: config.storage.maintenance_reserve_bytes,
+        },
+    )
+    .map_err(Into::into)
 }
 
 fn now() -> Result<UnixMillis> {

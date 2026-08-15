@@ -16,7 +16,9 @@ use crate::protocol::{
     SCHEMA_VERSION_V1, SignedActionResponseV1, SignedActionV1, TaskId, TrustStatus, UnixMillis,
 };
 use crate::resources::QueueSnapshot;
-use crate::store::{StateStore, StoreError, TerminalResponseMetadata, TerminalStatus};
+use crate::store::{
+    StateStore, StoragePressure, StoreError, TerminalResponseMetadata, TerminalStatus,
+};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -79,6 +81,9 @@ impl NodeRuntime {
         action: SignedActionV1,
         peer: &TransportPeer,
     ) -> Result<SignedActionResponseV1, RuntimeError> {
+        if let Some(response) = self.storage_pressure_response(&action)? {
+            return Ok(response);
+        }
         let request_id = action.request.request_id;
         let task_id = action.request.task_id;
         let Some(admission) = self.try_admit() else {
@@ -322,6 +327,29 @@ impl NodeRuntime {
         Ok(signed)
     }
 
+    /// Produce a bounded node-signed denial without consuming request, rate,
+    /// replay, or audit capacity. Transport calls this before its durable rate
+    /// counters so disk pressure cannot amplify itself through denial writes.
+    pub fn storage_pressure_response(
+        &self,
+        action: &SignedActionV1,
+    ) -> Result<Option<SignedActionResponseV1>, RuntimeError> {
+        match self.store.storage_pressure() {
+            Ok(StoragePressure::Healthy) => Ok(None),
+            Ok(StoragePressure::Soft | StoragePressure::Hard) | Err(_) => self
+                .sign_response(self.rejection(
+                    action.request.request_id,
+                    action.request.task_id,
+                    ActionStatus::Rejected,
+                    ActionErrorCode::StoragePressure,
+                    "node storage maintenance is required before remote work can continue",
+                    true,
+                    None,
+                )?)
+                .map(Some),
+        }
+    }
+
     #[must_use]
     pub fn queue_snapshot(&self, accepting_remote_work: bool) -> QueueSnapshot {
         let admitted = self.admitted.load(Ordering::Acquire);
@@ -453,10 +481,7 @@ fn safe_capability_message(error: &CapabilityError) -> &'static str {
         CapabilityError::UnauthorizedFileAccess => "file access is not authorized",
         CapabilityError::ArgumentMismatch => "capability arguments do not match local policy",
         CapabilityError::Unsupported => "capability adapter is not configured",
-        CapabilityError::ExecutablePolicy => {
-            "approved action does not match local executable policy"
-        }
-        CapabilityError::Execution => "approved local action failed",
+        CapabilityError::Execution => "configured local status adapter failed",
         CapabilityError::ResourceExhausted => "capability exceeded a local resource limit",
     }
 }
