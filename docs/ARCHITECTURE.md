@@ -27,6 +27,34 @@ Agent Green monitors node security independently. Sovereign Node may report its
 health state, but it cannot disable, reconfigure, update, or impersonate Agent
 Green.
 
+## Sovereign trust domains
+
+The development workload foundation preserves separate authorities:
+
+- AI-Avenger owns classification, cognitive planning, specialist/model
+  selection, owner approvals and cross-node placement.
+- Native Inference Engine owns tokenization, tensor execution, scheduling,
+  batching and inference internals.
+- Model Foundry owns artifact acquisition, quarantine, qualification,
+  provenance, signing and promotion.
+- Sovereign-AI-Contracts owns canonical cross-repository types.
+- Memory Vault owns durable cognitive memory.
+- Agent Green is an independent restrictive security authority.
+- Action Broker owns privileged tools and capability policy.
+- Sovereign Node owns local identity, enrollment, eligibility, resource
+  admission, service health and authenticated node communication.
+
+Node admission is not cognitive routing. Hardware capability is not model
+capability. Service availability is not authorization. Enrollment is not Action
+Broker authority. Agent Green may restrict but never grant. Workload service
+invocation is not arbitrary process execution.
+
+The current v0.1 network endpoint implements only the legacy exact-action
+protocol. The typed workload admission and service registry in `src/workload.rs`
+are domain-separated, development-only and not remotely reachable. They use
+transitional local types pending canonical Sovereign-AI-Contracts definitions;
+see `WORKLOAD-ADMISSION.md` and `SERVICE-REGISTRY.md`.
+
 ## Security principles
 
 1. A network location is not an identity. An IP address never establishes
@@ -153,9 +181,11 @@ the consumed RequestId and requiring owner reconciliation.
 The registry contains only compiled-in capability kinds with an explicit local
 policy instance. Each executor validates a typed argument schema and target
 allowlist. There is no fallback from an unknown capability to a command shell.
-ExecuteApprovedAction selects a preinstalled action identifier and fixed
-executable; it cannot accept a shell string, executable path, script body, or
-uploaded binary.
+`ExecuteApprovedAction` is unavailable: valid configuration cannot advertise
+it, direct dispatch returns `Unsupported`, and no process-spawning
+implementation remains in the shipping runtime. Future service supervision, if
+this repository ever owns it, is a separate pinned-service mechanism and cannot
+reuse the legacy action protocol.
 
 Before the authorization layer sees a decoded remote action, transport applies
 atomic per-paired-peer and node-global admission limits stored in the local
@@ -227,6 +257,24 @@ immutable replay fingerprint.
 Migration does not invent context for historical replay rows. Those rows keep
 their replay and terminal semantics, while action-context inspection correctly
 returns absent for pre-v9 history.
+
+Schema v10 separates the active audit tail from sealed history. Conservative
+defaults cap the active database at a 256 MiB soft threshold and 512 MiB hard
+threshold, WAL at 64 MiB, retained replay rows at 65,536, and active audit-tail
+rows at 131,072 while reserving 512 MiB free space and a 64 MiB maintenance
+floor. Remote request admission stops at soft pressure; owner-local status,
+archive, export, and verification remain available.
+
+Eligible contiguous prefixes are deterministically serialized into
+domain-separated, device-signed postcard segments. Each segment binds its
+sequence, event range and count, prior segment digest, prior and final audit
+hash, NodeId, device key ID and generation, timestamps, content digest, and
+signature suite. The database first pins a candidate, then the node writes and
+flushes a temporary file, verifies it, atomically renames and flushes the
+archive directory, commits sealed metadata, and prunes in a separate
+transaction. Restart deterministically resumes after every boundary. Live or
+nonterminal replay state, and terminal replay state still inside the configured
+validity-retention horizon, is never pruned.
 
 The local-only `audit export` CLI verifies the complete chain and emits at most
 1000 events per page plus redacted action contexts for requests in that page.

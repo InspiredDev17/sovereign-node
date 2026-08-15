@@ -21,33 +21,33 @@ The hardened v0.1 default manifest permits only `SystemInfo` and
 adapter is configured, the owner may explicitly add `GpuStatus`,
 `EngineStatus`, `ModelStatus`, `ProcessStatus`, `AgentGreenHealth`, or
 `ActionBrokerHealth` and increment `policy_version`. Configuration validation
-rejects those capabilities without their exact adapter and rejects advertising
-every other capability below. In particular, `FileRead`, `FileWrite`, and
-`ExecuteApprovedAction`
-remain unavailable until
-descriptor-relative no-follow access, credential exclusions, atomic writes,
-and a separate OS sandbox/process boundary are implemented and tested.
+rejects those capabilities without their exact adapter. Unix `FileRead` is
+also available only when the owner configures a dedicated, exact-file
+publication root. `FileWrite` and `ExecuteApprovedAction` remain unavailable.
+The latter has no process-spawning implementation in the shipping source, so a
+one-line configuration change cannot activate dormant command authority.
 Unverifiable process snapshots fail the specific request; unverifiable GPU,
 engine, model, Agent Green, and Action Broker measurements report `Unknown`/no
 verified entries rather than inventing state.
 
-## Manifest
+## Manifests
 
-The device-signed capability manifest includes:
+Implemented legacy action `CapabilityManifestV1` contains exactly:
 
-- NodeId, trust generation, policy version, and manifest digest;
-- capability name and schema version;
-- argument and result schema digests;
-- owner-readable target-scope summary;
-- required operating-system privileges;
-- per-request input, output, time, and concurrency limits;
-- whether the capability is read-only or may change state;
-- availability state and reason code; and
-- short issuance and expiration times.
+- `manifest_version`;
+- a bounded list of capability enum values; and
+- `generated_at`.
 
-The manifest omits secret paths, credentials, private hardware identifiers, and
-details that would materially aid reconnaissance. A remote party cannot modify
-the manifest. A local policy change is atomic, versioned, and audited.
+The node-signed legacy identity registration binds that manifest, but the
+manifest by itself does not contain NodeId, schema digests, scope summaries,
+availability reasons, or expiry.
+
+Development-only `workload::NodeCapabilityManifestV1` is a separate,
+domain-separated transitional workload contract. It binds NodeId, device key
+and identity generation, software/protocol/contract revisions, generation and
+expiry, truthful OS/architecture/core/memory facts, and locally trusted service
+definitions. It is unit-tested but is not published by the daemon transport in
+v0.1. Canonicalization in Sovereign-AI-Contracts remains externally blocked.
 
 ## Common authorization checks
 
@@ -175,8 +175,16 @@ service is outside this capability.
 
 ### ExecuteApprovedAction
 
-Invokes one owner-installed action definition by stable action ID. Each
-definition fixes:
+Unavailable in the shipping v0.1 runtime. Configuration rejects advertising
+it, direct dispatch returns `Unsupported`, and the prior process-spawning
+implementation has been removed. No caller-supplied path, arguments,
+environment, or working directory reaches an operating-system process API.
+
+Any future service supervision is a distinct architecture and requires a
+dedicated lower-privilege identity or sandbox, descendant termination, pinned
+executable identity, fixed filesystem and network scope, bounded environment
+and output, and adversarial lifecycle tests. A possible future definition
+would have to fix:
 
 - an absolute, owner-controlled executable path;
 - executable file digest or signed-package identity when supported;
@@ -188,11 +196,11 @@ definition fixes:
 - expected exit and result mapping; and
 - whether the action is idempotent and how crash recovery is reconciled.
 
-The request cannot supply an executable path, shell command, interpreter flag,
+Even in that future design, the request cannot supply an executable path, shell command, interpreter flag,
 script body, environment variable, working directory, redirection, or uploaded
-binary. The runtime invokes the executable directly without a shell. A changed
-binary digest disables the action until the owner approves a new local policy
-version.
+binary. A changed binary digest would disable the definition until the owner
+approves a new local policy version. None of this future process-isolation
+machinery is implemented or advertised today.
 
 ### GPUStatus
 

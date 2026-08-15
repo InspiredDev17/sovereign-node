@@ -112,10 +112,12 @@ Central AI credentials, SSH keys, cloud credentials, node private keys, trust
 state, replay state, audit storage, and Agent Green secrets are always excluded
 from remote file capabilities.
 
-ExecuteApprovedAction directly invokes an owner-installed, integrity-pinned
-binary with a fixed working directory, sanitized environment, typed arguments,
-deadline, and output limit. It cannot receive a shell expression, arbitrary
-path, interpreter option, script, environment override, or uploaded program.
+`ExecuteApprovedAction` is unavailable. Valid configuration cannot advertise
+it, direct dispatch returns `Unsupported`, and the shipping runtime contains no
+process-spawning implementation for it. No remote action or cognitive workload
+can reach a shell, command line, executable path, argument vector, environment,
+or working directory. Future pinned-service supervision requires a separate
+reviewed boundary and cannot reuse this action capability.
 
 The base design deliberately omits a privileged helper. Therefore operations
 requiring root are unavailable rather than silently elevated.

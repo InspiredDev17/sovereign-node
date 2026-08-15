@@ -51,14 +51,16 @@ The operator must first start the daemon with the intended valid configuration
 so normal monotonic policy activation succeeds. Proof generation itself never
 activates or changes policy.
 
-The v0.1 rotation CLI is narrower than the target ceremony: it requires local
-confirmation, serializes against every pairing/revocation mutation, refuses to
-run while the daemon or any trusted peer is active, preserves NodeId, writes a
-dual-signed old/new-key continuity binding, and appends digest-only rotation
-intent and completion audit events. A surviving intent without completion makes
-an interrupted rotation visible to the owner. It does not rotate TLS credentials
-or silently preserve remote trust; the daemon must already be stopped and peers
-must be re-established explicitly.
+The v0.1 rotation CLI requires local confirmation, serializes against every
+pairing/revocation mutation, refuses to run while the daemon or any trusted peer
+is active, preserves NodeId, and creates a dual-signed old/new-key continuity
+binding. Before replacing `identity.json`, it durably stores a versioned pending
+transaction and the started audit event. The replacement is descriptor-checked,
+atomically renamed and directory-synced; the completion audit and pending-record
+removal then commit together. On restart, the CLI deterministically recognizes
+either the old key plus staged file or the already-swapped new key, completes
+exactly once, and returns the continuity evidence. It does not rotate TLS
+credentials or silently preserve remote trust; peers must be re-established.
 
 ## Stable NodeId
 
@@ -113,7 +115,9 @@ unless the owner explicitly enables a narrowly justified local disclosure.
 
 ## Public identity statement
 
-The node can produce a signed identity statement containing:
+Implemented fresh V2 identity proof contains the fields described in the v0.1
+status section above. The richer canonical statement below remains target
+architecture for Sovereign-AI-Contracts:
 
 - identity schema version;
 - NodeId;
@@ -192,10 +196,17 @@ not stored by the node.
 
 ## Capability manifest identity
 
-The manifest is part of node identity but not a grant from the remote peer. It
-contains each enabled capability name and version, target-scope summary,
-argument-schema digest, result-schema digest, resource limits, and local policy
-version. The node signs manifest responses with its device key.
+The implemented legacy action manifest is part of node identity but not a grant
+from the remote peer. It contains only a manifest version, capability enum list,
+and generation time; the signed V2 proof separately binds its digest and the
+canonical local policy digest. It does not yet contain target summaries,
+argument/result schema digests, availability reasons, or resource limits.
+
+The development-only workload manifest adds domain-separated NodeId, key and
+identity generation, software/protocol/contract revisions, expiry, basic
+hardware facts, truthful sandbox fields, and locally trusted service inventory.
+It is unit-tested but is not yet emitted by the daemon or canonicalized in
+Sovereign-AI-Contracts.
 
 The locally loaded policy is authoritative. A stale advertisement cannot enable
 a removed capability, and a remote request cannot expand the manifest. A
@@ -231,5 +242,6 @@ requires local recovery.
 Identity statements, keys, manifests, registrations, and signatures each carry
 an algorithm or schema version. Unknown mandatory fields, unsupported
 algorithms, incompatible major versions, or downgrade attempts are rejected.
-Version negotiation may select only a mutually supported, locally allowed
-version; it may not silently reinterpret signed bytes.
+v0.1 validates fixed versions and does not negotiate an application protocol.
+Any future negotiation may select only a mutually supported, locally allowed
+version and may not silently reinterpret signed bytes.

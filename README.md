@@ -58,8 +58,9 @@ trust.
   and trust epoch and close promptly after revocation, expiry, rotation, or trust-store loss.
 - Only capabilities in both the local manifest and the paired peer's scope can run. The default
   manifest is read-only: `SystemInfo` and `ResourceStatus`.
-- File and approved-action wire types are reserved for later hardening, but v0.1 configuration
-  rejects advertising or executing them. There is no shell command string or code-upload path.
+- Hardened Unix `FileRead` is optional and uses exact owner-published files only. `FileWrite`
+  remains unavailable. `ExecuteApprovedAction` is unavailable and its dormant process-spawning
+  implementation has been removed; there is no shell, generic process or code-upload path.
 - The v0.1 daemon serves only on Unix, refuses to serve as root, and keeps identity/state owner-only.
 - Pairing, revocation, and identity rotation are serialized by an owner-only admin lease; device
   identity rotation is refused while the daemon or a trusted peer is active and is audited.
@@ -87,7 +88,11 @@ trust.
 See [Architecture](docs/ARCHITECTURE.md), [Pairing](docs/PAIRING.md),
 [Identity](docs/IDENTITY.md), [Transport](docs/TRANSPORT.md),
 [Capabilities](docs/CAPABILITIES.md), [Local Audit Export](docs/AUDIT.md), and
-[Threat model](docs/THREAT-MODEL.md).
+[Threat model](docs/THREAT-MODEL.md). The development-only cognitive workload boundary is
+documented separately in [Workload Admission](docs/WORKLOAD-ADMISSION.md) and
+[Trusted Service Registry](docs/SERVICE-REGISTRY.md); it is not wired to the v0.1 daemon.
+Platform-specific claims and deployment limits are in
+[Platform Support](docs/PLATFORM-SUPPORT.md).
 
 ## Build and verify
 
@@ -99,6 +104,10 @@ cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
+
+The committed `./scripts/verify-release.sh` runs the complete locally supported locked/offline
+release matrix. Hosted CI is not committed because repository policy does not explicitly
+authorize it; see [Release Verification](docs/RELEASE-VERIFICATION.md).
 
 Initialize a node and render a conservative example configuration:
 
@@ -115,6 +124,13 @@ revocation commands are owner-local operations; run `sovereign-node --help` for 
 exported page offline with `sovereign-node audit verify`, supplying the owner-retained NodeId,
 device-key SHA-256, expected cursor, and prior verified chain anchor. The verifier reads only a
 bounded no-follow regular file and does not open node state or contact a network.
+
+Active replay and audit storage is bounded. `audit status` reports database, WAL and free-space
+pressure; `audit archive --confirm` seals one replay-safe prefix into a deterministic,
+device-signed segment below the owner-private data directory; `audit verify-segment` verifies one
+file and `audit verify-archive` verifies the complete durable segment manifest and chain. Remote
+admission stops before the maintenance reserve is consumed. Exact defaults and recovery rules are
+in [Local Audit Export](docs/AUDIT.md).
 
 Inspect the durable authorization-time checkpoint with `sovereign-node clock status`. If an owner
 intentionally corrects the host clock backwards beyond policy, recovery is an explicit maintenance

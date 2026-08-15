@@ -3,6 +3,20 @@ data_dir = "/var/lib/sovereign-node"
 # Increment this monotonic value for every capability, target, root, or action mapping change.
 policy_version = 1
 
+[storage]
+# These fail-closed limits cannot be disabled. Remote admission stops at soft pressure while
+# owner-local status/archive/verification remain available from the maintenance reserve.
+database_soft_bytes = 268435456
+database_hard_bytes = 536870912
+wal_hard_bytes = 67108864
+minimum_free_bytes = 536870912
+maintenance_reserve_bytes = 67108864
+max_total_replays = 65536
+max_active_audit_events = 131072
+# Terminal replay detail is eligible only this many seconds after signed expiry.
+replay_retention_secs = 3900
+archive_max_events = 10000
+
 # The remote listener is intentionally absent by default. To enable it, set an exact loopback or
 # private-LAN SocketAddr and provide TLS files. Wildcard/public addresses and plaintext are rejected.
 # listen = "192.168.1.50:7443"

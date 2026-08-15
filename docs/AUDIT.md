@@ -6,6 +6,57 @@ local read-only command for taking a bounded, redacted snapshot of that
 journal. It is not a remote capability, listener, relay, upload, or monitoring
 control channel.
 
+## Active retention and sealed archives
+
+Schema v10 bounds the active store instead of allowing replay and audit history
+to grow indefinitely. Defaults are:
+
+- 65,536 total live replay rows and 4,096 nonterminal rows;
+- 131,072 active audit-tail rows;
+- 256 MiB database soft threshold and 512 MiB hard threshold;
+- 64 MiB WAL hard threshold;
+- 512 MiB minimum free space and a 64 MiB maintenance reserve;
+- 3,900 seconds replay-retention horizon; and
+- 10,000 events per archive segment.
+
+The relationships are validated and zero/unbounded configurations are rejected.
+Storage settings are included in the canonical policy digest. Remote request
+admission stops at soft or hard pressure before SQLite reaches `ENOSPC`; local
+status, archive, export and verification remain possible. The active audit and
+replay row ceilings provide a second fail-closed bound.
+
+Use these owner-local operations:
+
+```text
+sovereign-node audit status --config /absolute/path/to/node.toml
+sovereign-node audit archive --config /absolute/path/to/node.toml --confirm
+sovereign-node audit verify-segment --input /absolute/path/to/segment.postcard
+sovereign-node audit verify-archive --config /absolute/path/to/node.toml
+```
+
+Archive output is fixed beneath `<data_dir>/audit/archive`; no remote or CLI
+caller chooses an arbitrary output root. The directory and files must be real,
+owner-only, no-follow objects.
+
+Each deterministic postcard segment binds its schema/format, segment number,
+first/last sequence and event count, previous segment digest, previous/final
+audit hash, content digest, NodeId, device key ID and identity generation,
+creation/eligibility times, Ed25519 suite identifier and device signature.
+Filenames are not integrity evidence.
+
+Sealing is crash-consistent: pin candidate in SQLite; write and sync a temporary
+file; verify it; atomically rename and sync the directory; commit sealed
+metadata/checkpoint; then prune in a separate transaction. Restart resumes the
+same immutable candidate after interruption at any boundary. Pruning never
+precedes durable segment verification.
+
+Only a contiguous prefix is eligible. Any nonterminal replay stops selection.
+A terminal replay is retained until its signed validity has expired plus the
+configured action-TTL, clock-rollback and safety margin represented by the
+retention horizon. The archived audit-hash and segment-digest checkpoints keep
+the active tail verifiable and old request IDs cannot become valid again merely
+because their detailed row was retired.
+
 ## Command
 
 ```text

@@ -22,12 +22,14 @@ backwards clock step beyond the configured zero-to-sixty-second tolerance fails
 closed against a durable high-water mark. The default tolerance is five seconds.
 Every admitted frame is authorized again
 against current durable trust. Local administration is CLI-only, not a Unix
-socket. Paired client trust snapshots reload every 250 milliseconds. New and
-rotated pairings become eligible for a new handshake without daemon restart.
-Every established session is bound to its exact leaf digest and trust epoch and
-is rechecked on the same interval while reading, waiting for runtime work, and
-writing. Revocation, expiry, rotation, malformed trust, or an unavailable trust
-store closes the session. Application version negotiation remains target work.
+socket. One lifecycle-owned watcher reloads paired trust at most every 250
+milliseconds and broadcasts a monotonic snapshot to all sessions; sessions do
+not poll SQLite individually. New and rotated pairings become eligible for a
+new handshake without daemon restart. Every established session is bound to
+its exact leaf digest and trust epoch and observes the shared watcher while
+reading, waiting for runtime work, and writing. Revocation, expiry, rotation,
+malformed trust, or an unavailable trust store closes the session. Application
+version negotiation remains target work.
 The node server certificate must be provisioned to clients through a separate
 owner-controlled channel and does not reload in v0.1.
 
@@ -56,14 +58,13 @@ from a status or administration command cannot perform this reconciliation.
 ### Local administration
 
 Pairing, revocation, recovery, capability-policy changes, and update approval
-use a local owner endpoint. In the target design, on Unix-family systems this should be a
-permission-restricted Unix domain socket. An equivalent authenticated local IPC
-mechanism is used on other platforms.
+are owner-local CLI operations in v0.1. There is no local IPC listener. The CLI
+uses owner-only files, process-lifecycle leases, explicit confirmation and
+audited state transitions; remote interfaces cannot call these methods.
 
-Local access is not automatically privileged. The endpoint verifies operating
-system peer credentials, applies owner-configured permissions, rate limits
-requests, and audits security-sensitive changes. Remote interfaces cannot call
-local-only administrative methods.
+A future local API may use a permission-restricted Unix-domain socket with
+operating-system peer credentials, bounded requests and independent admission
+limits. No equivalent non-Unix IPC mechanism is implemented or claimed today.
 
 ### Private-LAN runtime
 
@@ -82,18 +83,22 @@ firewall is recommended but is not treated as the sole security boundary.
 
 ## TLS profile
 
-The implementation uses a maintained TLS library, such as rustls, with:
+Implemented v0.1 uses rustls with:
 
 - TLS 1.3;
 - certificate and public-key algorithms allowed by current local policy;
 - forward-secret standard cipher suites supplied by the library;
 - both server and client authentication;
-- node certificate or public-key pinning to the paired NodeId;
 - client certificate or public-key pinning to the paired Action Broker
   transport identity;
 - certificate validity and usage checks;
-- hostname-independent NodeId binding at the application layer; and
 - no anonymous, plaintext, legacy TLS, or silent downgrade mode.
+
+The server certificate is separately provisioned and is not cryptographically
+bound to NodeId by the v0.1 pairing ceremony. Clients must obtain and pin its CA
+or certificate through an owner-controlled channel. Hostname-independent
+server-certificate-to-NodeId binding is target architecture, not an implemented
+claim.
 
 TLS private keys remain local. Application Ed25519 identity keys should be
 separate from TLS keys so rotation and purpose are explicit. Certificate
@@ -123,7 +128,7 @@ After TLS succeeds, the node binds the session to:
 - paired peer key ID;
 - exact NodeId;
 - active trust generation;
-- negotiated protocol version; and
+- the fixed signed action protocol version; and
 - transport-certificate digest.
 
 Each action is then independently verified using the owner and Action Broker
@@ -222,10 +227,15 @@ execute it again.
 
 ## Version negotiation
 
-The client proposes supported protocol versions, and the node chooses only from
-its locally allowed set. The selected version is bound into the session and
-each signed action. Unsupported major versions, disallowed legacy versions,
-schema disagreement, or downgrade below local policy terminates the request.
+v0.1 has no session-level application-version negotiation. Each signed action
+contains fixed schema and protocol versions, and well-formed unsupported values
+return the stable node-signed `VersionMismatch` action error. Malformed frames
+remain `InvalidRequest`/connection framing errors and never reach replay or
+capability dispatch.
+
+Target architecture may let a client propose supported protocol versions and
+let the node choose only from its locally allowed set. Any future selection
+must be bound into the session and each signed request without a downgrade path.
 
 Compatibility cannot change signed field meaning. New optional response fields
 may be ignored only when the negotiated schema explicitly permits that
@@ -235,13 +245,23 @@ behavior.
 
 Before cryptographic and capability work, the endpoint enforces:
 
-- maximum concurrent connections and handshakes;
+- at most 32 concurrent TLS handshakes;
+- at most 256 authenticated sessions globally;
+- at most 8 authenticated sessions per trusted peer;
+- at most 4 authenticated sessions per exact client leaf;
 - atomic durable per-peer and node-global request rates;
 - read, handshake, queue, execution, and idle deadlines;
 - bounded frame and argument sizes;
 - bounded in-memory queues;
 - bounded result size and streaming backpressure; and
 - fair concurrency limits for expensive capabilities.
+
+Handshake and first-frame deadlines are 10 seconds, authenticated idle timeout
+is 60 seconds, and bounded frame/write operations use a 30-second deadline.
+The frame prefix is checked against the configured maximum before allocation.
+Session permits are RAII-owned and return after handshake failure, disconnect,
+timeout, or shutdown. These are conservative compile-time v0.1 limits rather
+than values derived from the application queue.
 
 When either v0.1 request limit is reached, the connection is closed before
 action authorization or replay reservation. Reconnecting remains limited for
